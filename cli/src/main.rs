@@ -4,6 +4,7 @@ use crate::service_description::{EndpointKind, generate_service_description};
 use anyhow::{Context, bail, ensure};
 use clap::Parser;
 use flate2::read::MultiGzDecoder;
+use mimalloc::MiMalloc;
 use oxhttp::Server;
 use oxhttp::model::header::{
     ACCEPT, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
@@ -42,6 +43,9 @@ use std::thread::available_parallelism;
 use std::time::{Duration, Instant};
 use std::{fmt, fs, str, thread};
 use url::{Url, form_urlencoded};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 mod cli;
 mod service_description;

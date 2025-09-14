@@ -30,6 +30,7 @@ geosparql = ["dep:spargeo"]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 flate2.workspace = true
+mimalloc = "0.1.48"
 oxhttp = { workspace = true, features = ["flate2"] }
 oxigraph.workspace = true
 oxiri.workspace = true
