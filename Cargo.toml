@@ -14,7 +14,7 @@ members = [
     "lib/spargebra",
     "lib/spargeo",
     "lib/sparopt",
-    "lib/sparql-smith",
+    "lib/sparql-smith", "lib/suxquads",
     "oxrocksdb-sys",
     "python",
     "testsuite"
