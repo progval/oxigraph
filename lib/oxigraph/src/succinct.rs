@@ -16,23 +16,35 @@ use tempfile::TempDir;
 pub struct TermMphf {}
 
 /// Sorts and deduplicates strings and spills to disk to save memory
+///
+/// Calls to [`Self::push_boxed_bytes`] add the given bytestring to an in-memory buffer
+/// (a `HashSet`) to perform deduplication as soon as possible.
+///
+/// Once that `HashSet` reaches the configured threshold (in number of bytes of data,
+/// not of the `HashSet` itself, which usually has ~1× overhead), that buffer is sorted
+/// and written to disk to a single file.
+///
+/// Once the number of written files reaches the other configured threshold, all files
+/// are read, merged together in a single new file, and then deleted.
 struct ExternalSorter {
     tempdirs: Vec<TempDir>,
     sorted_files: Vec<File>,
     max_buffer_size: usize,
+    max_num_files: usize,
     buffer_size: usize,
     buffer: FxHashSet<Box<[u8]>>,
     written_size: usize,
 }
 
 impl ExternalSorter {
-    pub fn new(max_buffer_size: usize) -> Result<Self> {
+    pub fn new(max_buffer_size: usize, max_num_files: usize) -> Result<Self> {
         Ok(Self {
             tempdirs: Vec::new(), // Create it only if needed
             sorted_files: Vec::new(),
             buffer: FxHashSet::with_hasher(Default::default()),
             buffer_size: 0,
             max_buffer_size,
+            max_num_files,
             written_size: 0,
         })
     }
@@ -60,6 +72,30 @@ impl ExternalSorter {
     }
 
     fn flush_buffer(&mut self) -> Result<()> {
+        // Sort buffer
+        let mut sort_buffer: Vec<_> = self.buffer.drain().collect();
+        sort_buffer.par_sort_unstable();
+        sort_buffer.dedup();
+
+        // Flush buffer to file
+        self.write_sorted_items(sort_buffer.into_iter().map(Ok))
+            .context("Could not write sorted buffer to disk")?;
+
+        // Reset buffer
+        self.written_size += self.buffer_size;
+        self.buffer_size = 0;
+
+        if self.sorted_files.len() > self.max_num_files {
+            self.compact_files().context("Could not compact files")?;
+        }
+
+        Ok(())
+    }
+
+    fn write_sorted_items(
+        &mut self,
+        sorted_items: impl Iterator<Item = Result<Box<[u8]>, std::io::Error>>,
+    ) -> Result<()> {
         if self.tempdirs.is_empty() {
             self.tempdirs
                 .push(TempDir::new().context("Could not create temporary directory")?);
@@ -73,16 +109,10 @@ impl ExternalSorter {
         let mut file = File::create_new(&path)
             .with_context(|| format!("Could not create {}", path.display()))?;
 
-        // Sort buffer
-        let mut sort_buffer: Vec<_> = self.buffer.drain().collect();
-        sort_buffer.par_sort_unstable();
-        sort_buffer.dedup();
-
-        // Flush buffer to file
         {
             let mut writer = BufWriter::new(&mut file);
             let mut first = true;
-            for string in sort_buffer {
+            for string in sorted_items {
                 if !first {
                     // String separator
                     writer
@@ -91,7 +121,7 @@ impl ExternalSorter {
                     first = false;
                 }
                 writer
-                    .write_all(&string)
+                    .write_all(&(string.context("Could not read input item")?))
                     .with_context(|| format!("Could not write to {}", path.display()))?;
             }
         }
@@ -100,25 +130,57 @@ impl ExternalSorter {
         file.rewind()
             .with_context(|| format!("Could not rewind {}", path.display()))?;
         self.sorted_files.push(file);
+        Ok(())
+    }
 
-        // Reset buffer
-        self.written_size += self.buffer_size;
-        self.buffer_size = 0;
+    /// Merges every file of this sorter currently on disk into a single one
+    pub fn compact_files(&mut self) -> Result<()> {
+        let mut sorted_files = Vec::new();
+        std::mem::swap(&mut sorted_files, &mut self.sorted_files);
+
+        /*
+        // Keep ownership on the old tempdirs until after we are done reading them
+        let mut tempdirs = Vec::new();
+        std::mem::swap(&mut tempdirs, &mut self.tempdirs);
+        */
+        self.tempdirs.clear();
+
+        let merged_items =
+            Self::iter_written_vec_bytes(sorted_files).map(|item| item.map(Vec::into_boxed_slice));
+        self.write_sorted_items(merged_items)
+            .context("Could not write merged items")?;
+
+        // remove files that we just read
+        //drop(tempdirs);
 
         Ok(())
     }
 
-    /// Consome this external sorter and returns sorted items
-    pub fn iter_vec_bytes(self) -> impl Iterator<Item = Result<Vec<u8>, std::io::Error>> {
-        let mut buffer: Vec<_> = self.buffer.into_iter().collect();
-        buffer.par_sort_unstable();
-        self.sorted_files
+    fn drain_written_vec_bytes(&mut self) -> impl Iterator<Item = Result<Vec<u8>, std::io::Error>> {
+        let mut sorted_files = Vec::new();
+        std::mem::swap(&mut sorted_files, &mut self.sorted_files);
+        Self::iter_written_vec_bytes(sorted_files)
+    }
+
+    fn iter_written_vec_bytes(
+        sorted_files: Vec<File>,
+    ) -> impl Iterator<Item = Result<Vec<u8>, std::io::Error>> {
+        sorted_files
             .into_iter()
             .map(|file| BufReader::new(file).split(b'\0'))
             .kmerge_by(|left, right| match (left, right) {
                 (Ok(left), Ok(right)) => left < right,
                 (_, _) => true, // doesn't matter, we are going to error anyway
             })
+    }
+
+    /// Consome this external sorter and returns sorted items
+    pub fn drain_vec_bytes(&mut self) -> impl Iterator<Item = Result<Vec<u8>, std::io::Error>> {
+        let mut buffer = Default::default();
+        std::mem::swap(&mut buffer, &mut self.buffer);
+        let mut buffer: Vec<_> = buffer.into_iter().collect();
+        buffer.par_sort_unstable();
+        self.drain_written_vec_bytes()
             // TODO: merge at the same time as the others
             .merge_by(buffer.into_iter().dedup().map(Vec::from).map(Ok),|left, right| match (left, right) {
                 (Ok(left), Ok(right)) => left < right,
@@ -127,8 +189,8 @@ impl ExternalSorter {
     }
 
     /// See [`Self::iter_vec_bytes`]
-    pub fn iter_boxed_bytes(self) -> impl Iterator<Item = Result<Box<[u8]>, std::io::Error>> {
-        self.iter_vec_bytes()
+    pub fn drain_boxed_bytes(&mut self) -> impl Iterator<Item = Result<Box<[u8]>, std::io::Error>> {
+        self.drain_vec_bytes()
             .map(|item| Ok(item?.into_boxed_slice()))
     }
 
@@ -175,9 +237,13 @@ pub fn build_term_mphf(quads: impl ParallelIterator<Item = Result<Quad>>) -> Res
         }
     }
 
-    let unique_sorted_quads = quads
+    let mut unique_sorted_quads = quads
         .fold(
-            || ExternalSorter::new(100 * 1024 * 1024), // 100MiB in-memory buffer per thread
+            || {
+                // 100MiB in-memory buffer per thread
+                ExternalSorter::new(100 * 1024 * 1024, 100)
+                    .context("Could not create sorter ExternalSorter")
+            },
             |thread_sorter, quad| -> Result<_> {
                 let mut thread_sorter: ExternalSorter = thread_sorter?;
                 let Quad {
@@ -186,17 +252,23 @@ pub fn build_term_mphf(quads: impl ParallelIterator<Item = Result<Quad>>) -> Res
                     object,
                     graph_name,
                 } = quad?;
-                thread_sorter.push_str(match subject {
-                    NamedOrBlankNode::NamedNode(n) => n.as_str().to_owned(),
-                    NamedOrBlankNode::BlankNode(n) => n.as_str().to_owned(),
-                })?;
-                thread_sorter.push_str(predicate.as_str().to_owned())?;
-                thread_sorter.push_str(match graph_name {
-                    GraphName::NamedNode(n) => n.as_str().to_owned(),
-                    GraphName::BlankNode(n) => n.as_str().to_owned(),
-                    GraphName::DefaultGraph => "".to_owned(), // XXX I guess?
-                })?;
-                push_term(&mut thread_sorter, object)?;
+                thread_sorter
+                    .push_str(match subject {
+                        NamedOrBlankNode::NamedNode(n) => n.as_str().to_owned(),
+                        NamedOrBlankNode::BlankNode(n) => n.as_str().to_owned(),
+                    })
+                    .context("Could not push subject")?;
+                thread_sorter
+                    .push_str(predicate.as_str().to_owned())
+                    .context("Could not push predicate")?;
+                thread_sorter
+                    .push_str(match graph_name {
+                        GraphName::NamedNode(n) => n.as_str().to_owned(),
+                        GraphName::BlankNode(n) => n.as_str().to_owned(),
+                        GraphName::DefaultGraph => "".to_owned(), // XXX I guess?
+                    })
+                    .context("Could not push graph name")?;
+                push_term(&mut thread_sorter, object).context("Could not push term")?;
 
                 let current_num_quads = num_quads.fetch_add(1, Ordering::Relaxed) + 1;
                 if current_num_quads % 100_000_000 == 0 {
@@ -206,13 +278,20 @@ pub fn build_term_mphf(quads: impl ParallelIterator<Item = Result<Quad>>) -> Res
             },
         )
         .reduce(
-            || ExternalSorter::new(100 * 1024 * 1024), // 100MiB in-memory buffer per thread
-            |left, right| left?.merge(right?),
+            || {
+                ExternalSorter::new(100 * 1024 * 1024, 100)
+                    .context("Could not create reducer ExternalSorter")
+            }, // 100MiB in-memory buffer per thread
+            |left, right| {
+                left?
+                    .merge(right?)
+                    .context("Could not merge ExternalSorter")
+            },
         )?;
 
     println!(
         "{} unique terms",
-        unique_sorted_quads.iter_boxed_bytes().count()
+        unique_sorted_quads.drain_boxed_bytes().count()
     );
 
     todo!("build_term_mphf");
