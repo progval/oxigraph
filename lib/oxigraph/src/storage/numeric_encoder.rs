@@ -468,6 +468,11 @@ impl From<NamedNodeRef<'_>> for EncodedTerm {
         }
     }
 }
+impl From<NamedNode> for EncodedTerm {
+    fn from(named_node: NamedNode) -> Self {
+        named_node.as_ref().into()
+    }
+}
 
 impl From<BlankNodeRef<'_>> for EncodedTerm {
     fn from(blank_node: BlankNodeRef<'_>) -> Self {
@@ -485,6 +490,11 @@ impl From<BlankNodeRef<'_>> for EncodedTerm {
                 }
             }
         }
+    }
+}
+impl From<BlankNode> for EncodedTerm {
+    fn from(blank_node: BlankNode) -> Self {
+        blank_node.as_ref().into()
     }
 }
 
@@ -630,6 +640,11 @@ impl From<LiteralRef<'_>> for EncodedTerm {
         }
     }
 }
+impl From<Literal> for EncodedTerm {
+    fn from(literal: Literal) -> Self {
+        literal.as_ref().into()
+    }
+}
 
 impl From<NamedOrBlankNodeRef<'_>> for EncodedTerm {
     fn from(term: NamedOrBlankNodeRef<'_>) -> Self {
@@ -637,6 +652,12 @@ impl From<NamedOrBlankNodeRef<'_>> for EncodedTerm {
             NamedOrBlankNodeRef::NamedNode(named_node) => named_node.into(),
             NamedOrBlankNodeRef::BlankNode(blank_node) => blank_node.into(),
         }
+    }
+}
+
+impl From<NamedOrBlankNode> for EncodedTerm {
+    fn from(term: NamedOrBlankNode) -> Self {
+        term.as_ref().into()
     }
 }
 
@@ -652,6 +673,12 @@ impl From<TermRef<'_>> for EncodedTerm {
     }
 }
 
+impl From<Term> for EncodedTerm {
+    fn from(term: Term) -> Self {
+        term.as_ref().into()
+    }
+}
+
 impl From<GraphNameRef<'_>> for EncodedTerm {
     fn from(name: GraphNameRef<'_>) -> Self {
         match name {
@@ -662,10 +689,23 @@ impl From<GraphNameRef<'_>> for EncodedTerm {
     }
 }
 
+impl From<GraphName> for EncodedTerm {
+    fn from(term: GraphName) -> Self {
+        term.as_ref().into()
+    }
+}
+
 #[cfg(feature = "rdf-12")]
 impl From<TripleRef<'_>> for EncodedTerm {
     fn from(triple: TripleRef<'_>) -> Self {
         Self::Triple(Arc::new(triple.into()))
+    }
+}
+
+#[cfg(feature = "rdf-12")]
+impl From<Triple> for EncodedTerm {
+    fn from(triple: Triple) -> Self {
+        triple.as_ref().into()
     }
 }
 
@@ -696,6 +736,12 @@ impl From<TripleRef<'_>> for EncodedTriple {
             predicate: triple.predicate.into(),
             object: triple.object.into(),
         }
+    }
+}
+#[cfg(feature = "rdf-12")]
+impl From<Triple> for EncodedTriple {
+    fn from(triple: Triple) -> Self {
+        triple.as_ref().into()
     }
 }
 
@@ -731,6 +777,12 @@ impl From<QuadRef<'_>> for EncodedQuad {
             object: quad.object.into(),
             graph_name: quad.graph_name.into(),
         }
+    }
+}
+
+impl From<Quad> for EncodedQuad {
+    fn from(quad: Quad) -> Self {
+        quad.as_ref().into()
     }
 }
 

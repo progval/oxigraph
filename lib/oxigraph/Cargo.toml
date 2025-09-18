@@ -26,12 +26,14 @@ rocksdb-debug = []
 rdf-12 = ["oxrdfio/rdf-12", "spareval/sparql-12"]
 
 [dependencies]
+anyhow.workspace = true
 dashmap.workspace = true
 oxiri.workspace = true
 oxrdf = { workspace = true, features = ["oxsdatatypes"] }
 oxrdfio.workspace = true
 oxsdatatypes.workspace = true
 rand.workspace = true
+rayon.workspace = true
 rustc-hash.workspace = true
 siphasher.workspace = true
 sparesults.workspace = true

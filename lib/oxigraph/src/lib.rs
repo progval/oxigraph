@@ -10,3 +10,4 @@ pub mod model;
 pub mod sparql;
 mod storage;
 pub mod store;
+pub mod succinct;

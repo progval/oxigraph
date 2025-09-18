@@ -19,6 +19,7 @@ use oxigraph::model::{
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
 use oxigraph::sparql::{CancellationToken, QueryResults, SparqlEvaluator};
 use oxigraph::store::{BulkLoader, LoaderError, Store};
+use oxigraph_cli::utils::{format_from_path, rdf_format_from_name, rdf_format_from_path};
 use oxiri::Iri;
 use rand::random;
 use rayon::ThreadPoolBuilder;
@@ -697,41 +698,6 @@ fn do_convert<R: Read, W: Write>(
         }
     }
     Ok(serializer.finish()?)
-}
-
-fn format_from_path<T>(
-    path: &Path,
-    from_extension: impl FnOnce(&str) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    if let Some(ext) = path.extension().and_then(OsStr::to_str) {
-        from_extension(ext).map_err(|e| {
-            e.context(format!(
-                "Not able to guess the file format from file name extension '{ext}'"
-            ))
-        })
-    } else {
-        bail!(
-            "The path {} has no extension to guess a file format from",
-            path.display()
-        )
-    }
-}
-
-fn rdf_format_from_path(path: &Path) -> anyhow::Result<RdfFormat> {
-    format_from_path(path, |ext| {
-        RdfFormat::from_extension(ext)
-            .with_context(|| format!("The file extension '{ext}' is unknown"))
-    })
-}
-
-fn rdf_format_from_name(name: &str) -> anyhow::Result<RdfFormat> {
-    if let Some(t) = RdfFormat::from_extension(name) {
-        return Ok(t);
-    }
-    if let Some(t) = RdfFormat::from_media_type(name) {
-        return Ok(t);
-    }
-    bail!("The file format '{name}' is unknown")
 }
 
 fn serve(

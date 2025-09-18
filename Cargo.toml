@@ -14,7 +14,7 @@ members = [
     "lib/spargebra",
     "lib/spargeo",
     "lib/sparopt",
-    "lib/sparql-smith", "lib/suxquads",
+    "lib/sparql-smith",
     "oxrocksdb-sys",
     "python",
     "testsuite"
@@ -64,7 +64,6 @@ pyo3 = "0.26"
 quick-xml = "0.37"
 rand = "0.9"
 rayon = "1.8.1"
-rayon-core = "1.12.1"
 regex = "1.7"
 rustc-hash = "2.1"
 serde = "1.0.200"
