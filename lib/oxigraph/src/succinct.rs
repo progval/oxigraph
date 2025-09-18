@@ -70,8 +70,8 @@ impl ExternalSorter {
             .unwrap()
             .path()
             .join(format!("{}", self.sorted_files.len()));
-        let mut file =
-            File::create(&path).with_context(|| format!("Could not create {}", path.display()))?;
+        let mut file = File::create_new(&path)
+            .with_context(|| format!("Could not create {}", path.display()))?;
 
         // Sort buffer
         let mut sort_buffer: Vec<_> = self.buffer.drain().collect();
