@@ -17,6 +17,10 @@ name = "oxigraph"
 path = "src/main.rs"
 doc = false
 
+[[bin]]
+name = "oxigraph-succinct-load"
+path = "src/bin/succinct-load.rs"
+
 [features]
 default = ["native-tls", "geosparql", "rdf-12"]
 native-tls = ["oxigraph/http-client-native-tls"]
@@ -34,7 +38,7 @@ oxhttp = { workspace = true, features = ["flate2"] }
 oxigraph.workspace = true
 oxiri.workspace = true
 rand.workspace = true
-rayon-core.workspace = true
+rayon.workspace = true
 spargeo = { workspace = true, optional = true }
 url.workspace = true
 

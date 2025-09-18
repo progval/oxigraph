@@ -21,7 +21,7 @@ use oxigraph::sparql::{CancellationToken, QueryResults, SparqlEvaluator};
 use oxigraph::store::{BulkLoader, LoaderError, Store};
 use oxiri::Iri;
 use rand::random;
-use rayon_core::ThreadPoolBuilder;
+use rayon::ThreadPoolBuilder;
 #[cfg(feature = "geosparql")]
 use spargeo::GEOSPARQL_EXTENSION_FUNCTIONS;
 use std::borrow::Cow;

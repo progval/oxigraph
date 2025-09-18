@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, ValueHint};
-use oxrdfio::{RdfFormat, RdfParseError, RdfParser};
-use oxrdf::{NamedNode, Quad};
+use oxigraph::io::{RdfFormat, RdfParseError, RdfParser};
+use oxigraph::model::{NamedNode, Quad};
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -9,8 +9,8 @@ use rayon::prelude::*;
 use std::process::{Command, Stdio};
 
 #[derive(Parser)]
-#[command(about, version, name = "oxigraph")]
-/// Oxigraph command line toolkit and SPARQL HTTP server
+#[command(about, version, name = "oxigraph-succinct-load")]
+/// Oxigraph loader into the "succinct" storage format
 pub struct Args {
     /// Directory in which Oxigraph data are persisted
     #[arg(short, long, value_hint = ValueHint::DirPath)]
