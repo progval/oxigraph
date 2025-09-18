@@ -33,6 +33,7 @@ geosparql = ["dep:spargeo"]
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
+deko.workspace = true
 flate2.workspace = true
 oxhttp = { workspace = true, features = ["flate2"] }
 oxigraph.workspace = true

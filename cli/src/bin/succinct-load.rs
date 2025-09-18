@@ -19,13 +19,8 @@ pub struct Args {
     /// File(s) to load
     ///
     /// If multiple files are provided, they are loaded in parallel.
-    #[arg(short, long, num_args = 0.., value_hint = ValueHint::FilePath)]
+    #[arg(num_args = 1.., value_hint = ValueHint::FilePath)]
     file: Vec<PathBuf>,
-    /// Shell commands that stream a file to load on their stdout.
-    ///
-    /// If multiple command are provided, they are loaded in parallel.
-    #[arg(short, long, num_args = 0.., requires = "format")]
-    command: Vec<String>,
     /// The format of the file(s) to load
     ///
     /// It can be an extension like "nt" or a MIME type like "application/n-triples".
@@ -72,116 +67,67 @@ pub fn main() -> Result<()> {
         None
     };
 
-    ensure!(
-        args.file.is_empty() || args.command.is_empty(),
-        "--file or --command must be provided"
-    );
-    ensure!(
-        args.command.is_empty() || format.is_some(),
-        "--command requires --format"
-    );
-
     #[expect(clippy::shadow_same)]
     let args = &args;
     #[expect(clippy::shadow_same)]
     let graph = &graph;
 
-    let file_quad_factories: Vec<_> = args
+    let quad_factories: Vec<_> = args
         .file
         .iter()
         .map(|file| {
             move || {
-                get_quads(
+                Ok((
                     file.display().to_string(),
-                    std::fs::File::open(file)
-                        .with_context(|| format!("Could not open {}", file.display()))?,
-                    format.map_or_else(
-                        || {
-                            rdf_format_from_path(&file.with_extension("")).with_context(|| {
-                                format!("Could not guess type of file {}", file.display())
-                            })
-                        },
-                        Ok,
+                    get_quads(
+                        file.display().to_string(),
+                        deko::read::AnyDecoder::new(
+                            std::fs::File::open(file)
+                                .with_context(|| format!("Could not open {}", file.display()))?,
+                        ),
+                        format.map_or_else(
+                            || {
+                                rdf_format_from_path(&file.with_extension("")).with_context(|| {
+                                    format!("Could not guess type of file {}", file.display())
+                                })
+                            },
+                            Ok,
+                        )?,
+                        args.base.as_deref(),
+                        graph.clone(),
+                        args.lenient,
                     )?,
-                    args.base.as_deref(),
-                    graph.clone(),
-                    args.lenient,
-                )
+                ))
             }
         })
         .collect();
 
-    let parallel_file_quad_factories: Vec<_> = args
+    let parallel_quad_factories: Vec<_> = args
         .file
         .iter()
         .map(|file| {
             move || {
-                get_parallel_quads(
+                Ok((
                     file.display().to_string(),
-                    std::fs::File::open(file)
-                        .with_context(|| format!("Could not open {}", file.display()))?,
-                    format.map_or_else(
-                        || {
-                            rdf_format_from_path(&file.with_extension("")).with_context(|| {
-                                format!("Could not guess type of file {}", file.display())
-                            })
-                        },
-                        Ok,
+                    get_parallel_quads(
+                        file.display().to_string(),
+                        deko::read::AnyDecoder::new(
+                            std::fs::File::open(file)
+                                .with_context(|| format!("Could not open {}", file.display()))?,
+                        ),
+                        format.map_or_else(
+                            || {
+                                rdf_format_from_path(&file.with_extension("")).with_context(|| {
+                                    format!("Could not guess type of file {}", file.display())
+                                })
+                            },
+                            Ok,
+                        )?,
+                        args.base.as_deref(),
+                        graph.clone(),
+                        args.lenient,
                     )?,
-                    args.base.as_deref(),
-                    graph.clone(),
-                    args.lenient,
-                )
-            }
-        })
-        .collect();
-
-    let command_quad_factories: Vec<_> = args
-        .command
-        .iter()
-        .map(|command| {
-            move || {
-                get_quads(
-                    command.clone(),
-                    Command::new("sh")
-                        .arg("-c")
-                        .arg(command)
-                        .stdout(Stdio::piped())
-                        .spawn()
-                        .with_context(|| format!("Could not spawn {command}"))?
-                        .stdout
-                        .take()
-                        .unwrap(),
-                    format.unwrap(),
-                    args.base.as_deref(),
-                    graph.clone(),
-                    args.lenient,
-                )
-            }
-        })
-        .collect();
-
-    let parallel_command_quad_factories: Vec<_> = args
-        .command
-        .iter()
-        .map(|command| {
-            move || {
-                get_parallel_quads(
-                    command.clone(),
-                    Command::new("sh")
-                        .arg("-c")
-                        .arg(command)
-                        .stdout(Stdio::piped())
-                        .spawn()
-                        .with_context(|| format!("Could not spawn {command}"))?
-                        .stdout
-                        .take()
-                        .unwrap(),
-                    format.unwrap(),
-                    args.base.as_deref(),
-                    graph.clone(),
-                    args.lenient,
-                )
+                ))
             }
         })
         .collect();
@@ -211,47 +157,39 @@ pub fn main() -> Result<()> {
     */
 
     let get_quad_parallel_iterator = || -> Result<_> {
-        let file_quad_iterators = file_quad_factories
+        Ok(quad_factories
             .iter()
             .map(|factory| (factory)())
             .collect::<Result<Vec<_>>>()?
             .into_par_iter()
-            .flatten_iter();
-        let command_quad_iterators = command_quad_factories
-            .iter()
-            .map(|factory| (factory)())
-            .collect::<Result<Vec<_>>>()?
-            .into_par_iter()
-            .flatten_iter();
-        Ok(file_quad_iterators
-            .chain(command_quad_iterators)
-            .flat_map(if args.lenient {
-                ignore_quad_error
-            } else {
-                some_quad
-            }))
+            .flat_map_iter(|(file_name, file)| {
+                file.map(move |quad| match quad {
+                    Err(e) if !args.lenient => {
+                        eprintln!("Parsing error in {file_name}: {e}");
+                        None
+                    }
+                    quad => Some(quad.with_context(|| format!("Could not parse {file_name}"))),
+                })
+            })
+            .flatten())
     };
 
     let get_parallel_quad_parallel_iterator = || -> Result<_> {
-        let file_quad_iterators = parallel_file_quad_factories
+        Ok(parallel_quad_factories
             .iter()
             .map(|factory| (factory)())
             .collect::<Result<Vec<_>>>()?
             .into_par_iter()
-            .flatten();
-        let command_quad_parallel_iterators = parallel_command_quad_factories
-            .iter()
-            .map(|factory| (factory)())
-            .collect::<Result<Vec<_>>>()?
-            .into_par_iter()
-            .flatten();
-        Ok(file_quad_iterators
-            .chain(command_quad_parallel_iterators)
-            .flat_map(if args.lenient {
-                ignore_quad_error
-            } else {
-                some_quad
-            }))
+            .flat_map(|(file_name, file)| {
+                file.map(move |quad| match quad {
+                    Err(e) if !args.lenient => {
+                        eprintln!("Parsing error in {file_name}: {e}");
+                        None
+                    }
+                    quad => Some(quad.with_context(|| format!("Could not parse {file_name}"))),
+                })
+            })
+            .flatten())
     };
 
     let mphf = if args.parallel_parser {
@@ -267,18 +205,6 @@ pub fn main() -> Result<()> {
     };
 
     Ok(())
-}
-
-#[expect(clippy::unnecessary_wraps)]
-fn some_quad(quad: Result<Quad, RdfParseError>) -> Option<Result<Quad, RdfParseError>> {
-    Some(quad)
-}
-fn ignore_quad_error(quad: Result<Quad, RdfParseError>) -> Option<Result<Quad, RdfParseError>> {
-    if let Err(e) = quad {
-        eprintln!("Parsing error: {e}");
-        return None;
-    }
-    Some(quad)
 }
 
 fn get_quads<R: Read + Send + 'static>(
