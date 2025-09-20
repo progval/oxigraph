@@ -1,18 +1,120 @@
 use crate::model::{GraphName, NamedOrBlankNode, Quad, Term, Triple};
 use anyhow::{Context, Result, anyhow, ensure};
+use bytemuck::TransparentWrapper;
 use dsi_progress_logger::{ProgressLog, concurrent_progress_logger, progress_logger};
-use epserde::deser::Deserialize as EpDeserialize;
+use epserde::deser::{
+    Deserialize as EpDeserialize, DeserializeInner as EpDeserializeInner, MemCase,
+};
 use epserde::ser::Serialize as EpSerialize;
 use itertools::Itertools;
+use lender::{Lender, Lending};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::fs::File;
-use std::io::{BufWriter, Cursor, Read, Seek, Write};
-use std::path::Path;
+use std::hash::Hasher;
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Seek, Write};
+use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
+use sux::bits::bit_field_vec::BitFieldVec;
+use sux::func::{VBuilder, VFunc};
+use sux::traits::BitFieldSliceCore;
+use sux::traits::bit_field_slice::BitFieldSlice;
+use sux::utils::{FromIntoIterator, RewindableIoLender};
 use tempfile::TempDir;
+use webgraph::prelude::MmapHelper;
+use zstd::stream::read::Decoder;
 
-pub struct TermMphf {}
+/// workaround while https://github.com/vigna/sux-rs/pull/78 is not merged
+#[derive(Debug, TransparentWrapper)]
+#[repr(transparent)]
+pub struct RawTerm(pub [u8]);
+
+impl epserde::traits::type_info::TypeHash for RawTerm {
+    fn type_hash(hasher: &mut impl Hasher) {
+        <&[u8]>::type_hash(hasher)
+    }
+
+    fn type_hash_val(&self, hasher: &mut impl Hasher) {
+        <&[u8]>::type_hash_val(&&self.0, hasher)
+    }
+}
+impl sux::utils::ToSig<[u64; 2]> for RawTerm {
+    fn to_sig(key: impl Borrow<Self>, seed: u64) -> [u64; 2] {
+        <&[u8]>::to_sig(&key.borrow().0, seed)
+    }
+}
+
+/// workaround while https://github.com/vigna/sux-rs/pull/78 is not merged
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct BoxedRawTerm(pub Box<[u8]>);
+
+impl Borrow<RawTerm> for BoxedRawTerm {
+    fn borrow(&self) -> &RawTerm {
+        RawTerm::wrap_ref(self.0.as_ref())
+    }
+}
+
+impl sux::utils::ToSig<[u64; 2]> for BoxedRawTerm {
+    fn to_sig(key: impl Borrow<Self>, seed: u64) -> [u64; 2] {
+        <&[u8]>::to_sig(key.borrow().0.as_ref(), seed)
+    }
+}
+
+pub struct TermMphf<D: BitFieldSlice<usize> = MmapHelper<usize>> {
+    vfunc: MemCase<VFunc<RawTerm, usize, D>>,
+    marker: PhantomData<D>,
+}
+
+impl<D: BitFieldSlice<usize>> TermMphf<D> {
+    pub fn serialize(&self, path: impl AsRef<Path>) -> Result<()>
+    where
+        VFunc<RawTerm, usize, D>: EpSerialize,
+    {
+        let path = path.as_ref();
+        std::fs::create_dir(&path)
+            .with_context(|| format!("Could not create {}", path.display()))?;
+
+        let vfunc_path = path.join("mphf.vfunc");
+        let mut file = File::create(&vfunc_path)
+            .with_context(|| format!("Could not create {}", vfunc_path.display()))?;
+        self.vfunc
+            .serialize(&mut file)
+            .with_context(|| format!("Could write VFunc to {}", vfunc_path.display()))?;
+        Ok(())
+    }
+}
+
+impl<D: BitFieldSlice<usize> + EpDeserializeInner> TermMphf<D>
+where
+    VFunc<RawTerm, usize, D>: EpDeserialize,
+{
+    pub fn deserialize(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<TermMphf<<D as EpDeserializeInner>::DeserType<'static>>>
+    where
+        <D as EpDeserializeInner>::DeserType<'static>: AsRef<[usize]>,
+        for<'a> VFunc<RawTerm, usize, D>: EpDeserializeInner<
+            DeserType<'a> = VFunc<RawTerm, usize, <D as EpDeserializeInner>::DeserType<'a>>,
+        >,
+    {
+        let path = path.as_ref();
+        let vfunc_path = path.join("mphf.vfunc");
+
+        let flags = epserde::deser::mem_case::Flags::RANDOM_ACCESS;
+        // SAFETY: this is unsafe because we can't guarantee the file won't be modified while we
+        // access it, but there is nothing we can do about this.
+        let vfunc = unsafe { <VFunc<RawTerm, usize, D>>::mmap(&vfunc_path, flags) }
+            .with_context(|| format!("Could write VFunc to {}", vfunc_path.display()))?;
+        Ok(TermMphf {
+            vfunc,
+            marker: PhantomData,
+        })
+    }
+}
 
 /// Sorts and deduplicates strings and spills to disk to save memory
 ///
@@ -181,9 +283,11 @@ impl ExternalSorter {
                         .map()
                         .context("Could not mmap SST")?
                 });
+                let get_position =
+                    |file: &mut Cursor<_>| Some(file.stream_position().map_err(Into::into));
                 Ok(
                     std::iter::repeat(()).map_while(move |()| -> Option<Result<_>> {
-                        read_length_prefixed_string(&mut reader).transpose()
+                        read_length_prefixed_string(&mut reader, get_position).transpose()
                     }),
                 )
             })
@@ -262,7 +366,10 @@ fn write_length_prefixed_string(writer: &mut impl Write, string: &[u8], path: &P
 
     Ok(())
 }
-fn read_length_prefixed_string(file: &mut (impl Read + Seek)) -> Result<Option<Box<[u8]>>> {
+fn read_length_prefixed_string<R: Read>(
+    file: &mut R,
+    get_position: impl FnOnce(&mut R) -> Option<Result<u64>>,
+) -> Result<Option<Box<[u8]>>> {
     let mut length_bytes = [0; _];
     if let Err(e) = file.read_exact(&mut length_bytes) {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -274,12 +381,16 @@ fn read_length_prefixed_string(file: &mut (impl Read + Seek)) -> Result<Option<B
         .with_context(|| format!("String is longer than {} bytes", usize::MAX))?;
     let mut string = vec![0; length];
     file.read_exact(&mut string).with_context(|| {
-        format!(
-            "Could not read next string of length {length} from offset {}",
-            file.stream_position()
-                .map(|pos| pos.to_string())
-                .unwrap_or_else(|e| format!("<error: {e}>")),
-        )
+        if let Some(position) = get_position(file) {
+            format!(
+                "Could not read next string of length {length} from offset {}",
+                position
+                    .map(|pos| pos.to_string())
+                    .unwrap_or_else(|e| format!("<error: {e}>")),
+            )
+        } else {
+            format!("Could not read next string of length {length}",)
+        }
     })?;
     Ok(Some(string.into()))
 }
@@ -358,7 +469,7 @@ fn deduplicate_terms(quads: impl ParallelIterator<Item = Result<Quad>>) -> Resul
     Ok(unique_sorted_terms)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct TermsStoreConfiguration {
     terms_per_frame: usize,
     frames_per_file: usize,
@@ -444,7 +555,16 @@ pub fn write_unique_terms(
     Ok(())
 }
 
-pub fn index_deduplicated_terms(dir: &Path) -> Result<()> {
+struct TermsFile<D> {
+    first_term_id: usize,
+    num_terms: usize,
+    path: PathBuf,
+    compressed_frames: D,
+}
+
+fn list_terms_files(
+    dir: &Path,
+) -> Result<(TermsStoreConfiguration, Vec<TermsFile<impl AsRef<[u8]>>>)> {
     let config_path = dir.join("config.json");
     let config_file = File::open(&config_path)
         .with_context(|| format!("Could not open {}", config_path.display()))?;
@@ -469,78 +589,105 @@ pub fn index_deduplicated_terms(dir: &Path) -> Result<()> {
         entries.len()
     );
 
+    Ok((
+        config.clone(),
+        entries
+            .into_par_iter()
+            .enumerate()
+            .map(|(file_id, entry)| -> Result<_> {
+                let num_terms = if file_id == num_files - 1 {
+                    let num_terms = config.num_terms % terms_per_file;
+                    if num_terms == 0 {
+                        terms_per_file
+                    } else {
+                        num_terms
+                    }
+                } else {
+                    terms_per_file
+                };
+
+                let terms_file_path = entry.path();
+                let terms_file = File::open(&terms_file_path)
+                    .with_context(|| format!("Could not open {}", terms_file_path.display()))?;
+                let terms_file_len = usize::try_from(
+                    entry
+                        .metadata()
+                        .with_context(|| format!("Could not stat {}", terms_file_path.display()))?
+                        .len(),
+                )
+                .context("File is larger than usize")?;
+
+                let compressed_frames = unsafe {
+                    mmap_rs::MmapOptions::new(terms_file_len)
+                        .context("Could not initialize mmap")?
+                        .with_file(&terms_file, 0)
+                        .map()
+                        .with_context(|| format!("Could not mmap {}", terms_file_path.display()))?
+                };
+
+                Ok(TermsFile {
+                    first_term_id: file_id * terms_per_file,
+                    num_terms,
+                    path: terms_file_path,
+                    compressed_frames,
+                })
+            })
+            .collect::<Result<_>>()?,
+    ))
+}
+
+pub fn index_terms(dir: &Path) -> Result<()> {
+    let (config, terms_files) = list_terms_files(dir)?;
     let mut pl = concurrent_progress_logger!(
         item_name = "frame",
         display_memory = true,
         local_speed = true,
         expected_updates = Some(config.num_terms / config.terms_per_frame),
     );
-    let pl = pl.threshold(1000); // more frequent updates
     pl.start("Indexing terms...");
-    entries.into_par_iter().enumerate().try_for_each_with(
-        pl.clone(),
-        |pl, (file_id, entry)| -> Result<_> {
-            let num_terms = if file_id == num_files - 1 {
-                let num_terms = config.num_terms % terms_per_file;
-                if num_terms == 0 {
-                    terms_per_file
-                } else {
-                    num_terms
-                }
-            } else {
-                terms_per_file
-            };
+
+    terms_files
+        .into_par_iter()
+        .try_for_each_with(pl.clone(), |pl, terms_file| {
+            let TermsFile {
+                first_term_id: _,
+                num_terms,
+                path,
+                compressed_frames,
+            } = terms_file;
             let num_frames = num_terms.div_ceil(config.terms_per_frame);
+            let compressed_frames = compressed_frames.as_ref();
 
-            let terms_file_path = entry.path();
-            let terms_file = File::open(&terms_file_path)
-                .with_context(|| format!("Could not open {}", terms_file_path.display()))?;
-            let terms_file_len = usize::try_from(
-                entry
-                    .metadata()
-                    .with_context(|| format!("Could not stat {}", terms_file_path.display()))?
-                    .len(),
-            )
-            .context("File is larger than usize")?;
-
-            let frames = unsafe {
-                mmap_rs::MmapOptions::new(terms_file_len)
-                    .context("Could not initialize mmap")?
-                    .with_file(&terms_file, 0)
-                    .map()
-                    .with_context(|| format!("Could not mmap {}", terms_file_path.display()))?
-            };
-
-            let mut efb = sux::dict::elias_fano::EliasFanoBuilder::new(num_terms, terms_file_len);
+            let mut efb =
+                sux::dict::elias_fano::EliasFanoBuilder::new(num_terms, compressed_frames.len());
             let mut offset = 0;
             for frame_id in 0..num_frames {
                 ensure!(
-                    !frames[offset..].is_empty(),
+                    !compressed_frames[offset..].is_empty(),
                     "Expected {num_frames} in {}, but there are only {frame_id}",
-                    terms_file_path.display()
+                    path.display()
                 );
                 efb.push(offset);
-                offset += zstd::zstd_safe::find_frame_compressed_size(&frames[offset..]).map_err(
-                    |errno| {
+                offset += zstd::zstd_safe::find_frame_compressed_size(&compressed_frames[offset..])
+                    .map_err(|errno| {
                         anyhow!(
                             "Could not get compressed size of frame {frame_id} of {}: {}",
-                            terms_file_path.display(),
+                            path.display(),
                             zstd::zstd_safe::get_error_name(errno)
                         )
-                    },
-                )?;
+                    })?;
                 pl.light_update();
             }
             ensure!(
-                frames[offset..].is_empty(),
+                compressed_frames[offset..].is_empty(),
                 "Expected {num_frames} in {}, but there are more ({} unread bytes)",
-                terms_file_path.display(),
-                frames[offset..].len()
+                path.display(),
+                compressed_frames[offset..].len()
             );
 
             let ef = efb.build_with_seq();
 
-            let index_file_path = terms_file_path.with_extension("ef");
+            let index_file_path = path.with_extension("ef");
             let mut index_file = File::create(&index_file_path)
                 .with_context(|| format!("Could not create {}", index_file_path.display()))?;
             ef.serialize(&mut index_file).with_context(|| {
@@ -551,9 +698,183 @@ pub fn index_deduplicated_terms(dir: &Path) -> Result<()> {
             })?;
 
             Ok(())
-        },
-    )?;
+        })?;
     pl.done();
 
     Ok(())
+}
+
+pub fn build_terms_mph(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
+    let (config, terms_files) = list_terms_files(dir)?;
+
+    let terms_lender = RewindableIoFlattenLender::new(
+        terms_files
+            .iter()
+            .map(|terms_file| {
+                let TermsFile {
+                    first_term_id: _,
+                    num_terms,
+                    path,
+                    compressed_frames,
+                } = terms_file;
+
+                ZstdLengthPrefixedStringLender::new(Cursor::new(compressed_frames))
+                    .map_err(DecodeError)
+            })
+            .collect::<Result<_, DecodeError>>()?,
+    );
+
+    let mut pl = progress_logger!(
+        item_name = "term",
+        display_memory = true,
+        local_speed = true,
+        expected_updates = Some(config.num_terms),
+    );
+    pl.start("Building MPHF...");
+
+    let builder = VBuilder::<_, BitFieldVec<usize>>::default().expected_num_keys(config.num_terms)
+        .check_dups(true)
+        .offline(true) // Save memory by spilling to disk
+        .low_mem(true) // Save memory by using slightly more CPU;
+        ;
+    let vfunc = MemCase::encase(
+        builder
+            .try_build_func::<RawTerm, BoxedRawTerm>(
+                terms_lender,
+                FromIntoIterator::from(0..config.num_terms),
+                &mut pl,
+            )
+            .context("Could not build VFunc")?,
+    );
+    pl.done();
+
+    Ok(TermMphf {
+        vfunc,
+        marker: PhantomData,
+    })
+}
+
+/// Reads a zstd-compressed file using [`read_length_prefixed_string`] on each item of each frame
+struct ZstdLengthPrefixedStringLender<R: BufRead> {
+    decoder: Decoder<'static, R>,
+    string: Option<BoxedRawTerm>,
+}
+
+impl<R: BufRead> ZstdLengthPrefixedStringLender<R> {
+    pub fn new(read: R) -> Result<Self> {
+        Ok(ZstdLengthPrefixedStringLender {
+            decoder: Decoder::with_buffer(read)?,
+            string: None,
+        })
+    }
+}
+
+impl<'lend, R: BufRead> Lending<'lend> for ZstdLengthPrefixedStringLender<R> {
+    type Lend = Result<&'lend BoxedRawTerm, DecodeError>;
+}
+
+impl<R: BufRead> Lender for ZstdLengthPrefixedStringLender<R> {
+    fn next(&mut self) -> Option<<Self as Lending<'_>>::Lend> {
+        match read_length_prefixed_string(&mut self.decoder, |_| None) {
+            Ok(Some(string)) => {
+                if let Some(previous_string) = &self.string {
+                    if string <= previous_string.0 {
+                        return Some(Err(DecodeError(anyhow!(
+                            "Unsorted strings: {} ({:?}) after {} ({:?})",
+                            String::from_utf8_lossy(&string),
+                            &string,
+                            String::from_utf8_lossy(&previous_string.0),
+                            &previous_string.0,
+                        ))));
+                    }
+                }
+                self.string = Some(BoxedRawTerm(string));
+                Some(Ok(self.string.as_ref().unwrap()))
+            }
+            Ok(None) => None,
+            Err(e) => Some(Err(e.into())),
+        }
+    }
+}
+
+impl<R: BufRead + Seek> RewindableIoLender<BoxedRawTerm> for ZstdLengthPrefixedStringLender<R> {
+    type Error = DecodeError;
+
+    fn rewind(mut self) -> Result<Self, Self::Error> {
+        let mut read = self.decoder.finish();
+        read.rewind().context("Could not rewind")?;
+        self.decoder =
+            Decoder::with_buffer(read).context("Could not create new decoder to rewind")?;
+        Ok(self)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct DecodeError(#[from] anyhow::Error);
+
+/// Equivalent to [`Lender::flatten`] but implements [`RewindableIoLender`]
+struct RewindableIoFlattenLender<L> {
+    lenders: Vec<L>,
+    current_index: usize,
+}
+
+impl<L> RewindableIoFlattenLender<L> {
+    pub fn new(lenders: Vec<L>) -> Self {
+        Self {
+            lenders,
+            current_index: 0,
+        }
+    }
+}
+
+impl<'lend, L: Lending<'lend>> Lending<'lend> for RewindableIoFlattenLender<L> {
+    type Lend = L::Lend;
+}
+
+impl<L: Lender> Lender for RewindableIoFlattenLender<L> {
+    fn next(&mut self) -> Option<<Self as Lending<'_>>::Lend> {
+        // This is equivalent to:
+        //
+        //  while let Some(current_lender) = self.lenders.get_mut(self.current_index) {
+        //      if let Some(item) = current_lender.next() {
+        //          return Some(item);
+        //      }
+        //      // exhausted the current lender, go to the next one
+        //      self.current_index += 1
+        //  }
+        //  // exhausted all lenders
+        //  None
+        //
+        //  but the borrow-checker forces us to write it this way because it doesn't understand we
+        //  only borrow one lender at a time.
+        self.lenders[self.current_index..]
+            .iter_mut()
+            .flat_map(|current_lender| {
+                if let Some(item) = current_lender.next() {
+                    return Some(item);
+                }
+
+                // exhausted the current lender, go to the next one
+                self.current_index += 1;
+
+                None
+            })
+            .next()
+    }
+}
+
+impl<T, L: RewindableIoLender<T>> RewindableIoLender<T> for RewindableIoFlattenLender<L> {
+    type Error = <L as RewindableIoLender<T>>::Error;
+
+    fn rewind(mut self) -> Result<Self, Self::Error> {
+        let mut new_lenders = Vec::with_capacity(self.lenders.len());
+        for lender in self.lenders.drain(0..=self.current_index) {
+            new_lenders.push(lender.rewind()?);
+        }
+        new_lenders.extend(self.lenders.drain(..));
+        std::mem::swap(&mut new_lenders, &mut self.lenders);
+        self.current_index = 0;
+        Ok(self)
+    }
 }

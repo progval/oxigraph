@@ -105,6 +105,9 @@ name = "anyhow"
 version = "1.0.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0674a1ddeecb70197781e945de4b3b8ffb61fa939a5597bcf48503737663100"
+dependencies = [
+ "backtrace",
+]
 
 [[package]]
 name = "approx"
@@ -264,6 +267,26 @@ name = "bumpalo"
 version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46c5e41b57b8bba42a04676d81cb89e9ee8e859a1a66f80a5a72e1cb76b34d43"
+
+[[package]]
+name = "bytemuck"
+version = "1.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3995eaeebcdf32f91f980d360f78732ddc061097ab4e39991ae7a6ace9194677"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f154e572231cb6ba2bd1176980827e3d5dc04cc183a75dea38109fbdd672d29"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+]
 
 [[package]]
 name = "byteorder"
@@ -746,6 +769,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dary_heap"
+version = "0.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06d2e3287df1c007e74221c49ca10a95d557349e54b3a75dc2fb14712c751f04"
+
+[[package]]
 name = "dashmap"
 version = "6.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -854,6 +883,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fea41bba32d969b513997752735605054bc0dfa92b4c56bf1189f2e174be7a10"
 
 [[package]]
+name = "dsi-bitstream"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49c971cdf87e1d91ee3bfb29b070b94ccc5c574eb72497011f96343a96277456"
+dependencies = [
+ "anyhow",
+ "common_traits",
+ "impl-tools 0.10.3",
+ "mem_dbg",
+ "rand",
+]
+
+[[package]]
 name = "dsi-progress-logger"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -880,6 +922,15 @@ name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+
+[[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
+]
 
 [[package]]
 name = "enum-as-inner"
@@ -1536,6 +1587,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 
 [[package]]
+name = "java-properties"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37bf6f484471c451f2b51eabd9e66b3fa7274550c5ec4b6c3d6070840945117f"
+dependencies = [
+ "encoding_rs",
+ "lazy_static",
+ "regex",
+]
+
+[[package]]
 name = "jiff"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1878,6 +1940,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "no-break"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abe9436731d9b5064ab1ea61b956a6224710b088a029d81246675e1c0166f219"
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1886,6 +1954,12 @@ dependencies = [
  "memchr",
  "minimal-lexical",
 ]
+
+[[package]]
+name = "nonmax"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "610a5acd306ec67f907abe5567859a3c693fb9886eb1f012ab8f2a47bef3db51"
 
 [[package]]
 name = "normalize-line-endings"
@@ -1935,6 +2009,16 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
+]
+
+[[package]]
+name = "num_cpus"
+version = "1.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
+dependencies = [
+ "hermit-abi",
+ "libc",
 ]
 
 [[package]]
@@ -2049,6 +2133,7 @@ name = "oxigraph"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "bzip2 0.6.0",
  "codspeed-criterion-compat",
  "csv",
@@ -2058,6 +2143,7 @@ dependencies = [
  "getrandom 0.3.3",
  "itertools 0.13.0",
  "js-sys",
+ "lender",
  "libc",
  "log",
  "mmap-rs",
@@ -2079,6 +2165,7 @@ dependencies = [
  "sux",
  "tempfile",
  "thiserror 2.0.16",
+ "webgraph",
  "zstd",
 ]
 
@@ -2230,6 +2317,15 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.16",
  "tokio",
+]
+
+[[package]]
+name = "parallel_frontier"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38a1703e84f54676175da5c1872825b7e9ba245d4f611900243cccac4232689b"
+dependencies = [
+ "rayon",
 ]
 
 [[package]]
@@ -3119,6 +3215,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sync-cell-slice"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25d346b7dba9bb779958d0db4b65da932ef2ad1d26cd469c15de1e318044386b"
+
+[[package]]
 name = "synstructure"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3543,6 +3645,43 @@ checksum = "77e4b637749ff0d92b8fad63aa1f7cff3cbe125fd49c175cd6345e7272638b12"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webgraph"
+version = "0.3.0"
+source = "git+https://github.com/vigna/webgraph-rs.git?rev=b7d1559d87c335ce069144939f436d6f765a1c99#b7d1559d87c335ce069144939f436d6f765a1c99"
+dependencies = [
+ "anyhow",
+ "bitflags 2.9.4",
+ "common_traits",
+ "crossbeam-channel",
+ "dary_heap",
+ "dsi-bitstream",
+ "dsi-progress-logger",
+ "epserde",
+ "impl-tools 0.11.2",
+ "impl-tools-lib",
+ "itertools 0.14.0",
+ "java-properties",
+ "lender",
+ "libc",
+ "log",
+ "mmap-rs",
+ "no-break",
+ "nonmax",
+ "num_cpus",
+ "parallel_frontier",
+ "predicates",
+ "rand",
+ "rayon",
+ "rdst",
+ "sealed",
+ "sux",
+ "sync-cell-slice",
+ "tempfile",
+ "thiserror 2.0.16",
+ "value-traits",
 ]
 
 [[package]]

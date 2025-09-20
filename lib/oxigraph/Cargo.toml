@@ -27,9 +27,11 @@ rdf-12 = ["oxrdfio/rdf-12", "spareval/sparql-12"]
 
 [dependencies]
 anyhow.workspace = true
+bytemuck = { workspace = true, features = ["derive"] }
 dashmap.workspace = true
 dsi-progress-logger.workspace = true
 epserde.workspace = true
+lender.workspace = true
 log.workspace = true
 itertools.workspace = true
 mmap-rs.workspace = true
@@ -49,6 +51,7 @@ spareval = { workspace = true, features = ["sep-0002", "sep-0006", "calendar-ext
 sux.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+webgraph.workspace = true
 zstd.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]

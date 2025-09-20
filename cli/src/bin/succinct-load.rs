@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, ensure};
-use clap::{Parser, Subcommand, ValueHint, Args};
+use clap::{Args, Parser, Subcommand, ValueHint};
 use oxigraph::io::{RdfFormat, RdfParseError, RdfParser};
 use oxigraph::model::{NamedNode, Quad};
 use oxigraph::succinct;
@@ -65,8 +65,11 @@ pub enum Commands {
         /// Provides an estimated time of completion
         approx_quads_per_file: Option<usize>,
     },
-    /// Step 2: reads the terms/ directory and makes each term accessible in O(1) given its position
+    /// Step 2b: reads the terms/ directory and makes each term accessible in O(1) given its position,
+    /// allowing a O(1) map from ids to terms
     IndexTerms {},
+    /// Step 3b: build a O(1) map from terms to ids
+    BuildTermsMphf {},
 }
 
 pub fn main() -> Result<()> {
@@ -106,7 +109,14 @@ pub fn main() -> Result<()> {
             }
         }
         Commands::IndexTerms {} => {
-            succinct::index_deduplicated_terms(&terms_path).context("Could not index terms")?;
+            succinct::index_terms(&terms_path).context("Could not index terms")?;
+        }
+        Commands::BuildTermsMphf {} => {
+            let mphf =
+                succinct::build_terms_mph(&terms_path).context("Could not build terms MPHF")?;
+            let mphf_path = args.location.join("terms_mphf");
+            mphf.serialize(mphf_path)
+                .context("Could not write terms MPHF")?;
         }
     }
 
@@ -116,7 +126,6 @@ pub fn main() -> Result<()> {
 fn get_parallel_iterator_from_sequential_parsers(
     args: &ParseQuadsArgs,
 ) -> Result<impl ParallelIterator<Item = Result<Quad>>> {
-
     let format = if let Some(format) = &args.format {
         Some(rdf_format_from_name(format)?)
     } else {
@@ -174,7 +183,6 @@ fn get_parallel_iterator_from_sequential_parsers(
 fn get_parallel_iterator_from_parallel_parsers(
     args: &ParseQuadsArgs,
 ) -> Result<impl ParallelIterator<Item = Result<Quad>>> {
-
     let format = if let Some(format) = &args.format {
         Some(rdf_format_from_name(format)?)
     } else {
