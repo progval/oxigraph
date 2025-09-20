@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand, ValueHint};
 use oxigraph::io::{RdfFormat, RdfParseError, RdfParser};
 use oxigraph::model::{NamedNode, Quad};
@@ -92,7 +92,7 @@ pub fn main() -> Result<()> {
             }
             if parse_args.parallel_parser {
                 // parse in parallel, process in parallel
-                succinct::write_unique_terms(
+                succinct::terms_store::write_unique_terms(
                     get_parallel_iterator_from_parallel_parsers(&parse_args)?,
                     &terms_path,
                     approx_num_quads,
@@ -100,7 +100,7 @@ pub fn main() -> Result<()> {
                 .context("Could not deduplicate or write terms")?
             } else {
                 // parse sequentially, process in parallel
-                succinct::write_unique_terms(
+                succinct::terms_store::write_unique_terms(
                     get_parallel_iterator_from_sequential_parsers(&parse_args)?,
                     &terms_path,
                     approx_num_quads,
@@ -109,11 +109,11 @@ pub fn main() -> Result<()> {
             }
         }
         Commands::IndexTerms {} => {
-            succinct::index_terms(&terms_path).context("Could not index terms")?;
+            succinct::terms_store::index_terms(&terms_path).context("Could not index terms")?;
         }
         Commands::BuildTermsMphf {} => {
             let mphf =
-                succinct::build_terms_mph(&terms_path).context("Could not build terms MPHF")?;
+                succinct::terms_mphf::build_terms_mph(&terms_path).context("Could not build terms MPHF")?;
             let mphf_path = args.location.join("terms_mphf");
             mphf.serialize(mphf_path)
                 .context("Could not write terms MPHF")?;
