@@ -1,5 +1,6 @@
+use super::terms_store::{TermsFile, list_terms_files, read_length_prefixed_string};
+use crate::model::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use anyhow::{Context, Result, anyhow};
-use std::path::Path;
 use bytemuck::TransparentWrapper;
 use dsi_progress_logger::{ProgressLog, progress_logger};
 use epserde::deser::{
@@ -12,13 +13,12 @@ use std::fs::File;
 use std::hash::Hasher;
 use std::io::{BufRead, Cursor, Seek};
 use std::marker::PhantomData;
+use std::path::Path;
 use sux::bits::bit_field_vec::BitFieldVec;
 use sux::func::{VBuilder, VFunc};
 use sux::traits::bit_field_slice::BitFieldSlice;
 use sux::utils::{FromIntoIterator, RewindableIoLender};
-use webgraph::prelude::MmapHelper;
 use zstd::stream::read::Decoder;
-use super::terms_store::{list_terms_files, TermsFile, read_length_prefixed_string};
 
 /// workaround while https://github.com/vigna/sux-rs/pull/78 is not merged
 #[derive(Debug, TransparentWrapper)]
@@ -57,9 +57,49 @@ impl sux::utils::ToSig<[u64; 2]> for BoxedRawTerm {
     }
 }
 
-pub struct TermMphf<D: BitFieldSlice<usize> = MmapHelper<usize>> {
+pub struct TermMphf<D: BitFieldSlice<usize> = BitFieldVec<usize>> {
     vfunc: MemCase<VFunc<RawTerm, usize, D>>,
     marker: PhantomData<D>,
+}
+
+impl<D: BitFieldSlice<usize>> TermMphf<D> {
+    /// Returns the number of known terms
+    pub fn len(&self) -> usize {
+        self.vfunc.len()
+    }
+
+    pub fn hash_namedorblanknode(&self, term: NamedOrBlankNode) -> Result<usize> {
+        match term {
+            NamedOrBlankNode::NamedNode(n) => self.hash_string(n.as_str()),
+            NamedOrBlankNode::BlankNode(n) => self.hash_string(n.as_str()),
+        }
+    }
+    pub fn hash_namednode(&self, term: NamedNode) -> Result<usize> {
+        self.hash_string(term.as_str())
+    }
+
+    pub fn hash_term(&self, term: Term) -> Result<usize> {
+        match term {
+            Term::NamedNode(n) => self.hash_string(n.as_str()),
+            Term::BlankNode(n) => self.hash_string(n.as_str()),
+            Term::Literal(l) => self.hash_string(l.to_string()), // XXX is that injective?
+            #[cfg(feature = "rdf-12")]
+            Term::Triple(_) => todo!("Term::Triple"),
+        }
+    }
+
+    pub fn hash_graphname(&self, graph_name: GraphName) -> Result<usize> {
+        match graph_name {
+            GraphName::NamedNode(n) => self.hash_string(n.as_str()),
+            GraphName::BlankNode(n) => self.hash_string(n.as_str()),
+            GraphName::DefaultGraph => self.hash_string("".to_owned()), // XXX I guess?
+        }
+    }
+
+    fn hash_string(&self, s: impl AsRef<str>) -> Result<usize> {
+        // TODO check in the list of terms store that it is not a collision
+        Ok(self.vfunc.get(RawTerm::wrap_ref(s.as_ref().as_bytes())))
+    }
 }
 
 impl<D: BitFieldSlice<usize>> TermMphf<D> {
@@ -81,19 +121,11 @@ impl<D: BitFieldSlice<usize>> TermMphf<D> {
     }
 }
 
-impl<D: BitFieldSlice<usize> + EpDeserializeInner> TermMphf<D>
-where
-    VFunc<RawTerm, usize, D>: EpDeserialize,
+impl<> TermMphf<BitFieldVec<usize>>
 {
-    pub fn deserialize(
-        &self,
+    pub fn mmap(
         path: impl AsRef<Path>,
-    ) -> Result<TermMphf<<D as EpDeserializeInner>::DeserType<'static>>>
-    where
-        <D as EpDeserializeInner>::DeserType<'static>: AsRef<[usize]>,
-        for<'a> VFunc<RawTerm, usize, D>: EpDeserializeInner<
-            DeserType<'a> = VFunc<RawTerm, usize, <D as EpDeserializeInner>::DeserType<'a>>,
-        >,
+    ) -> Result<TermMphf<<BitFieldVec<usize> as EpDeserializeInner>::DeserType<'static>>>
     {
         let path = path.as_ref();
         let vfunc_path = path.join("mphf.vfunc");
@@ -101,16 +133,14 @@ where
         let flags = epserde::deser::mem_case::Flags::RANDOM_ACCESS;
         // SAFETY: this is unsafe because we can't guarantee the file won't be modified while we
         // access it, but there is nothing we can do about this.
-        let vfunc = unsafe { <VFunc<RawTerm, usize, D>>::mmap(&vfunc_path, flags) }
-            .with_context(|| format!("Could write VFunc to {}", vfunc_path.display()))?;
+        let vfunc = unsafe { <VFunc<RawTerm, usize, BitFieldVec<usize>>>::mmap(&vfunc_path, flags) }
+            .with_context(|| format!("Could mmap VFunc from {}", vfunc_path.display()))?;
         Ok(TermMphf {
             vfunc,
             marker: PhantomData,
         })
     }
 }
-
-
 
 pub fn build_terms_mph(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
     let (config, terms_files) = list_terms_files(dir)?;
@@ -121,12 +151,13 @@ pub fn build_terms_mph(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
             .map(|terms_file| {
                 let TermsFile {
                     first_term_id: _,
-                    num_terms,
+                    num_terms: _,
                     path,
                     compressed_frames,
                 } = terms_file;
 
                 ZstdLengthPrefixedStringLender::new(Cursor::new(compressed_frames))
+                    .with_context(|| format!("Could not decompress {}", path.display()))
                     .map_err(DecodeError)
             })
             .collect::<Result<_, DecodeError>>()?,
@@ -286,5 +317,3 @@ impl<T, L: RewindableIoLender<T>> RewindableIoLender<T> for RewindableIoFlattenL
         Ok(self)
     }
 }
-
-

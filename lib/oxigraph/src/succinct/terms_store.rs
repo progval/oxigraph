@@ -1,16 +1,20 @@
+use super::sort::ExternalDeduplicatingStringSorter;
 use crate::model::{GraphName, NamedOrBlankNode, Quad, Term, Triple};
 use anyhow::{Context, Result, anyhow, ensure};
 use dsi_progress_logger::{ProgressLog, concurrent_progress_logger, progress_logger};
-use rayon::prelude::*;
-use itertools::Itertools;
-use serde::{Deserialize, Serialize};
 use epserde::ser::Serialize as EpSerialize;
+use itertools::Itertools;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use super::sort::ExternalDeduplicatingStringSorter;
 
-pub(super) fn write_length_prefixed_string(writer: &mut impl Write, string: &[u8], path: &Path) -> Result<()> {
+pub(super) fn write_length_prefixed_string(
+    writer: &mut impl Write,
+    string: &[u8],
+    path: &Path,
+) -> Result<()> {
     // write string's length
     writer
         .write_all(
@@ -56,7 +60,9 @@ pub(super) fn read_length_prefixed_string<R: Read>(
     Ok(Some(string.into()))
 }
 
-fn deduplicate_terms(quads: impl ParallelIterator<Item = Result<Quad>>) -> Result<ExternalDeduplicatingStringSorter> {
+fn deduplicate_terms(
+    quads: impl ParallelIterator<Item = Result<Quad>>,
+) -> Result<ExternalDeduplicatingStringSorter> {
     fn push_term(sorter: &mut ExternalDeduplicatingStringSorter, term: Term) -> Result<()> {
         match term {
             Term::NamedNode(n) => sorter.push_str(n.as_str().to_owned()),
@@ -364,4 +370,3 @@ pub fn index_terms(dir: &Path) -> Result<()> {
 
     Ok(())
 }
-

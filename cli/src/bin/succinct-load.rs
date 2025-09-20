@@ -70,6 +70,14 @@ pub enum Commands {
     IndexTerms {},
     /// Step 2b: build a O(1) map from terms to ids
     BuildTermsMphf {},
+    /// Step 3: read all quads again, and write them in a succinct format
+    CompressQuads {
+        #[command(flatten)]
+        parse_args: ParseQuadsArgs,
+        #[arg(long)]
+        /// Provides an estimated time of completion
+        approx_quads_per_file: Option<usize>,
+    },
 }
 
 pub fn main() -> Result<()> {
@@ -79,6 +87,7 @@ pub fn main() -> Result<()> {
     #[expect(clippy::shadow_same)]
     let args = &args;
     let terms_path = args.location.join("terms");
+    let quads_path = args.location.join("quads");
     match &args.command {
         Commands::ExtractTerms {
             parse_args,
@@ -112,11 +121,47 @@ pub fn main() -> Result<()> {
             succinct::terms_store::index_terms(&terms_path).context("Could not index terms")?;
         }
         Commands::BuildTermsMphf {} => {
-            let mphf =
-                succinct::terms_mphf::build_terms_mph(&terms_path).context("Could not build terms MPHF")?;
+            let mphf = succinct::terms_mphf::build_terms_mph(&terms_path)
+                .context("Could not build terms MPHF")?;
             let mphf_path = args.location.join("terms_mphf");
-            mphf.serialize(mphf_path)
-                .context("Could not write terms MPHF")?;
+            mphf.serialize(&mphf_path).with_context(|| {
+                format!("Could not write terms MPHF to {}", mphf_path.display())
+            })?;
+        }
+        Commands::CompressQuads {
+            parse_args,
+            approx_quads_per_file,
+        } => {
+            let mphf_path = args.location.join("terms_mphf");
+            let terms_mphf = succinct::terms_mphf::TermMphf::mmap(&mphf_path).with_context(|| {
+                format!("Could not mmap terms MPHF from {}", mphf_path.display())
+            })?;
+            let approx_num_quads = approx_quads_per_file
+                .map(|approx_quads_per_file| approx_quads_per_file * parse_args.file.len());
+            if !args.location.exists() {
+                std::fs::create_dir(&args.location)
+                    .with_context(|| format!("Could not create {}", args.location.display()))?;
+            }
+            if parse_args.parallel_parser {
+                // parse in parallel, process in parallel
+                succinct::quads_store::compress_quads(
+                    get_parallel_iterator_from_parallel_parsers(&parse_args)?,
+                    &quads_path,
+                    &terms_mphf,
+                    approx_num_quads,
+                )
+                .context("Could not deduplicate or write terms")?
+            } else {
+                // parse sequentially, process in parallel
+                succinct::quads_store::compress_quads(
+                    get_parallel_iterator_from_sequential_parsers(&parse_args)?,
+                    &quads_path,
+                    &terms_mphf,
+                    approx_num_quads,
+
+                )
+                .context("Could not deduplicate or write terms")?
+            }
         }
     }
 
