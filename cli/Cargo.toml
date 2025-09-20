@@ -34,7 +34,9 @@ geosparql = ["dep:spargeo"]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 deko.workspace = true
+env_logger.workspace = true
 flate2.workspace = true
+log.workspace = true
 oxhttp = { workspace = true, features = ["flate2"] }
 oxigraph.workspace = true
 oxiri.workspace = true

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, ensure};
-use clap::{Parser, ValueHint};
+use clap::{Parser, Subcommand, ValueHint, Args};
 use oxigraph::io::{RdfFormat, RdfParseError, RdfParser};
 use oxigraph::model::{NamedNode, Quad};
 use oxigraph::succinct;
@@ -7,15 +7,9 @@ use oxigraph_cli::utils::{rdf_format_from_name, rdf_format_from_path};
 use rayon::prelude::*;
 use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
-#[derive(Parser)]
-#[command(about, version, name = "oxigraph-succinct-load")]
-/// Oxigraph loader into the "succinct" storage format
-pub struct Args {
-    /// Directory in which Oxigraph data are persisted
-    #[arg(short, long, value_hint = ValueHint::DirPath)]
-    location: PathBuf,
+#[derive(Args, Clone)]
+pub struct ParseQuadsArgs {
     /// File(s) to load
     ///
     /// If multiple files are provided, they are loaded in parallel.
@@ -50,8 +44,78 @@ pub struct Args {
     graph: Option<String>,
 }
 
+#[derive(Parser)]
+#[command(about, version, name = "oxigraph-succinct-load")]
+/// Oxigraph loader into the "succinct" storage format
+pub struct GlobalArgs {
+    /// Directory in which Oxigraph data are persisted
+    #[arg(short, long, value_hint = ValueHint::DirPath)]
+    location: PathBuf,
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum Commands {
+    /// Step 1: reads quads from the input and builds a terms/ directory with unique terms
+    ExtractTerms {
+        #[command(flatten)]
+        parse_args: ParseQuadsArgs,
+        #[arg(long)]
+        /// Provides an estimated time of completion
+        approx_quads_per_file: Option<usize>,
+    },
+    /// Step 2: reads the terms/ directory and makes each term accessible in O(1) given its position
+    IndexTerms {},
+}
+
 pub fn main() -> Result<()> {
-    let args = Args::parse();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let args = GlobalArgs::parse();
+
+    #[expect(clippy::shadow_same)]
+    let args = &args;
+    let terms_path = args.location.join("terms");
+    match &args.command {
+        Commands::ExtractTerms {
+            parse_args,
+            approx_quads_per_file,
+        } => {
+            let approx_num_quads = approx_quads_per_file
+                .map(|approx_quads_per_file| approx_quads_per_file * parse_args.file.len());
+            if !args.location.exists() {
+                std::fs::create_dir(&args.location)
+                    .with_context(|| format!("Could not create {}", args.location.display()))?;
+            }
+            if parse_args.parallel_parser {
+                // parse in parallel, process in parallel
+                succinct::write_unique_terms(
+                    get_parallel_iterator_from_parallel_parsers(&parse_args)?,
+                    &terms_path,
+                    approx_num_quads,
+                )
+                .context("Could not deduplicate or write terms")?
+            } else {
+                // parse sequentially, process in parallel
+                succinct::write_unique_terms(
+                    get_parallel_iterator_from_sequential_parsers(&parse_args)?,
+                    &terms_path,
+                    approx_num_quads,
+                )
+                .context("Could not deduplicate or write terms")?
+            }
+        }
+        Commands::IndexTerms {} => {
+            succinct::index_deduplicated_terms(&terms_path).context("Could not index terms")?;
+        }
+    }
+
+    Ok(())
+}
+
+fn get_parallel_iterator_from_sequential_parsers(
+    args: &ParseQuadsArgs,
+) -> Result<impl ParallelIterator<Item = Result<Quad>>> {
 
     let format = if let Some(format) = &args.format {
         Some(rdf_format_from_name(format)?)
@@ -67,144 +131,101 @@ pub fn main() -> Result<()> {
         None
     };
 
-    #[expect(clippy::shadow_same)]
-    let args = &args;
-    #[expect(clippy::shadow_same)]
-    let graph = &graph;
-
-    let quad_factories: Vec<_> = args
+    Ok(args
         .file
         .iter()
-        .map(|file| {
-            move || {
-                Ok((
+        .map(move |file| {
+            Ok((
+                file.display().to_string(),
+                get_quads(
                     file.display().to_string(),
-                    get_quads(
-                        file.display().to_string(),
-                        deko::read::AnyDecoder::new(
-                            std::fs::File::open(file)
-                                .with_context(|| format!("Could not open {}", file.display()))?,
-                        ),
-                        format.map_or_else(
-                            || {
-                                rdf_format_from_path(&file.with_extension("")).with_context(|| {
-                                    format!("Could not guess type of file {}", file.display())
-                                })
-                            },
-                            Ok,
-                        )?,
-                        args.base.as_deref(),
-                        graph.clone(),
-                        args.lenient,
+                    deko::read::AnyDecoder::new(
+                        std::fs::File::open(file)
+                            .with_context(|| format!("Could not open {}", file.display()))?,
+                    ),
+                    format.map_or_else(
+                        || {
+                            rdf_format_from_path(&file.with_extension("")).with_context(|| {
+                                format!("Could not guess type of file {}", file.display())
+                            })
+                        },
+                        Ok,
                     )?,
-                ))
-            }
+                    args.base.as_deref(),
+                    graph.clone(),
+                    args.lenient,
+                )?,
+            ))
         })
-        .collect();
-
-    let parallel_quad_factories: Vec<_> = args
-        .file
-        .iter()
-        .map(|file| {
-            move || {
-                Ok((
-                    file.display().to_string(),
-                    get_parallel_quads(
-                        file.display().to_string(),
-                        deko::read::AnyDecoder::new(
-                            std::fs::File::open(file)
-                                .with_context(|| format!("Could not open {}", file.display()))?,
-                        ),
-                        format.map_or_else(
-                            || {
-                                rdf_format_from_path(&file.with_extension("")).with_context(|| {
-                                    format!("Could not guess type of file {}", file.display())
-                                })
-                            },
-                            Ok,
-                        )?,
-                        args.base.as_deref(),
-                        graph.clone(),
-                        args.lenient,
-                    )?,
-                ))
-            }
+        .collect::<Result<Vec<_>>>()?
+        .into_par_iter()
+        .flat_map_iter(move |(file_name, file)| {
+            file.map(move |quad| match quad {
+                Err(e) if !args.lenient => {
+                    eprintln!("Parsing error in {file_name}: {e}");
+                    None
+                }
+                quad => Some(quad.with_context(|| format!("Could not parse {file_name}"))),
+            })
         })
-        .collect();
+        .flatten())
+}
 
-    /*
-    let get_quad_iterator = || -> Result<_> {
-        let file_quad_iterators = file_quad_factories
-            .iter()
-            .map(|factory| (factory)())
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten();
-        let command_quad_iterators = command_quad_factories
-            .iter()
-            .map(|factory| (factory)())
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten();
-        Ok(file_quad_iterators
-            .chain(command_quad_iterators)
-            .flat_map(if args.lenient {
-                ignore_quad_error
-            } else {
-                some_quad
-            }))
-    };
-    */
+fn get_parallel_iterator_from_parallel_parsers(
+    args: &ParseQuadsArgs,
+) -> Result<impl ParallelIterator<Item = Result<Quad>>> {
 
-    let get_quad_parallel_iterator = || -> Result<_> {
-        Ok(quad_factories
-            .iter()
-            .map(|factory| (factory)())
-            .collect::<Result<Vec<_>>>()?
-            .into_par_iter()
-            .flat_map_iter(|(file_name, file)| {
-                file.map(move |quad| match quad {
-                    Err(e) if !args.lenient => {
-                        eprintln!("Parsing error in {file_name}: {e}");
-                        None
-                    }
-                    quad => Some(quad.with_context(|| format!("Could not parse {file_name}"))),
-                })
-            })
-            .flatten())
-    };
-
-    let get_parallel_quad_parallel_iterator = || -> Result<_> {
-        Ok(parallel_quad_factories
-            .iter()
-            .map(|factory| (factory)())
-            .collect::<Result<Vec<_>>>()?
-            .into_par_iter()
-            .flat_map(|(file_name, file)| {
-                file.map(move |quad| match quad {
-                    Err(e) if !args.lenient => {
-                        eprintln!("Parsing error in {file_name}: {e}");
-                        None
-                    }
-                    quad => Some(quad.with_context(|| format!("Could not parse {file_name}"))),
-                })
-            })
-            .flatten())
-    };
-
-    let mphf = if args.parallel_parser {
-        let parallel_parallel_iterators = (get_parallel_quad_parallel_iterator)()?;
-        // parse in parallel, process in parallel
-        eprintln!("parse in parallel");
-        succinct::build_term_mphf(parallel_parallel_iterators).context("Could not build MPH")?
+    let format = if let Some(format) = &args.format {
+        Some(rdf_format_from_name(format)?)
     } else {
-        // parse sequentially, process in parallel
-        eprintln!("parse sequentially");
-        let parallel_iterators = (get_quad_parallel_iterator)()?;
-        succinct::build_term_mphf(parallel_iterators).context("Could not build MPH")?
+        None
     };
-
-    Ok(())
+    let graph = if let Some(iri) = &args.graph {
+        Some(
+            NamedNode::new(iri)
+                .with_context(|| format!("The target graph name {iri} is invalid"))?,
+        )
+    } else {
+        None
+    };
+    Ok(args
+        .file
+        .iter()
+        .map(move |file| {
+            Ok((
+                file.display().to_string(),
+                get_parallel_quads(
+                    file.display().to_string(),
+                    deko::read::AnyDecoder::new(
+                        std::fs::File::open(file)
+                            .with_context(|| format!("Could not open {}", file.display()))?,
+                    ),
+                    format.map_or_else(
+                        || {
+                            rdf_format_from_path(&file.with_extension("")).with_context(|| {
+                                format!("Could not guess type of file {}", file.display())
+                            })
+                        },
+                        Ok,
+                    )?,
+                    args.base.as_deref(),
+                    graph.clone(),
+                    args.lenient,
+                )?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_par_iter()
+        .flat_map(move |(file_name, file)| {
+            file.map(move |quad| match quad {
+                Err(e) if !args.lenient => {
+                    eprintln!("Parsing error in {file_name}: {e}");
+                    None
+                }
+                quad => Some(quad.with_context(|| format!("Could not parse {file_name}"))),
+            })
+        })
+        .flatten())
 }
 
 fn get_quads<R: Read + Send + 'static>(
@@ -260,7 +281,7 @@ fn get_parallel_quads<R: Read + Send + 'static>(
 
     let mut reader = BufReader::new(reader);
     let buf_size = 10 * 1024 * 1024; // read blocks of at most 10MiB at a time
-    //let buf_size = 10 * 1024; // XXX debugging
+    // let buf_size = 10 * 1024; // XXX debugging
     let mut buf = Vec::with_capacity(buf_size);
     Ok(std::iter::repeat(())
         .map_while(move |()| -> Option<Result<_>> {
@@ -326,8 +347,8 @@ fn get_parallel_quads<R: Read + Send + 'static>(
                         String::from_utf8_lossy(&chunk)
                     );
                     assert!(!buf.contains(&b'\0'), "{:?}", String::from_utf8_lossy(&buf));
-                    //println!("normal chunk: {}", String::from_utf8_lossy(&chunk));
-                    //println!("drained: {}", String::from_utf8_lossy(&buf));
+                    // println!("normal chunk: {}", String::from_utf8_lossy(&chunk));
+                    // println!("drained: {}", String::from_utf8_lossy(&buf));
                     assert_eq!(chunk[0], b'<', "{}", String::from_utf8_lossy(&chunk));
                     assert_eq!(
                         chunk[chunk.len() - 1],

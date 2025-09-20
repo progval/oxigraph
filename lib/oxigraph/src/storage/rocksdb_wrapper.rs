@@ -134,7 +134,35 @@ impl Db {
             let options = Self::db_options(true)?;
             rocksdb_options_set_create_if_missing(options, 1);
             rocksdb_options_set_create_missing_column_families(options, 1);
+
             rocksdb_options_set_compression(options, rocksdb_lz4_compression.try_into().unwrap());
+            rocksdb_options_set_compression_options(
+                options, 0, // w_bits, zlib only
+                1, // from 0 to 16 for lz4
+                0, // strategy, zlib only
+                0, // max_dict_bytes, zstd only
+            );
+
+            rocksdb_options_set_bottommost_compression(
+                options,
+                rocksdb_zstd_compression.try_into().unwrap(),
+            );
+            rocksdb_options_set_bottommost_compression_options(
+                options,
+                0,               // w_bits, zlib only
+                19,              // from 0 to 16 for lz4
+                0,               // strategy, zlib only
+                8 * 1024 * 1024, // max_dict_bytes, zstd only
+                1,               // enabled
+            );
+            rocksdb_options_set_bottommost_compression_options_zstd_max_train_bytes(
+                options,
+                // 100×max_dict_bytes, as recommended by
+                // https://rocksdb.org/blog/2021/05/31/dictionary-compression.html#user-api
+                100 * 8 * 1024 * 1024,
+                1, // enabled
+            );
+
             let block_based_table_options = rocksdb_block_based_options_create();
             assert!(
                 !block_based_table_options.is_null(),

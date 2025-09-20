@@ -1,16 +1,15 @@
-use crate::io::RdfParseError;
 use crate::model::{GraphName, NamedOrBlankNode, Quad, Term, Triple};
-use crate::storage::numeric_encoder::EncodedTerm;
 use anyhow::{Context, Result, anyhow, ensure};
-use dashmap::DashSet;
+use dsi_progress_logger::{ProgressLog, concurrent_progress_logger, progress_logger};
+use epserde::deser::Deserialize as EpDeserialize;
+use epserde::ser::Serialize as EpSerialize;
 use itertools::Itertools;
 use rayon::prelude::*;
-use rustc_hash::FxBuildHasher;
 use rustc_hash::FxHashSet;
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{BufWriter, Cursor, Read, Seek, Write};
+use std::path::Path;
 use tempfile::TempDir;
 
 pub struct TermMphf {}
@@ -26,6 +25,8 @@ pub struct TermMphf {}
 ///
 /// Once the number of written files reaches the other configured threshold, all files
 /// are read, merged together in a single new file, and then deleted.
+/// Higher thresholds reduce the number of writes (as merges form a k-ary tree
+/// with k=that threshold), but require more RAM (k * Rust's DEFAULT_BUF_SIZE * number of threads)
 struct ExternalSorter {
     tempdirs: Vec<TempDir>,
     sorted_files: Vec<File>,
@@ -34,6 +35,7 @@ struct ExternalSorter {
     buffer_size: usize,
     buffer: FxHashSet<Box<[u8]>>,
     written_size: usize,
+    num_unique_items_upperbound: usize, // only counting those in files
 }
 
 impl ExternalSorter {
@@ -46,6 +48,7 @@ impl ExternalSorter {
             max_buffer_size,
             max_num_files,
             written_size: 0,
+            num_unique_items_upperbound: 0,
         })
     }
 
@@ -54,7 +57,8 @@ impl ExternalSorter {
     }
 
     pub fn push_boxed_bytes(&mut self, bytes: Box<[u8]>) -> Result<()> {
-        let bytes_len = bytes.len() + 1;
+        let bytes_len = size_of::<usize>() + bytes.len();
+
         if self.buffer_size + bytes.len() > self.max_buffer_size {
             self.flush_buffer()?;
         }
@@ -64,7 +68,6 @@ impl ExternalSorter {
             self.max_buffer_size
         );
 
-        ensure!(!bytes.contains(&b'\0'), "String contains null character");
         if self.buffer.insert(bytes) {
             self.buffer_size += bytes_len;
         }
@@ -94,7 +97,7 @@ impl ExternalSorter {
 
     fn write_sorted_items(
         &mut self,
-        sorted_items: impl Iterator<Item = Result<Box<[u8]>, std::io::Error>>,
+        sorted_items: impl Iterator<Item = Result<Box<[u8]>>>,
     ) -> Result<()> {
         if self.tempdirs.is_empty() {
             self.tempdirs
@@ -111,20 +114,16 @@ impl ExternalSorter {
 
         {
             let mut writer = BufWriter::new(&mut file);
-            let mut first = true;
             for string in sorted_items {
-                if !first {
-                    // String separator
-                    writer
-                        .write_all(b"\0")
-                        .with_context(|| format!("Could not write to {}", path.display()))?;
-                    first = false;
-                }
-                writer
-                    .write_all(&(string.context("Could not read input item")?))
-                    .with_context(|| format!("Could not write to {}", path.display()))?;
+                let string = string.context("Could not read input item")?;
+
+                write_length_prefixed_string(&mut writer, &string, &path)?;
+
+                self.num_unique_items_upperbound += 1;
             }
         }
+        file.flush()
+            .with_context(|| format!("Could not flush {}", path.display()))?;
 
         // Make file readable
         file.rewind()
@@ -137,67 +136,93 @@ impl ExternalSorter {
     pub fn compact_files(&mut self) -> Result<()> {
         let mut sorted_files = Vec::new();
         std::mem::swap(&mut sorted_files, &mut self.sorted_files);
+        self.num_unique_items_upperbound = 0; // self.write_sorted_items() will re-count them after dedup
 
-        /*
-        // Keep ownership on the old tempdirs until after we are done reading them
-        let mut tempdirs = Vec::new();
-        std::mem::swap(&mut tempdirs, &mut self.tempdirs);
-        */
         self.tempdirs.clear();
 
         let merged_items =
-            Self::iter_written_vec_bytes(sorted_files).map(|item| item.map(Vec::into_boxed_slice));
+            Self::iter_written_boxed_bytes(sorted_files).context("Could not read merged items")?;
         self.write_sorted_items(merged_items)
             .context("Could not write merged items")?;
-
-        // remove files that we just read
-        //drop(tempdirs);
 
         Ok(())
     }
 
-    fn drain_written_vec_bytes(&mut self) -> impl Iterator<Item = Result<Vec<u8>, std::io::Error>> {
+    fn drain_written_boxed_bytes(&mut self) -> Result<impl Iterator<Item = Result<Box<[u8]>>>> {
         let mut sorted_files = Vec::new();
         std::mem::swap(&mut sorted_files, &mut self.sorted_files);
-        Self::iter_written_vec_bytes(sorted_files)
+        Self::iter_written_boxed_bytes(sorted_files)
     }
 
-    fn iter_written_vec_bytes(
+    fn iter_written_boxed_bytes(
         sorted_files: Vec<File>,
-    ) -> impl Iterator<Item = Result<Vec<u8>, std::io::Error>> {
-        sorted_files
+    ) -> Result<impl Iterator<Item = Result<Box<[u8]>>>> {
+        Ok(sorted_files
             .into_iter()
-            .map(|file| BufReader::new(file).split(b'\0'))
+            .map(|file| {
+                // Don't use BufReader here, even though it's tempting to simplify this code.
+                // Some strings from Wikidata are very long (megabytes) and keep the BufReader's
+                // internal buffer capacity pretty large, wasting memory for the entire duration
+                // of the file read.
+                // This ends up using num_threads * max_num_files * ~10MB of RAM, which can be
+                // significant.
+                //
+                // Using 'file' directly instead of mmapping works too, but wastes a significant
+                // amount of time in syscall overhead because of the small reads. (It doubles the
+                // *overall* time of the merging phase on NVMe.)
+                let file_len =
+                    usize::try_from(file.metadata().context("Could not stat SST file")?.len())
+                        .context("file size overflowed usize")?;
+                let mut reader = Cursor::new(unsafe {
+                    mmap_rs::MmapOptions::new(file_len)
+                        .context("Could not initialize mmap")?
+                        .with_flags(mmap_rs::MmapFlags::SEQUENTIAL)
+                        .with_file(&file, 0)
+                        .map()
+                        .context("Could not mmap SST")?
+                });
+                Ok(
+                    std::iter::repeat(()).map_while(move |()| -> Option<Result<_>> {
+                        read_length_prefixed_string(&mut reader).transpose()
+                    }),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
             .kmerge_by(|left, right| match (left, right) {
                 (Ok(left), Ok(right)) => left < right,
                 (_, _) => true, // doesn't matter, we are going to error anyway
-            })
+            }))
     }
 
     /// Consome this external sorter and returns sorted items
-    pub fn drain_vec_bytes(&mut self) -> impl Iterator<Item = Result<Vec<u8>, std::io::Error>> {
+    pub fn drain_boxed_bytes(&mut self) -> Result<impl Iterator<Item = Result<Box<[u8]>>>> {
         let mut buffer = Default::default();
         std::mem::swap(&mut buffer, &mut self.buffer);
-        let mut buffer: Vec<_> = buffer.into_iter().collect();
+        let mut buffer: Vec<_> = buffer.into_iter().map(Box::from).collect();
         buffer.par_sort_unstable();
-        self.drain_written_vec_bytes()
+        Ok(self.drain_written_boxed_bytes()?
             // TODO: merge at the same time as the others
-            .merge_by(buffer.into_iter().dedup().map(Vec::from).map(Ok),|left, right| match (left, right) {
+            .merge_by(buffer.into_iter().dedup().map(Ok),|left, right| match (left, right) {
                 (Ok(left), Ok(right)) => left < right,
                 (_, _) => true, // doesn't matter, we are going to error anyway
-            })
-    }
-
-    /// See [`Self::iter_vec_bytes`]
-    pub fn drain_boxed_bytes(&mut self) -> impl Iterator<Item = Result<Box<[u8]>, std::io::Error>> {
-        self.drain_vec_bytes()
-            .map(|item| Ok(item?.into_boxed_slice()))
+            }))
     }
 
     pub fn merge(mut self, mut other: Self) -> Result<Self> {
+        if self.sorted_files.len() + other.sorted_files.len() > self.max_num_files {
+            let (l, r) = rayon::join(
+                || self.compact_files().context("Could not compact files"),
+                || other.compact_files().context("Could not compact files"),
+            );
+            l?;
+            r?;
+        }
+
         self.tempdirs.extend(other.tempdirs);
         self.sorted_files.extend(other.sorted_files.into_iter());
         self.written_size += other.written_size;
+        self.num_unique_items_upperbound += other.num_unique_items_upperbound;
 
         // merge smallest buffer into largest
         if self.buffer.len() < other.buffer.len() {
@@ -212,9 +237,46 @@ impl ExternalSorter {
     }
 }
 
-pub fn build_term_mphf(quads: impl ParallelIterator<Item = Result<Quad>>) -> Result<TermMphf> {
-    let num_quads = AtomicU64::new(0);
+fn write_length_prefixed_string(writer: &mut impl Write, string: &[u8], path: &Path) -> Result<()> {
+    // write string's length
+    writer
+        .write_all(
+            &u32::try_from(string.len())
+                .with_context(|| format!("String is longer than {} bytes", u32::MAX))?
+                .to_ne_bytes(),
+        )
+        .with_context(|| format!("Could not write to {}", path.display()))?;
 
+    // write string
+    writer
+        .write_all(string)
+        .with_context(|| format!("Could not write to {}", path.display()))?;
+
+    Ok(())
+}
+fn read_length_prefixed_string(file: &mut (impl Read + Seek)) -> Result<Option<Box<[u8]>>> {
+    let mut length_bytes = [0; _];
+    if let Err(e) = file.read_exact(&mut length_bytes) {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Ok(None);
+        }
+        Err(e).context("Could not read next string's length")?;
+    }
+    let length = usize::try_from(u32::from_ne_bytes(length_bytes))
+        .with_context(|| format!("String is longer than {} bytes", usize::MAX))?;
+    let mut string = vec![0; length];
+    file.read_exact(&mut string).with_context(|| {
+        format!(
+            "Could not read next string of length {length} from offset {}",
+            file.stream_position()
+                .map(|pos| pos.to_string())
+                .unwrap_or_else(|e| format!("<error: {e}>")),
+        )
+    })?;
+    Ok(Some(string.into()))
+}
+
+fn deduplicate_terms(quads: impl ParallelIterator<Item = Result<Quad>>) -> Result<ExternalSorter> {
     fn push_term(sorter: &mut ExternalSorter, term: Term) -> Result<()> {
         match term {
             Term::NamedNode(n) => sorter.push_str(n.as_str().to_owned()),
@@ -237,11 +299,11 @@ pub fn build_term_mphf(quads: impl ParallelIterator<Item = Result<Quad>>) -> Res
         }
     }
 
-    let mut unique_sorted_quads = quads
+    let unique_sorted_terms = quads
         .fold(
             || {
                 // 100MiB in-memory buffer per thread
-                ExternalSorter::new(100 * 1024 * 1024, 100)
+                ExternalSorter::new(100 * 1024 * 1024, 10)
                     .context("Could not create sorter ExternalSorter")
             },
             |thread_sorter, quad| -> Result<_> {
@@ -270,18 +332,14 @@ pub fn build_term_mphf(quads: impl ParallelIterator<Item = Result<Quad>>) -> Res
                     .context("Could not push graph name")?;
                 push_term(&mut thread_sorter, object).context("Could not push term")?;
 
-                let current_num_quads = num_quads.fetch_add(1, Ordering::Relaxed) + 1;
-                if current_num_quads % 100_000_000 == 0 {
-                    eprintln!("Loaded {}M quads", current_num_quads / 1_000_000,);
-                }
                 Ok(thread_sorter)
             },
         )
         .reduce(
             || {
-                ExternalSorter::new(100 * 1024 * 1024, 100)
+                ExternalSorter::new(100 * 1024 * 1024, 10)
                     .context("Could not create reducer ExternalSorter")
-            }, // 100MiB in-memory buffer per thread
+            },
             |left, right| {
                 left?
                     .merge(right?)
@@ -289,10 +347,205 @@ pub fn build_term_mphf(quads: impl ParallelIterator<Item = Result<Quad>>) -> Res
             },
         )?;
 
-    println!(
-        "{} unique terms",
-        unique_sorted_quads.drain_boxed_bytes().count()
+    Ok(unique_sorted_terms)
+}
+
+#[derive(Serialize, Deserialize)]
+struct TermsStoreConfiguration {
+    terms_per_frame: usize,
+    frames_per_file: usize,
+    num_terms: usize,
+}
+
+pub fn write_unique_terms(
+    quads: impl ParallelIterator<Item = Result<Quad>>,
+    dir: &Path,
+    approx_num_quads: Option<usize>,
+) -> Result<()> {
+    let mut config = TermsStoreConfiguration {
+        terms_per_frame: 16,
+        frames_per_file: 1024 * 1024,
+        num_terms: 0,
+    };
+    let compression_level = 1; // we are going to read it very often and in small chunks
+
+    let mut pl = concurrent_progress_logger!(
+        item_name = "quad",
+        display_memory = true,
+        local_speed = true,
+        expected_updates = approx_num_quads,
+    );
+    pl.start("Reading quads and deduplicating terms...");
+    let mut sorter = deduplicate_terms(quads.map_with(pl.clone(), |pl, quad| {
+        pl.light_update();
+        quad
+    }))?;
+    pl.done();
+    drop(pl);
+
+    std::fs::create_dir(dir).with_context(|| format!("Could not create {}", dir.display()))?;
+    let mut pl = progress_logger!(
+        item_name = "term",
+        display_memory = true,
+        local_speed = true,
+        expected_updates = Some(sorter.num_unique_items_upperbound),
+    );
+    pl.start("Writing terms...");
+    let term_chunk_iterator = sorter
+        .drain_boxed_bytes()
+        .context("Could not read final iterator of terms")?
+        .chunks(config.terms_per_frame * config.frames_per_file);
+    for (file_id, big_chunk) in term_chunk_iterator.into_iter().enumerate() {
+        let file_path = dir.join(format!("{file_id:0>10}.zst"));
+        let mut file = File::create(&file_path)
+            .with_context(|| format!("Could not create {}", file_path.display()))?;
+        let term_chunk_iterator = big_chunk.chunks(config.terms_per_frame);
+        for (frame_id, small_chunk) in term_chunk_iterator.into_iter().enumerate() {
+            let mut uncompressed_frame = Cursor::new(Vec::new());
+            for term in small_chunk {
+                write_length_prefixed_string(&mut uncompressed_frame, &term?, &file_path)?;
+                pl.light_update();
+                config.num_terms += 1;
+            }
+            let uncompressed_frame = &uncompressed_frame.into_inner();
+            let mut compressed_frame =
+                Vec::with_capacity(zstd::zstd_safe::compress_bound(uncompressed_frame.len()));
+            zstd::zstd_safe::compress(&mut compressed_frame, uncompressed_frame, compression_level)
+                .map_err(|errno| {
+                    anyhow!(
+                        "Could not compress frame: {}",
+                        zstd::zstd_safe::get_error_name(errno)
+                    )
+                })?;
+            file.write_all(&compressed_frame).with_context(|| {
+                format!(
+                    "Could not write frame {frame_id} of {}",
+                    file_path.display(),
+                )
+            })?;
+        }
+    }
+    pl.done();
+
+    let config_path = dir.join("config.json");
+    let config_file = File::create(&config_path)
+        .with_context(|| format!("Could not create {}", config_path.display()))?;
+    serde_json::to_writer_pretty(config_file, &config)
+        .context("Could not write terms store config")?;
+
+    Ok(())
+}
+
+pub fn index_deduplicated_terms(dir: &Path) -> Result<()> {
+    let config_path = dir.join("config.json");
+    let config_file = File::open(&config_path)
+        .with_context(|| format!("Could not open {}", config_path.display()))?;
+    let config: TermsStoreConfiguration = serde_json::from_reader(config_file)
+        .with_context(|| format!("Could not read config from {}", config_path.display()))?;
+
+    let mut entries = std::fs::read_dir(dir)
+        .with_context(|| format!("Could not list {}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("Could not stat {} entry", dir.display()))?
+        .into_iter()
+        .filter(|entry| entry.path().extension() == Some("zst".as_ref()))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+
+    let terms_per_file = config.terms_per_frame * config.frames_per_file;
+    let num_files = config.num_terms.div_ceil(terms_per_file);
+    ensure!(
+        num_files == entries.len(),
+        "Inconsistent number of .zst files in {}: expected {num_files}, got {}",
+        dir.display(),
+        entries.len()
     );
 
-    todo!("build_term_mphf");
+    let mut pl = concurrent_progress_logger!(
+        item_name = "frame",
+        display_memory = true,
+        local_speed = true,
+        expected_updates = Some(config.num_terms / config.terms_per_frame),
+    );
+    let pl = pl.threshold(1000); // more frequent updates
+    pl.start("Indexing terms...");
+    entries.into_par_iter().enumerate().try_for_each_with(
+        pl.clone(),
+        |pl, (file_id, entry)| -> Result<_> {
+            let num_terms = if file_id == num_files - 1 {
+                let num_terms = config.num_terms % terms_per_file;
+                if num_terms == 0 {
+                    terms_per_file
+                } else {
+                    num_terms
+                }
+            } else {
+                terms_per_file
+            };
+            let num_frames = num_terms.div_ceil(config.terms_per_frame);
+
+            let terms_file_path = entry.path();
+            let terms_file = File::open(&terms_file_path)
+                .with_context(|| format!("Could not open {}", terms_file_path.display()))?;
+            let terms_file_len = usize::try_from(
+                entry
+                    .metadata()
+                    .with_context(|| format!("Could not stat {}", terms_file_path.display()))?
+                    .len(),
+            )
+            .context("File is larger than usize")?;
+
+            let frames = unsafe {
+                mmap_rs::MmapOptions::new(terms_file_len)
+                    .context("Could not initialize mmap")?
+                    .with_file(&terms_file, 0)
+                    .map()
+                    .with_context(|| format!("Could not mmap {}", terms_file_path.display()))?
+            };
+
+            let mut efb = sux::dict::elias_fano::EliasFanoBuilder::new(num_terms, terms_file_len);
+            let mut offset = 0;
+            for frame_id in 0..num_frames {
+                ensure!(
+                    !frames[offset..].is_empty(),
+                    "Expected {num_frames} in {}, but there are only {frame_id}",
+                    terms_file_path.display()
+                );
+                efb.push(offset);
+                offset += zstd::zstd_safe::find_frame_compressed_size(&frames[offset..]).map_err(
+                    |errno| {
+                        anyhow!(
+                            "Could not get compressed size of frame {frame_id} of {}: {}",
+                            terms_file_path.display(),
+                            zstd::zstd_safe::get_error_name(errno)
+                        )
+                    },
+                )?;
+                pl.light_update();
+            }
+            ensure!(
+                frames[offset..].is_empty(),
+                "Expected {num_frames} in {}, but there are more ({} unread bytes)",
+                terms_file_path.display(),
+                frames[offset..].len()
+            );
+
+            let ef = efb.build_with_seq();
+
+            let index_file_path = terms_file_path.with_extension("ef");
+            let mut index_file = File::create(&index_file_path)
+                .with_context(|| format!("Could not create {}", index_file_path.display()))?;
+            ef.serialize(&mut index_file).with_context(|| {
+                format!(
+                    "Could not write Elias-Fano index to {}",
+                    index_file_path.display()
+                )
+            })?;
+
+            Ok(())
+        },
+    )?;
+    pl.done();
+
+    Ok(())
 }

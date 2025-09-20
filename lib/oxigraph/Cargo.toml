@@ -28,7 +28,11 @@ rdf-12 = ["oxrdfio/rdf-12", "spareval/sparql-12"]
 [dependencies]
 anyhow.workspace = true
 dashmap.workspace = true
+dsi-progress-logger.workspace = true
+epserde.workspace = true
+log.workspace = true
 itertools.workspace = true
+mmap-rs.workspace = true
 oxiri.workspace = true
 oxrdf = { workspace = true, features = ["oxsdatatypes"] }
 oxrdfio.workspace = true
@@ -36,12 +40,16 @@ oxsdatatypes.workspace = true
 rand.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 siphasher.workspace = true
 sparesults.workspace = true
 spargebra = { workspace = true, features = ["sep-0002", "sep-0006"] }
 spareval = { workspace = true, features = ["sep-0002", "sep-0006", "calendar-ext"] }
+sux.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+zstd.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 libc.workspace = true
