@@ -57,7 +57,7 @@ pub struct GlobalArgs {
 
 #[derive(Subcommand, Clone)]
 pub enum Commands {
-    /// Step 1: reads quads from the input and builds a terms/ directory with unique terms
+    /// Step 1: read quads from the input and builds a terms/ directory with unique terms
     ExtractTerms {
         #[command(flatten)]
         parse_args: ParseQuadsArgs,
@@ -65,10 +65,10 @@ pub enum Commands {
         /// Provides an estimated time of completion
         approx_quads_per_file: Option<usize>,
     },
-    /// Step 2b: reads the terms/ directory and makes each term accessible in O(1) given its position,
+    /// Step 2a: read the terms/ directory and makes each term accessible in O(1) given its position,
     /// allowing a O(1) map from ids to terms
     IndexTerms {},
-    /// Step 3b: build a O(1) map from terms to ids
+    /// Step 2b: build a O(1) map from terms to ids
     BuildTermsMphf {},
 }
 

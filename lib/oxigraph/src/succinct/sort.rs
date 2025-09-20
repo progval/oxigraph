@@ -20,7 +20,7 @@ use super::terms_store::{read_length_prefixed_string, write_length_prefixed_stri
 /// are read, merged together in a single new file, and then deleted.
 /// Higher thresholds reduce the number of writes (as merges form a k-ary tree
 /// with k=that threshold), but require more RAM (k * Rust's DEFAULT_BUF_SIZE * number of threads)
-pub(super) struct ExternalSorter {
+pub(super) struct ExternalDeduplicatingStringSorter {
     tempdirs: Vec<TempDir>,
     sorted_files: Vec<File>,
     max_buffer_size: usize,
@@ -31,7 +31,7 @@ pub(super) struct ExternalSorter {
     pub(super) num_unique_items_upperbound: usize, // only counting those in files
 }
 
-impl ExternalSorter {
+impl ExternalDeduplicatingStringSorter {
     pub fn new(max_buffer_size: usize, max_num_files: usize) -> Result<Self> {
         Ok(Self {
             tempdirs: Vec::new(), // Create it only if needed

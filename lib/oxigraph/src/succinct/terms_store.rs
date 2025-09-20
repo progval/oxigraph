@@ -8,7 +8,7 @@ use epserde::ser::Serialize as EpSerialize;
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use super::sort::ExternalSorter;
+use super::sort::ExternalDeduplicatingStringSorter;
 
 pub(super) fn write_length_prefixed_string(writer: &mut impl Write, string: &[u8], path: &Path) -> Result<()> {
     // write string's length
@@ -56,8 +56,8 @@ pub(super) fn read_length_prefixed_string<R: Read>(
     Ok(Some(string.into()))
 }
 
-fn deduplicate_terms(quads: impl ParallelIterator<Item = Result<Quad>>) -> Result<ExternalSorter> {
-    fn push_term(sorter: &mut ExternalSorter, term: Term) -> Result<()> {
+fn deduplicate_terms(quads: impl ParallelIterator<Item = Result<Quad>>) -> Result<ExternalDeduplicatingStringSorter> {
+    fn push_term(sorter: &mut ExternalDeduplicatingStringSorter, term: Term) -> Result<()> {
         match term {
             Term::NamedNode(n) => sorter.push_str(n.as_str().to_owned()),
             Term::BlankNode(n) => sorter.push_str(n.as_str().to_owned()),
@@ -83,11 +83,11 @@ fn deduplicate_terms(quads: impl ParallelIterator<Item = Result<Quad>>) -> Resul
         .fold(
             || {
                 // 100MiB in-memory buffer per thread
-                ExternalSorter::new(100 * 1024 * 1024, 10)
-                    .context("Could not create sorter ExternalSorter")
+                ExternalDeduplicatingStringSorter::new(100 * 1024 * 1024, 10)
+                    .context("Could not create sorter ExternalDeduplicatingStringSorter")
             },
             |thread_sorter, quad| -> Result<_> {
-                let mut thread_sorter: ExternalSorter = thread_sorter?;
+                let mut thread_sorter: ExternalDeduplicatingStringSorter = thread_sorter?;
                 let Quad {
                     subject,
                     predicate,
@@ -117,13 +117,13 @@ fn deduplicate_terms(quads: impl ParallelIterator<Item = Result<Quad>>) -> Resul
         )
         .reduce(
             || {
-                ExternalSorter::new(100 * 1024 * 1024, 10)
-                    .context("Could not create reducer ExternalSorter")
+                ExternalDeduplicatingStringSorter::new(100 * 1024 * 1024, 10)
+                    .context("Could not create reducer ExternalDeduplicatingStringSorter")
             },
             |left, right| {
                 left?
                     .merge(right?)
-                    .context("Could not merge ExternalSorter")
+                    .context("Could not merge ExternalDeduplicatingStringSorter")
             },
         )?;
 
