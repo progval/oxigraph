@@ -192,6 +192,10 @@ impl ExternalSorter {
             .kmerge_by(|left, right| match (left, right) {
                 (Ok(left), Ok(right)) => left < right,
                 (_, _) => true, // doesn't matter, we are going to error anyway
+            })
+            .dedup_by(|left, right| match (left, right) {
+                (Ok(left), Ok(right)) => left == right,
+                (_, _) => true, // doesn't matter, we are going to error anyway
             }))
     }
 
@@ -203,8 +207,12 @@ impl ExternalSorter {
         buffer.par_sort_unstable();
         Ok(self.drain_written_boxed_bytes()?
             // TODO: merge at the same time as the others
-            .merge_by(buffer.into_iter().dedup().map(Ok),|left, right| match (left, right) {
+            .merge_by(buffer.into_iter().map(Ok),|left, right| match (left, right) {
                 (Ok(left), Ok(right)) => left < right,
+                (_, _) => true, // doesn't matter, we are going to error anyway
+            })
+            .dedup_by(|left, right| match (left, right) {
+                (Ok(left), Ok(right)) => left == right,
                 (_, _) => true, // doesn't matter, we are going to error anyway
             }))
     }
