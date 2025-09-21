@@ -133,9 +133,10 @@ pub fn main() -> Result<()> {
             approx_quads_per_file,
         } => {
             let mphf_path = args.location.join("terms_mphf");
-            let terms_mphf = succinct::terms_mphf::TermMphf::mmap(&mphf_path).with_context(|| {
-                format!("Could not mmap terms MPHF from {}", mphf_path.display())
-            })?;
+            let terms_mphf =
+                succinct::terms_mphf::TermMphf::load(&mphf_path).with_context(|| {
+                    format!("Could not mmap terms MPHF from {}", mphf_path.display())
+                })?;
             let approx_num_quads = approx_quads_per_file
                 .map(|approx_quads_per_file| approx_quads_per_file * parse_args.file.len());
             if !args.location.exists() {
@@ -150,7 +151,7 @@ pub fn main() -> Result<()> {
                     &terms_mphf,
                     approx_num_quads,
                 )
-                .context("Could not deduplicate or write terms")?
+                .context("Could not compress quads")?
             } else {
                 // parse sequentially, process in parallel
                 succinct::quads_store::compress_quads(
@@ -158,9 +159,8 @@ pub fn main() -> Result<()> {
                     &quads_path,
                     &terms_mphf,
                     approx_num_quads,
-
                 )
-                .context("Could not deduplicate or write terms")?
+                .context("Could not compress quads")?
             }
         }
     }
@@ -301,7 +301,7 @@ fn get_quads<R: Read + Send + 'static>(
     if lenient {
         parser = parser.lenient();
     }
-    Ok(parser.rename_blank_nodes().for_reader(reader))
+    Ok(parser.for_reader(reader))
 }
 
 fn get_parallel_quads<R: Read + Send + 'static>(
@@ -330,7 +330,6 @@ fn get_parallel_quads<R: Read + Send + 'static>(
     if lenient {
         parser = parser.lenient();
     }
-    let parser = parser.rename_blank_nodes();
 
     let mut reader = BufReader::new(reader);
     let buf_size = 10 * 1024 * 1024; // read blocks of at most 10MiB at a time

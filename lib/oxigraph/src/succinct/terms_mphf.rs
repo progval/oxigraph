@@ -1,6 +1,6 @@
 use super::terms_store::{TermsFile, list_terms_files, read_length_prefixed_string};
 use crate::model::{GraphName, NamedNode, NamedOrBlankNode, Term};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use bytemuck::TransparentWrapper;
 use dsi_progress_logger::{ProgressLog, progress_logger};
 use epserde::deser::{
@@ -68,17 +68,17 @@ impl<D: BitFieldSlice<usize>> TermMphf<D> {
         self.vfunc.len()
     }
 
-    pub fn hash_namedorblanknode(&self, term: NamedOrBlankNode) -> Result<usize> {
+    pub fn hash_namedorblanknode(&self, term: &NamedOrBlankNode) -> Result<usize> {
         match term {
             NamedOrBlankNode::NamedNode(n) => self.hash_string(n.as_str()),
             NamedOrBlankNode::BlankNode(n) => self.hash_string(n.as_str()),
         }
     }
-    pub fn hash_namednode(&self, term: NamedNode) -> Result<usize> {
+    pub fn hash_namednode(&self, term: &NamedNode) -> Result<usize> {
         self.hash_string(term.as_str())
     }
 
-    pub fn hash_term(&self, term: Term) -> Result<usize> {
+    pub fn hash_term(&self, term: &Term) -> Result<usize> {
         match term {
             Term::NamedNode(n) => self.hash_string(n.as_str()),
             Term::BlankNode(n) => self.hash_string(n.as_str()),
@@ -88,7 +88,7 @@ impl<D: BitFieldSlice<usize>> TermMphf<D> {
         }
     }
 
-    pub fn hash_graphname(&self, graph_name: GraphName) -> Result<usize> {
+    pub fn hash_graphname(&self, graph_name: &GraphName) -> Result<usize> {
         match graph_name {
             GraphName::NamedNode(n) => self.hash_string(n.as_str()),
             GraphName::BlankNode(n) => self.hash_string(n.as_str()),
@@ -98,7 +98,13 @@ impl<D: BitFieldSlice<usize>> TermMphf<D> {
 
     fn hash_string(&self, s: impl AsRef<str>) -> Result<usize> {
         // TODO check in the list of terms store that it is not a collision
-        Ok(self.vfunc.get(RawTerm::wrap_ref(s.as_ref().as_bytes())))
+        let hash = self.vfunc.get(RawTerm::wrap_ref(s.as_ref().as_bytes()));
+        ensure!(
+            hash < self.vfunc.len(),
+            "hash={hash} for vfunc of length={}",
+            self.vfunc.len()
+        );
+        Ok(hash)
     }
 }
 
@@ -121,20 +127,36 @@ impl<D: BitFieldSlice<usize>> TermMphf<D> {
     }
 }
 
-impl<> TermMphf<BitFieldVec<usize>>
-{
+impl TermMphf<BitFieldVec<usize>> {
+    /// Alternative to [`Self::load`] that does not force this structure to be in memory
+    ///
+    /// This saves memory, but is not worth it unless it is accessed infrequently.
+    /// If you used `mmap` and a program that should maximize CPU usage does not,
+    /// this is probably why. This can be seen as page faults in the `VFunc::get_by_sig`
+    /// function when profiling eg. with `cargo flamegraph`.
     pub fn mmap(
         path: impl AsRef<Path>,
-    ) -> Result<TermMphf<<BitFieldVec<usize> as EpDeserializeInner>::DeserType<'static>>>
-    {
+    ) -> Result<TermMphf<<BitFieldVec<usize> as EpDeserializeInner>::DeserType<'static>>> {
         let path = path.as_ref();
         let vfunc_path = path.join("mphf.vfunc");
 
         let flags = epserde::deser::mem_case::Flags::RANDOM_ACCESS;
-        // SAFETY: this is unsafe because we can't guarantee the file won't be modified while we
-        // access it, but there is nothing we can do about this.
-        let vfunc = unsafe { <VFunc<RawTerm, usize, BitFieldVec<usize>>>::mmap(&vfunc_path, flags) }
+        let vfunc = <VFunc<RawTerm, usize, BitFieldVec<usize>>>::mmap(&vfunc_path, flags)
             .with_context(|| format!("Could mmap VFunc from {}", vfunc_path.display()))?;
+        Ok(TermMphf {
+            vfunc,
+            marker: PhantomData,
+        })
+    }
+
+    pub fn load(
+        path: impl AsRef<Path>,
+    ) -> Result<TermMphf<<BitFieldVec<usize> as EpDeserializeInner>::DeserType<'static>>> {
+        let path = path.as_ref();
+        let vfunc_path = path.join("mphf.vfunc");
+
+        let vfunc = <VFunc<RawTerm, usize, BitFieldVec<usize>>>::load_mem(&vfunc_path)
+            .with_context(|| format!("Could load VFunc from {}", vfunc_path.display()))?;
         Ok(TermMphf {
             vfunc,
             marker: PhantomData,
@@ -186,6 +208,13 @@ pub fn build_terms_mph(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
             .context("Could not build VFunc")?,
     );
     pl.done();
+
+    ensure!(
+        vfunc.len() == config.num_terms,
+        "vfunc.len()={}, expected {}",
+        vfunc.len(),
+        config.num_terms
+    );
 
     Ok(TermMphf {
         vfunc,

@@ -1,14 +1,18 @@
 use super::terms_store::{read_length_prefixed_string, write_length_prefixed_string};
+use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, ensure};
+use bytemuck::TransparentWrapper;
 use dsi_bitstream::prelude::*;
 use dsi_progress_logger::{ProgressLog, no_logging};
 use itertools::Itertools;
+use mmap_rs::{Mmap, MmapFlags, MmapOptions};
 use rayon::prelude::*;
-use rdst::RadixSort;
+use rdst::{RadixKey, RadixSort};
 use rustc_hash::FxHashSet;
 use std::fs::File;
 use std::io::{BufWriter, Cursor, Seek, Write};
 use sux::bits::BitFieldVec;
+use sux::traits::BitFieldSlice;
 use sux::traits::bit_field_slice::BitFieldSliceCore;
 use tempfile::TempDir;
 
@@ -172,9 +176,9 @@ impl ExternalDeduplicatingStringSorter {
                     usize::try_from(file.metadata().context("Could not stat SST file")?.len())
                         .context("file size overflowed usize")?;
                 let mut reader = Cursor::new(unsafe {
-                    mmap_rs::MmapOptions::new(file_len)
+                    MmapOptions::new(file_len)
                         .context("Could not initialize mmap")?
-                        .with_flags(mmap_rs::MmapFlags::SEQUENTIAL)
+                        .with_flags(MmapFlags::SEQUENTIAL)
                         .with_file(&file, 0)
                         .map()
                         .context("Could not mmap SST")?
@@ -191,11 +195,15 @@ impl ExternalDeduplicatingStringSorter {
             .into_iter()
             .kmerge_by(|left, right| match (left, right) {
                 (Ok(left), Ok(right)) => left < right,
-                (_, _) => true, // doesn't matter, we are going to error anyway
+                (Err(_), Ok(_)) => true,  // return error first
+                (Ok(_), Err(_)) => false, // return error first
+                (_, _) => true,           // doesn't matter
             })
             .dedup_by(|left, right| match (left, right) {
                 (Ok(left), Ok(right)) => left == right,
-                (_, _) => true, // doesn't matter, we are going to error anyway
+                (Err(_), Ok(_)) => true,  // return error first
+                (Ok(_), Err(_)) => false, // return error first
+                (_, _) => true,           // doesn't matter
             }))
     }
 
@@ -248,52 +256,50 @@ impl ExternalDeduplicatingStringSorter {
 /// Sorts arrays and spills to disk to save memory
 pub(super) struct ExternalArraySorter<const N: usize> {
     tempdirs: Vec<TempDir>,
-    sorted_files: Vec<Vec<mmap_rs::Mmap>>, // one vec for each partition
-    max_buffer_size: usize,
+    num_files_in_first_tempdir: usize,
+    sorted_files: Vec<Vec<(PathBuf, Mmap)>>, // one vec for each partition
+    max_buffer_len: usize,
+    current_buffer_len: usize,
     buffers: Vec<BitFieldVec<usize>>,
     num_partitions: usize,
     max_value: usize,
+    max_num_files_per_partition: usize,
 }
 
 impl<const N: usize> ExternalArraySorter<N> {
     /// At the end you need to process each partition in parallel, then it's good
     /// to have at least as many partitions as threads. Multiply that by
-    /// about 10 if partitions are uneven, so a single thread doesn't end up alone
+    /// a small number if partitions are uneven, so a single thread doesn't end up alone
     /// at the end writing a huge partition while other threads are already done.
     ///
     /// More partitions also save time on merging.
+    ///
+    /// On the other hand, more partitions cause sorted quads to be split into
+    /// more (and smaller) files and as many mmaps.
     pub fn new(max_value: usize, max_buffer_size: usize, num_partitions: usize) -> Result<Self> {
         let bit_width = usize::try_from(usize::BITS - max_value.leading_zeros())
             .context("Weird pointer size")?;
 
-
         Ok(Self {
             tempdirs: Vec::new(), // Create it only if needed
+            num_files_in_first_tempdir: 0,
             sorted_files: (0..num_partitions).map(|_| Vec::new()).collect(),
             buffers: (0..num_partitions)
-                .map(|_| {
-                    BitFieldVec::with_capacity(
-                        bit_width,
-                        max_buffer_size / bit_width / num_partitions,
-                    )
-                })
+                .map(|_| BitFieldVec::new(bit_width, 0))
                 .collect(),
-            max_buffer_size,
+            max_buffer_len: max_buffer_size / bit_width,
+            current_buffer_len: 0,
             num_partitions,
             max_value,
+            max_num_files_per_partition: 128,
         })
-    }
-
-    #[inline(always)]
-    fn item_width_bytes() -> usize {
-        N * usize::try_from(usize::BITS).expect("weird pointer size") / 8
     }
 
     #[inline(always)]
     fn get_partition(&self, item: [usize; N]) -> Result<usize> {
         ensure!(
             item[0] <= self.max_value,
-            "Got item {item:?}, but max value is {:?}",
+            "Got item {item:?}, but max value is {}",
             self.max_value
         );
         Ok((item[0] * self.num_partitions) / (self.max_value + 1))
@@ -306,50 +312,100 @@ impl<const N: usize> ExternalArraySorter<N> {
 
     fn push_to_partition(&mut self, item: [usize; N], partition_id: usize) -> Result<()> {
         let buffer = &self.buffers[partition_id];
-        if buffer.len() + Self::item_width_bytes() >= self.max_buffer_size {
-            self.flush_buffer(partition_id)?;
+        if self.current_buffer_len >= self.max_buffer_len {
+            // if we need to flush a buffer and this one is not too small
+            // (at least half the average), flush it
+            if buffer.len() * self.num_partitions * 2 > self.max_buffer_len {
+                self.flush_buffer(partition_id)?;
+            }
         }
         let buffer = &mut self.buffers[partition_id];
         buffer.extend(item);
+        self.current_buffer_len += N;
         Ok(())
     }
 
     fn flush_buffer(&mut self, partition_id: usize) -> Result<()> {
         let buffer = &mut self.buffers[partition_id];
+        if buffer.is_empty() {
+            return Ok(());
+        }
+
+        if self.sorted_files[partition_id].len() >= self.max_num_files_per_partition {
+            self.compact_partition(partition_id)
+                .context("Could not compact partition")?;
+        }
+        let buffer = &mut self.buffers[partition_id];
 
         // sort items in the buffer using a regular Vec (because BitFieldVec does not implement
         // sorting, especially not radix sorting)
-        let chunks = buffer.iter().chunks(4);
-        let mut sorted_vec: Vec<[usize; N]> = chunks
-            .into_iter()
-            .map(|chunk| {
-                chunk.collect_array().ok_or_else(|| {
-            anyhow!(
-                "ExternalDeduplicatingStringSorter<{}> buffer length is not a multiple of 4",
-                N
-            )
-        })
-            })
-            .collect::<Result<_>>()?;
-        if N != 4 {
-            todo!("Add support for N != 4");
+        let num_quads = buffer
+            .len()
+            .checked_div(N)
+            .ok_or_else(|| anyhow!("buffer size is not a multiple of {N}"))?;
+        let mut quads: Vec<[usize; N]> = Vec::with_capacity(num_quads);
+        let mut buffer_iter = buffer.iter();
+        for _ in 0..num_quads {
+            let mut quad = [0; N];
+            for i in 0..N {
+                quad[i] = buffer_iter
+                    .next()
+                    .ok_or_else(|| anyhow!("buffer_iter is shorter than expected"))?;
+            }
+            quads.push(quad);
         }
-        // FIXME: replace '4' with 'N'
-        bytemuck::cast_slice_mut::<_, [u8; (4 * (usize::BITS / 8)) as usize]>(&mut sorted_vec)
-            .radix_sort_unstable();
+
+        // if N != 4 {
+        // todo!("Add support for N != 4");
+        // }
+        // FIXME: replace '4' with 'N' (https://github.com/rust-lang/rust/issues/76560)
+        // bytemuck::cast_slice_mut::<_, [u8; (4 * (usize::BITS / 8)) as usize]>(&mut sorted_vec)
+        // .radix_sort_unstable();
+        #[derive(TransparentWrapper, Clone, Copy)]
+        #[repr(transparent)]
+        struct Quad<const N: usize>([usize; N]);
+
+        impl<const N: usize> RadixKey for Quad<N> {
+            const LEVELS: usize = N * usize::LEVELS;
+
+            #[inline]
+            fn get_level(&self, level: usize) -> u8 {
+                self.0[N - level / usize::LEVELS - 1].get_level(level % usize::LEVELS)
+            }
+        }
+        Quad::<N>::wrap_slice_mut(&mut quads).radix_sort_unstable();
+
+        assert!(quads.is_sorted());
+        self.current_buffer_len -= buffer.len();
         buffer.clear();
 
+        self.write_sorted_quads(partition_id, quads.into_iter().map(Ok))?;
+
+        Ok(())
+    }
+
+    fn write_sorted_quads(
+        &mut self,
+        partition_id: usize,
+        quads: impl IntoIterator<Item = Result<[usize; N]>>,
+    ) -> Result<usize> {
         // write sorted quads to disk
+        if self.tempdirs.is_empty() {
+            self.tempdirs
+                .push(TempDir::new().context("Could not create temporary directory")?);
+        }
         let path = self
             .tempdirs
             .first()
             .unwrap()
             .path()
-            .join(format!("{}", self.sorted_files[partition_id].len()));
+            .join(format!("{}", self.num_files_in_first_tempdir));
         let file = File::create_new(&path)
             .with_context(|| format!("Could not create {}", path.display()))?;
+        self.num_files_in_first_tempdir += 1;
+
         let mut writer = BufBitWriter::new(WordAdapter::<usize, _>::new(file));
-        write_sorted_array_file(&mut writer, sorted_vec.into_iter().map(Ok), no_logging!())
+        let num_quads = write_sorted_array_file(&mut writer, quads.into_iter(), no_logging!())
             .with_context(|| format!("Could not write quads to {}", path.display()))?;
         let mut file = writer
             .into_inner()
@@ -366,21 +422,36 @@ impl<const N: usize> ExternalArraySorter<N> {
         )
         .context("file size overflowed usize")?;
         let data = unsafe {
-            mmap_rs::MmapOptions::new(file_len)
+            MmapOptions::new(file_len)
                 .context("Could not initialize mmap")?
-                .with_flags(mmap_rs::MmapFlags::SEQUENTIAL)
+                .with_flags(MmapFlags::SEQUENTIAL)
                 .with_file(&file, 0)
                 .map()
                 .context("Could not mmap sorted array file")?
         };
 
-        self.sorted_files[partition_id].push(data);
-        buffer.clear();
+        self.sorted_files[partition_id].push((path, data));
+
+        Ok(num_quads)
+    }
+
+    fn compact_partition(&mut self, partition_id: usize) -> Result<()> {
+        let mut sorted_files = Vec::new();
+        std::mem::swap(&mut sorted_files, &mut self.sorted_files[partition_id]);
+
+        let merged_quads = Self::iter_written_quads(&sorted_files)?;
+        let num_quads = self.write_sorted_quads(partition_id, merged_quads)
+            .context("Could not write compacted items")?;
+        log::debug!("Compacted {num_quads} quads in partition {partition_id}");
+
+        for (path, _) in sorted_files {
+            std::fs::remove_file(&path).with_context(|| format!("Could not remove {}", path.display()))?;
+        }
 
         Ok(())
     }
 
-    pub fn merge(mut self, other: Self) -> Result<Self> {
+    pub fn merge(mut self, mut other: Self) -> Result<Self> {
         ensure!(
             self.max_value == other.max_value,
             "Tried to merge ExternalArraySorter with different max_value ({} with {})",
@@ -392,46 +463,66 @@ impl<const N: usize> ExternalArraySorter<N> {
         for (self_partition, other_partition) in self
             .sorted_files
             .iter_mut()
-            .zip(other.sorted_files.into_iter())
+            .zip(other.sorted_files.iter_mut())
         {
-            self_partition.extend(other_partition);
+            if self_partition.len() < other_partition.len() {
+                std::mem::swap(self_partition, other_partition);
+            }
+            self_partition.extend(other_partition.drain(..));
         }
 
         // TODO: flush all partitions if they are already above a certain size,
         // so we can just move the buffers instead of copying them.
         for (partition_id, partition) in other.buffers.into_iter().enumerate() {
-            let chunks = partition.iter().chunks(N);
-            for item in chunks.into_iter() {
-                self.push_to_partition(
-                    item.collect_array()
-                        .ok_or_else(|| anyhow!("buffer size is not a multiple of {N}"))?,
-                    partition_id,
-                )
-                .context("Could not push merged item")?;
+            let num_quads = partition
+                .len()
+                .checked_div(N)
+                .ok_or_else(|| anyhow!("buffer size is not a multiple of {N}"))?;
+            for quad_id in 0..num_quads {
+                let mut quad = [0; N];
+                for i in 0..N {
+                    quad[i] = partition.get(quad_id * N + i);
+                }
+                self.push_to_partition(quad, partition_id)
+                    .context("Could not push merged item")?;
             }
         }
 
         Ok(self)
     }
 
-    pub fn iter_partitions(&mut self) -> Result<Vec<impl Iterator<Item = Result<[usize; N]>>>> {
+    pub fn flush_buffers(&mut self) -> Result<()> {
         for partition_id in 0..self.buffers.len() {
             self.flush_buffer(partition_id)
                 .context("Could not flush buffer before reading")?;
         }
-        Ok(self
-            .sorted_files
+        Ok(())
+    }
+
+    pub fn iter_partitions(&mut self) -> Result<Vec<impl Iterator<Item = Result<[usize; N]>>>> {
+        self.flush_buffers()?;
+        self.sorted_files
             .iter()
-            .map(|partition| {
-                partition
-                    .iter()
-                    .map(|file| read_sorted_array_file(BufBitReader::new(MemWordReader::new(file))))
-                    .kmerge_by(|left, right| match (left, right) {
-                        (Ok(left), Ok(right)) => left < right,
-                        (_, _) => true, // doesn't matter, we are going to error anyway
-                    })
+            .map(|partition| Self::iter_written_quads(&partition))
+            .collect()
+    }
+
+    fn iter_written_quads(files: &[(PathBuf, Mmap)]) -> Result<impl Iterator<Item = Result<[usize; N]>>> {
+        Ok(files
+            .iter()
+            .map(|(_path, file)| {
+                read_sorted_array_file(BufBitReader::new(MemWordReader::<u64, _>::new(
+                    bytemuck::cast_slice(file),
+                )))
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .kmerge_by(|left, right| match (left, right) {
+                (Ok(left), Ok(right)) => left < right,
+                (Err(_), Ok(_)) => true,  // return error first
+                (Ok(_), Err(_)) => false, // return error first
+                (_, _) => true,           // doesn't matter
+            }))
     }
 }
 
@@ -439,70 +530,164 @@ pub fn write_sorted_array_file<const N: usize>(
     writer: &mut (impl BitWrite<LE> + GammaWrite<LE>),
     items: impl Iterator<Item = Result<[usize; N]>>,
     pl: &mut impl ProgressLog,
-) -> Result<()> {
+) -> Result<usize> {
+    // TODO: configurable.
+    // lower frame size: inversely higher space usage
+    // higher frame size: linearly higher random access time
+    let min_frame_size = 100;
+    let max_frame_size = 10000;
+
+    let mut num_quads = 0;
     let mut previous_item = [0; N];
+    let mut actual_previous_item = [0; N];
+    let mut current_frame_size = 0;
+    let mut first_frame = true;
     for item in items {
         let item = item?;
+        assert!(
+            item >= previous_item,
+            "{item:?} after {previous_item:?} (actually: {actual_previous_item:?})"
+        );
+        assert!(
+            item >= actual_previous_item,
+            "{item:?} after {previous_item:?} (actually: {actual_previous_item:?})"
+        );
+
+        if !first_frame {
+            if (current_frame_size > min_frame_size && item[0] != previous_item[0])
+                || current_frame_size >= max_frame_size
+            {
+                // new frame
+                previous_item = [0; N];
+                current_frame_size = 0;
+                writer
+                    .write_bits(1, 1)
+                    .context("Could not write frame bit")?;
+            } else {
+                writer
+                    .write_bits(0, 1)
+                    .context("Could not write non-frame bit")?;
+            }
+        }
+        first_frame = false;
+
+
         // guaranteed to be increasing, no need to zigzag
-        writer
-            .write_gamma(
-                u64::try_from(
-                    item[0]
-                        .checked_sub(previous_item[0])
-                        .context("write_sorted_array_file got non-sorted quads")?,
-                )
-                .context("value overflows u64")?,
+        let diff = u64::try_from(item[0].checked_sub(previous_item[0]).with_context(|| {
+            format!(
+                "write_sorted_array_file got non-sorted quads ({item:?} after {previous_item:?})"
             )
-            .context("Could not write gamma")?;
+        })?)
+        .context("value overflows u64")?;
+        writer.write_gamma(diff).context("Could not write gamma")?;
 
         for (&previous_cell, &cell) in previous_item[1..].iter().zip(item[1..].iter()) {
             // TODO: we only need to zigzag if item[0] increased. otherwise we know it's positive
             // because of lexicographic order
-            let zigzag = (i64::try_from(cell).context("value overflows i64")?
-                - i64::try_from(previous_cell).context("value overflows i64")?)
-            .to_nat();
+            let diff = i64::try_from(cell).context("value overflows i64")?
+                - i64::try_from(previous_cell).context("value overflows i64")?;
+            let zigzag = diff.to_nat();
             writer
                 .write_gamma(zigzag)
                 .context("Could not write gamma")?;
         }
         previous_item = item;
+        actual_previous_item = item;
+
+        current_frame_size += 1;
+
         pl.light_update();
+        num_quads += 1;
     }
 
-    Ok(())
+    // mark end of file
+    writer
+        .write_bits(1, 1)
+        .context("Could not write last frame bit")?;
+    for _ in 0..N {
+        writer
+            .write_gamma(0)
+            .context("Could not write final gammas")?;
+    }
+
+    Ok(num_quads)
 }
 
 pub fn read_sorted_array_file<'a, const N: usize>(
     mut reader: impl BitRead<LE> + GammaRead<LE> + 'a,
-) -> impl Iterator<Item = Result<[usize; N]>> + 'a {
+) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'a> {
+    let mut actual_previous_item = [0usize; N];
     let mut previous_item = [0usize; N];
-    std::iter::repeat(()).map(move |()| {
-        let mut item = [0usize; N];
-        // guaranteed to be increasing, no need to zigzag
-        item[0] = reader
-            .read_gamma()
-            .context("Could not read gamma")?
-            .checked_add(previous_item[0] as u64)
-            .context("value overflows u64")?
-            .try_into()
-            .context("value overflows usize")?;
-
-        for (&previous_cell, cell) in previous_item[1..].iter().zip(item[1..].iter_mut()) {
-            // TODO: we only need to zigzag if item[0] increased. otherwise we know it's positive
-            // because of lexicographic order
-            let zigzag = reader.read_gamma().context("Could not read gamma")?;
-            let diff = zigzag.to_int();
-
-            *cell = u64::try_from(previous_cell)
-                .context("value overflows u64")?
-                .checked_add_signed(diff)
-                .context("value overflows u64")?
+    let mut new_frame = false;
+    Ok(std::iter::repeat(()).map_while(move |()| {
+        (|| {
+            let mut item = [0usize; N];
+            // guaranteed to be increasing, no need to zigzag
+            let diff = reader.read_gamma().context("Could not read gamma")?;
+            item[0] = diff
+                .checked_add(
+                    u64::try_from(previous_item[0]).context("previous value overflowed u64")?,
+                )
+                .context("value[0] overflows u64")?
                 .try_into()
                 .context("value overflows usize")?;
-        }
+            // assert!(item[0] >= actual_previous_item[0], "{} (actual {})+ {} -> {} (new frame: {new_frame:?}", previous_item[0], actual_previous_item[0], diff, item[0]);
 
-        previous_item = item;
+            for (&previous_cell, cell) in previous_item[1..].iter().zip(item[1..].iter_mut()) {
+                // TODO: we only need to zigzag if item[0] increased. otherwise we know it's positive
+                // because of lexicographic order
+                let zigzag = reader.read_gamma().context("Could not read gamma")?;
+                let diff = zigzag.to_int();
 
-        Ok(item)
-    })
+                *cell = u64::try_from(previous_cell)
+                    .context("previous value overflows u64")?
+                    .checked_add_signed(diff)
+                    .context("value overflows u64")?
+                    .try_into()
+                    .context("value overflows usize")?;
+            }
+
+            if new_frame && item == [0; N] {
+                // zeroed item after a frame bit marks the end of the file
+                return Ok(None);
+            } else {
+                assert!(
+                    item >= previous_item,
+                    "{item:?} {actual_previous_item:?} {previous_item:?}"
+                );
+                assert!(
+                    item >= actual_previous_item,
+                    "{item:?} {actual_previous_item:?} {previous_item:?}"
+                );
+                previous_item = item;
+                actual_previous_item = item;
+            }
+
+            new_frame = reader.read_bits(1).context("Could not read frame bit")? == 1;
+            if new_frame {
+                previous_item = [0; N];
+            }
+
+            Ok(Some(item))
+        })()
+        .transpose()
+    }))
+}
+
+#[test]
+fn test_read_write_sorted_array() -> Result<()> {
+    let mut buf = Vec::<u64>::new();
+    let quads: Vec<_> = vec![[1, 2, 2, 2], [1, 2, 3, 4]];
+    write_sorted_array_file(
+        &mut BufBitWriter::<LE, _>::new(MemWordWriterVec::new(&mut buf)),
+        quads.iter().copied().map(Ok),
+        no_logging!(),
+    )?;
+    assert_eq!(
+        read_sorted_array_file(BufBitReader::<LE, _>::new(MemWordReader::new(&buf)))?
+            .map(Result::unwrap)
+            .collect::<Vec<_>>(),
+        quads
+    );
+    Ok(())
 }

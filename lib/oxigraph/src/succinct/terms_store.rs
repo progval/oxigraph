@@ -89,7 +89,7 @@ fn deduplicate_terms(
         .fold(
             || {
                 // 100MiB in-memory buffer per thread
-                ExternalDeduplicatingStringSorter::new(100 * 1024 * 1024, 10)
+                ExternalDeduplicatingStringSorter::new(100 * 1024 * 1024, 16)
                     .context("Could not create sorter ExternalDeduplicatingStringSorter")
             },
             |thread_sorter, quad| -> Result<_> {
