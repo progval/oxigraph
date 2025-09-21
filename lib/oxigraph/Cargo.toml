@@ -53,6 +53,7 @@ spareval = { workspace = true, features = ["sep-0002", "sep-0006", "calendar-ext
 sux.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+thread_local.workspace = true
 webgraph.workspace = true
 zstd.workspace = true
 

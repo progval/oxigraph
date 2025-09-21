@@ -1,13 +1,14 @@
 use super::sort::{ExternalArraySorter, write_sorted_array_file};
 use super::terms_mphf::TermMphf;
 use crate::model::Quad;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use dsi_bitstream::prelude::*;
 use dsi_progress_logger::{ProgressLog, concurrent_progress_logger};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use sux::traits::bit_field_slice::BitFieldSlice;
 
 pub fn compress_quads(
@@ -25,8 +26,10 @@ pub fn compress_quads(
 
     let max_value = mphf.len();
 
-    // 100MiB in-memory buffer per thread
-    let max_buffer_size = 100 * 1024 * 1024;
+    let sorter_pool = thread_local::ThreadLocal::new();
+
+    // 500MiB in-memory buffer per thread
+    let max_buffer_size = 500 * 1024 * 1024;
     let mut pl = concurrent_progress_logger!(
         item_name = "quad",
         display_memory = true,
@@ -34,78 +37,87 @@ pub fn compress_quads(
         expected_updates = approx_num_quads,
     );
     pl.start("Reading and sorting quads...");
-    let (mut sorted_quads, num_quads) = quads
-        .fold(
-            || {
-                Ok((
-                    pl.clone(),
-                    ExternalArraySorter::<4>::new(max_value, max_buffer_size, num_partitions)
-                        .context("Could not create sorter ExternalArraySorter")?,
-                    0,
-                ))
-            },
-            |acc: Result<(_, _, _)>, quad| {
-                let (mut pl, mut sorter, num_quads) = acc.unwrap(); // XXX debug
-                // let (mut pl, mut sorter, num_quads) = acc?;
-                let quad = quad?;
-                let Quad {
-                    subject,
-                    predicate,
-                    object,
-                    graph_name,
-                } = &quad;
-                let compressed_quad = [
-                    mphf.hash_namedorblanknode(subject)
-                        .with_context(|| format!("Unknown subject: {subject:?}"))
-                        .unwrap(),
-                    mphf.hash_namednode(predicate)
-                        .with_context(|| format!("Unknown predicate: {predicate:?}"))
-                        .unwrap(),
-                    mphf.hash_term(object)
-                        .with_context(|| format!("Unknown object: {object:?}"))
-                        .unwrap(),
-                    mphf.hash_graphname(graph_name)
-                        .with_context(|| format!("Unknown graph name: {graph_name:?}"))
-                        .unwrap(),
-                ];
-                assert!(
-                    compressed_quad.iter().all(|term_id| *term_id < max_value),
-                    "Got quad {compressed_quad:?} (from {quad:?}), but max value is {}",
-                    max_value,
-                );
-                sorter
-                    .push(compressed_quad)
-                    .context("Could not push quad to sorter")?;
-                pl.light_update();
-                Ok((pl, sorter, num_quads + 1))
-            },
-        )
-        .map(|item| {
-            let (_pl, mut sorter, num_quads) = item?;
-            sorter.flush_buffers()?;
-            Ok((sorter, num_quads))
+    let num_quads = AtomicUsize::new(0);
+    let sorter_pool_ref = &sorter_pool;
+    quads.try_for_each_init(
+        || -> Result<_> {
+            Ok((
+                pl.clone(),
+                sorter_pool_ref
+                    .get_or(|| {
+                        std::cell::RefCell::new(ExternalArraySorter::<4>::new(
+                            max_value,
+                            max_buffer_size,
+                            num_partitions,
+                        ))
+                    })
+                    .borrow_mut(),
+            ))
+        },
+        |acc, quad| -> Result<_> {
+            let (pl, sorter) = acc.as_mut().unwrap(); // XXX debug
+            let mut sorter = sorter
+                .as_mut()
+                .map_err(|e| anyhow!("Could not create sorter ExternalArraySorter: {e:#?}"))?;
+            // let (mut pl, mut sorter, num_quads) = acc?;
+            let quad = quad?;
+            let Quad {
+                subject,
+                predicate,
+                object,
+                graph_name,
+            } = &quad;
+            let compressed_quad = [
+                mphf.hash_namedorblanknode(subject)
+                    .with_context(|| format!("Unknown subject: {subject:?}"))
+                    .unwrap(),
+                mphf.hash_namednode(predicate)
+                    .with_context(|| format!("Unknown predicate: {predicate:?}"))
+                    .unwrap(),
+                mphf.hash_term(object)
+                    .with_context(|| format!("Unknown object: {object:?}"))
+                    .unwrap(),
+                mphf.hash_graphname(graph_name)
+                    .with_context(|| format!("Unknown graph name: {graph_name:?}"))
+                    .unwrap(),
+            ];
+            assert!(
+                compressed_quad.iter().all(|term_id| *term_id < max_value),
+                "Got quad {compressed_quad:?} (from {quad:?}), but max value is {}",
+                max_value,
+            );
+            sorter
+                .push(compressed_quad)
+                .context("Could not push quad to sorter")?;
+            pl.light_update();
+            num_quads.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        },
+    )?;
+
+    let mut sorted_quads = sorter_pool
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|sorter| {
+            let mut sorter = sorter.into_inner().expect("could not get sorter"); // XXX debug
+            sorter.flush_buffers().expect("could not flush"); // XXX debug
+            Ok(sorter)
         })
         .reduce(
             || {
-                Ok((
+                Ok(
                     ExternalArraySorter::<4>::new(max_value, max_buffer_size, num_partitions)
                         .context("Could not create sorter ExternalArraySorter")?,
-                    0,
-                ))
+                )
             },
-            |left: Result<(_, _)>, right| {
-                let (left_sorter, left_num_quads) = left.unwrap(); //XXX debug
-                let (right_sorter, right_num_quads) = right.unwrap(); // XXX debug
-                // let (left_sorter, left_num_quads) = left?;
-                // let (right_sorter, right_num_quads) = right?;
-
-                Ok((
-                    left_sorter
-                        .merge(right_sorter)
+            |left: Result<_>, right| {
+                Ok(
+                    left.unwrap()
+                        .merge(right.unwrap())
                         .expect("Could not merge ExternalDeduplicatingStringSorter"),
                     //.context("Could not merge ExternalDeduplicatingStringSorter")?,
-                    left_num_quads + right_num_quads,
-                ))
+                )
             },
         )?;
     pl.done();
@@ -116,7 +128,7 @@ pub fn compress_quads(
         item_name = "quad",
         display_memory = true,
         local_speed = true,
-        expected_updates = Some(num_quads),
+        expected_updates = Some(num_quads.into_inner()),
     );
     pl.start("Merging and writing quads...");
     sorted_quads

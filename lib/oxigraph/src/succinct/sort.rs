@@ -1,5 +1,4 @@
 use super::terms_store::{read_length_prefixed_string, write_length_prefixed_string};
-use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, ensure};
 use bytemuck::TransparentWrapper;
 use dsi_bitstream::prelude::*;
@@ -11,6 +10,7 @@ use rdst::{RadixKey, RadixSort};
 use rustc_hash::FxHashSet;
 use std::fs::File;
 use std::io::{BufWriter, Cursor, Seek, Write};
+use std::path::PathBuf;
 use sux::bits::BitFieldVec;
 use sux::traits::BitFieldSlice;
 use sux::traits::bit_field_slice::BitFieldSliceCore;
@@ -254,10 +254,12 @@ impl ExternalDeduplicatingStringSorter {
 }
 
 /// Sorts arrays and spills to disk to save memory
+///
+/// May error with ENOMEM if sysctl setting `vm.max_map_count` is too low.
 pub(super) struct ExternalArraySorter<const N: usize> {
     tempdirs: Vec<TempDir>,
     num_files_in_first_tempdir: usize,
-    sorted_files: Vec<Vec<(PathBuf, Mmap)>>, // one vec for each partition
+    sorted_files: Vec<Vec<PathBuf>>, // one vec for each partition
     max_buffer_len: usize,
     current_buffer_len: usize,
     buffers: Vec<BitFieldVec<usize>>,
@@ -407,30 +409,14 @@ impl<const N: usize> ExternalArraySorter<N> {
         let mut writer = BufBitWriter::new(WordAdapter::<usize, _>::new(file));
         let num_quads = write_sorted_array_file(&mut writer, quads.into_iter(), no_logging!())
             .with_context(|| format!("Could not write quads to {}", path.display()))?;
-        let mut file = writer
+        writer
             .into_inner()
             .with_context(|| format!("Could not flush {}", path.display()))?
-            .into_inner();
+            .into_inner()
+            .flush()
+            .with_context(|| format!("Could not flush {}", path.display()))?;
 
-        file.rewind()
-            .with_context(|| format!("Could not rewind {}", path.display()))?;
-
-        let file_len = usize::try_from(
-            file.metadata()
-                .context("Could not stat sorted array file")?
-                .len(),
-        )
-        .context("file size overflowed usize")?;
-        let data = unsafe {
-            MmapOptions::new(file_len)
-                .context("Could not initialize mmap")?
-                .with_flags(MmapFlags::SEQUENTIAL)
-                .with_file(&file, 0)
-                .map()
-                .context("Could not mmap sorted array file")?
-        };
-
-        self.sorted_files[partition_id].push((path, data));
+        self.sorted_files[partition_id].push(path);
 
         Ok(num_quads)
     }
@@ -440,12 +426,14 @@ impl<const N: usize> ExternalArraySorter<N> {
         std::mem::swap(&mut sorted_files, &mut self.sorted_files[partition_id]);
 
         let merged_quads = Self::iter_written_quads(&sorted_files)?;
-        let num_quads = self.write_sorted_quads(partition_id, merged_quads)
+        let num_quads = self
+            .write_sorted_quads(partition_id, merged_quads)
             .context("Could not write compacted items")?;
         log::debug!("Compacted {num_quads} quads in partition {partition_id}");
 
-        for (path, _) in sorted_files {
-            std::fs::remove_file(&path).with_context(|| format!("Could not remove {}", path.display()))?;
+        for path in sorted_files {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("Could not remove {}", path.display()))?;
         }
 
         Ok(())
@@ -507,13 +495,33 @@ impl<const N: usize> ExternalArraySorter<N> {
             .collect()
     }
 
-    fn iter_written_quads(files: &[(PathBuf, Mmap)]) -> Result<impl Iterator<Item = Result<[usize; N]>>> {
+    fn iter_written_quads(files: &[PathBuf]) -> Result<impl Iterator<Item = Result<[usize; N]>>> {
         Ok(files
             .iter()
-            .map(|(_path, file)| {
-                read_sorted_array_file(BufBitReader::new(MemWordReader::<u64, _>::new(
-                    bytemuck::cast_slice(file),
-                )))
+            .map(|path| {
+                // let file = File::open(&path).with_context(|| {
+                // format!("Could not open sorted array file {}", path.display())
+                // })?;
+                //
+                // let file_len = usize::try_from(
+                // file.metadata()
+                // .with_context(|| {
+                // format!("Could not stat sorted array file {}", path.display())
+                // })?
+                // .len(),
+                // )
+                // .context("file size overflowed usize")?;
+                // let data = unsafe {
+                // MmapOptions::new(file_len)
+                // .context("Could not initialize mmap")?
+                // .with_flags(MmapFlags::SEQUENTIAL)
+                // .with_file(&file, 0)
+                // .map()
+                // .with_context(|| format!("Could not mmap array file {}", path.display()))?
+                // };
+                let data = webgraph::utils::MmapHelper::mmap(path, MmapFlags::SEQUENTIAL)
+                    .with_context(|| format!("Could not mmap array file {}", path.display()))?;
+                read_sorted_array_file(BufBitReader::new(MemWordReader::<u64, _>::new(data)))
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
@@ -570,7 +578,6 @@ pub fn write_sorted_array_file<const N: usize>(
             }
         }
         first_frame = false;
-
 
         // guaranteed to be increasing, no need to zigzag
         let diff = u64::try_from(item[0].checked_sub(previous_item[0]).with_context(|| {

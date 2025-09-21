@@ -71,6 +71,8 @@ pub enum Commands {
     /// Step 2b: build a O(1) map from terms to ids
     BuildTermsMphf {},
     /// Step 3: read all quads again, and write them in a succinct format
+    ///
+    /// May error with ENOMEM if sysctl setting `vm.max_map_count` is too low.
     CompressQuads {
         #[command(flatten)]
         parse_args: ParseQuadsArgs,
