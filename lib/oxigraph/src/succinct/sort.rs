@@ -551,7 +551,6 @@ pub fn write_sorted_array_file<const N: usize>(
     let mut previous_item = [0; N];
     let mut actual_previous_item = [0; N];
     let mut current_frame_size = 0;
-    let mut first_frame = true;
     for item in items {
         let item = item?;
         assert!(
@@ -563,23 +562,22 @@ pub fn write_sorted_array_file<const N: usize>(
             "{item:?} after {previous_item:?} (actually: {actual_previous_item:?})"
         );
 
-        if !first_frame {
-            if (current_frame_size > min_frame_size && item[0] != previous_item[0])
-                || current_frame_size >= max_frame_size
-            {
-                // new frame
-                previous_item = [0; N];
-                current_frame_size = 0;
-                writer
-                    .write_bits(1, 1)
-                    .context("Could not write frame bit")?;
-            } else {
-                writer
-                    .write_bits(0, 1)
-                    .context("Could not write non-frame bit")?;
-            }
+        assert!(item != [0; N], "invalid quad: {item:?}");
+
+        if (current_frame_size > min_frame_size && item[0] != previous_item[0])
+            || current_frame_size >= max_frame_size
+        {
+            // new frame
+            previous_item = [0; N];
+            current_frame_size = 0;
+            writer
+                .write_bits(1, 1)
+                .context("Could not write frame bit")?;
+        } else {
+            writer
+                .write_bits(0, 1)
+                .context("Could not write non-frame bit")?;
         }
-        first_frame = false;
 
         // quads are sorted lexicographically, so the first term of a quad is guaranteed to be
         // >= the first term of the previous quad
@@ -636,10 +634,15 @@ pub fn read_sorted_array_file<'a, const N: usize>(
 ) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'a> {
     let mut actual_previous_item = [0usize; N];
     let mut previous_item = [0usize; N];
-    let mut new_frame = false;
+
     Ok(std::iter::repeat(()).map_while(move |()| {
         (|| {
             let mut item = [0usize; N];
+
+            let new_frame = reader.read_bits(1).context("Could not read frame bit")? == 1;
+            if new_frame {
+                previous_item = [0; N];
+            }
 
             // quads are sorted lexicographically, so the first term of a quad is guaranteed to be
             // >= the first term of the previous quad
@@ -674,7 +677,7 @@ pub fn read_sorted_array_file<'a, const N: usize>(
             }
 
             if new_frame && item == [0; N] {
-                // zeroed item after a frame bit marks the end of the file
+                // zeroed item marks the end of the file
                 return Ok(None);
             } else {
                 assert!(
@@ -687,11 +690,6 @@ pub fn read_sorted_array_file<'a, const N: usize>(
                 );
                 previous_item = item;
                 actual_previous_item = item;
-            }
-
-            new_frame = reader.read_bits(1).context("Could not read frame bit")? == 1;
-            if new_frame {
-                previous_item = [0; N];
             }
 
             Ok(Some(item))
