@@ -79,6 +79,8 @@ pub enum Commands {
         #[arg(long)]
         /// Provides an estimated time of completion
         approx_quads_per_file: Option<usize>,
+        #[arg(long)]
+        order: succinct::quads_store::QuadOrder,
     },
 }
 
@@ -89,7 +91,6 @@ pub fn main() -> Result<()> {
     #[expect(clippy::shadow_same)]
     let args = &args;
     let terms_path = args.location.join("terms");
-    let quads_path = args.location.join("quads");
     match &args.command {
         Commands::ExtractTerms {
             parse_args,
@@ -133,7 +134,9 @@ pub fn main() -> Result<()> {
         Commands::CompressQuads {
             parse_args,
             approx_quads_per_file,
+            order,
         } => {
+            let quads_path = args.location.join(format!("quads-{order}"));
             let mphf_path = args.location.join("terms_mphf");
             let terms_mphf =
                 succinct::terms_mphf::TermMphf::load(&mphf_path).with_context(|| {
@@ -145,6 +148,7 @@ pub fn main() -> Result<()> {
                 std::fs::create_dir(&args.location)
                     .with_context(|| format!("Could not create {}", args.location.display()))?;
             }
+
             if parse_args.parallel_parser {
                 // parse in parallel, process in parallel
                 succinct::quads_store::compress_quads(
@@ -152,6 +156,7 @@ pub fn main() -> Result<()> {
                     &quads_path,
                     &terms_mphf,
                     approx_num_quads,
+                    *order,
                 )
                 .context("Could not compress quads")?
             } else {
@@ -161,6 +166,7 @@ pub fn main() -> Result<()> {
                     &quads_path,
                     &terms_mphf,
                     approx_num_quads,
+                    *order,
                 )
                 .context("Could not compress quads")?
             }

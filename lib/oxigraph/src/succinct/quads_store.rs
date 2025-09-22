@@ -11,11 +11,47 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use sux::traits::bit_field_slice::BitFieldSlice;
 
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+pub enum QuadOrder {
+    Spog,
+    Opsg,
+}
+
+impl QuadOrder {
+    pub fn predicate(self) -> fn([usize; 4]) -> [usize; 4] {
+        fn order_spog(quad: [usize; 4]) -> [usize; 4] {
+            quad
+        }
+        fn order_opsg(quad: [usize; 4]) -> [usize; 4] {
+            let [s, p, o, g] = quad;
+            [o, p, s, g]
+        }
+        use QuadOrder::*;
+        match self {
+            Spog => order_spog,
+            Opsg => order_opsg,
+        }
+    }
+}
+
+impl std::fmt::Display for QuadOrder {
+    #[inline(always)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use QuadOrder::*;
+        let s = match self {
+            Spog => "spog",
+            Opsg => "opsg",
+        };
+        write!(f, "{}", s)
+    }
+}
+
 pub fn compress_quads(
     quads: impl ParallelIterator<Item = Result<Quad>>,
     dst_dir: &Path,
     mphf: &TermMphf<impl BitFieldSlice<usize> + Sync + Send>,
     approx_num_quads: Option<usize>,
+    order: QuadOrder,
 ) -> Result<()> {
     let num_partitions = (4 * usize::from(
         std::thread::available_parallelism().context("Could not count CPU threads")?,
@@ -27,6 +63,8 @@ pub fn compress_quads(
     let max_value = mphf.len();
 
     let sorter_pool = thread_local::ThreadLocal::new();
+
+    let order_quad = order.predicate();
 
     // 500MiB in-memory buffer per thread
     let max_buffer_size = 500 * 1024 * 1024;
@@ -67,7 +105,7 @@ pub fn compress_quads(
                 object,
                 graph_name,
             } = &quad;
-            let compressed_quad = [
+            let compressed_quad = order_quad([
                 mphf.hash_namedorblanknode(subject)
                     .with_context(|| format!("Unknown subject: {subject:?}"))
                     .unwrap(),
@@ -80,7 +118,7 @@ pub fn compress_quads(
                 mphf.hash_graphname(graph_name)
                     .with_context(|| format!("Unknown graph name: {graph_name:?}"))
                     .unwrap(),
-            ];
+            ]);
             assert!(
                 compressed_quad.iter().all(|term_id| *term_id < max_value),
                 "Got quad {compressed_quad:?} (from {quad:?}), but max value is {}",

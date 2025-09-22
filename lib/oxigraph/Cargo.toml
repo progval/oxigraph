@@ -28,6 +28,7 @@ rdf-12 = ["oxrdfio/rdf-12", "spareval/sparql-12"]
 [dependencies]
 anyhow.workspace = true
 bytemuck = { workspace = true, features = ["derive", "min_const_generics"] }
+clap.workspace = true
 dashmap.workspace = true
 dsi-progress-logger.workspace = true
 dsi-bitstream.workspace = true
