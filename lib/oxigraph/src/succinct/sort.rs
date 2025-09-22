@@ -581,24 +581,33 @@ pub fn write_sorted_array_file<const N: usize>(
         }
         first_frame = false;
 
-        // guaranteed to be increasing, no need to zigzag
-        let diff = u64::try_from(item[0].checked_sub(previous_item[0]).with_context(|| {
-            format!(
-                "write_sorted_array_file got non-sorted quads ({item:?} after {previous_item:?})"
-            )
-        })?)
-        .context("value overflows u64")?;
-        writer.write_gamma(diff).context("Could not write gamma")?;
+        // quads are sorted lexicographically, so the first term of a quad is guaranteed to be
+        // >= the first term of the previous quad
+        let mut must_zigzag = false;
+        for (&previous_cell, &cell) in previous_item.iter().zip(item.iter()) {
+            if must_zigzag {
+                let diff = i64::try_from(cell).context("value overflows i64")?
+                    - i64::try_from(previous_cell).context("value overflows i64")?;
+                let zigzag = diff.to_nat();
+                writer
+                    .write_gamma(zigzag)
+                    .context("Could not write gamma")?;
+            } else {
+                let diff = u64::try_from(cell)
+                    .context("value overflows u64")?
+                    .checked_sub(u64::try_from(previous_cell).context("value overflows u64")?)
+                    .context(
+                        "write_sorted_array_file got non-sorted quads after the initial check",
+                    )?;
+                writer.write_gamma(diff).context("Could not write gamma")?;
 
-        for (&previous_cell, &cell) in previous_item[1..].iter().zip(item[1..].iter()) {
-            // TODO: we only need to zigzag if item[0] increased. otherwise we know it's positive
-            // because of lexicographic order
-            let diff = i64::try_from(cell).context("value overflows i64")?
-                - i64::try_from(previous_cell).context("value overflows i64")?;
-            let zigzag = diff.to_nat();
-            writer
-                .write_gamma(zigzag)
-                .context("Could not write gamma")?;
+                if cell > previous_cell {
+                    // this term is a strict increase, so terms after it in the quad are
+                    // not guaranteed to be >= the corresponding term in the previous quad,
+                    // so we must zigzag-encode them all for the rest of this term.
+                    must_zigzag = true;
+                }
+            }
         }
         previous_item = item;
         actual_previous_item = item;
@@ -631,29 +640,37 @@ pub fn read_sorted_array_file<'a, const N: usize>(
     Ok(std::iter::repeat(()).map_while(move |()| {
         (|| {
             let mut item = [0usize; N];
-            // guaranteed to be increasing, no need to zigzag
-            let diff = reader.read_gamma().context("Could not read gamma")?;
-            item[0] = diff
-                .checked_add(
-                    u64::try_from(previous_item[0]).context("previous value overflowed u64")?,
-                )
-                .context("value[0] overflows u64")?
-                .try_into()
-                .context("value overflows usize")?;
-            // assert!(item[0] >= actual_previous_item[0], "{} (actual {})+ {} -> {} (new frame: {new_frame:?}", previous_item[0], actual_previous_item[0], diff, item[0]);
 
-            for (&previous_cell, cell) in previous_item[1..].iter().zip(item[1..].iter_mut()) {
-                // TODO: we only need to zigzag if item[0] increased. otherwise we know it's positive
-                // because of lexicographic order
-                let zigzag = reader.read_gamma().context("Could not read gamma")?;
-                let diff = zigzag.to_int();
+            // quads are sorted lexicographically, so the first term of a quad is guaranteed to be
+            // >= the first term of the previous quad
+            let mut must_zigzag = false;
+            for (&previous_cell, cell) in previous_item.iter().zip(item.iter_mut()) {
+                if must_zigzag {
+                    let zigzag = reader.read_gamma().context("Could not read gamma")?;
+                    let diff = zigzag.to_int();
 
-                *cell = u64::try_from(previous_cell)
-                    .context("previous value overflows u64")?
-                    .checked_add_signed(diff)
-                    .context("value overflows u64")?
-                    .try_into()
-                    .context("value overflows usize")?;
+                    *cell = u64::try_from(previous_cell)
+                        .context("previous value overflows u64")?
+                        .checked_add_signed(diff)
+                        .context("value overflows u64")?
+                        .try_into()
+                        .context("value overflows usize")?;
+                } else {
+                    let diff = reader.read_gamma().context("Could not read gamma")?;
+                    *cell = u64::try_from(previous_cell)
+                        .context("previous value overflows u64")?
+                        .checked_add(diff)
+                        .context("value overflows u64")?
+                        .try_into()
+                        .context("value overflows usize")?;
+
+                    if diff > 0 {
+                        // this term is a strict increase, so terms after it in the quad are
+                        // not guaranteed to be >= the corresponding term in the previous quad,
+                        // so we must zigzag-encode them all for the rest of this term.
+                        must_zigzag = true;
+                    }
+                }
             }
 
             if new_frame && item == [0; N] {
