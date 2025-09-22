@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use dsi_bitstream::prelude::*;
 use dsi_progress_logger::{ProgressLog, concurrent_progress_logger};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -46,6 +47,12 @@ impl std::fmt::Display for QuadOrder {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct QuadStoreConfiguration {
+    num_partitions: usize,
+    num_quads: usize,
+}
+
 pub fn compress_quads(
     quads: impl ParallelIterator<Item = Result<Quad>>,
     dst_dir: &Path,
@@ -53,12 +60,15 @@ pub fn compress_quads(
     approx_num_quads: Option<usize>,
     order: QuadOrder,
 ) -> Result<()> {
-    let num_partitions = (4 * usize::from(
+    let mut config = QuadStoreConfiguration {
+        num_partitions: (4 * usize::from(
         std::thread::available_parallelism().context("Could not count CPU threads")?,
     ))
     .min(16)
     .max(256) // avoid too many files
-    .next_power_of_two();
+    .next_power_of_two(),
+        num_quads: 0,
+    };
 
     let max_value = mphf.len();
 
@@ -86,7 +96,7 @@ pub fn compress_quads(
                         std::cell::RefCell::new(ExternalArraySorter::<4>::new(
                             max_value,
                             max_buffer_size,
-                            num_partitions,
+                            config.num_partitions,
                         ))
                     })
                     .borrow_mut(),
@@ -160,13 +170,14 @@ pub fn compress_quads(
         )?;
     pl.done();
 
+    config.num_quads = num_quads.into_inner();
     std::fs::create_dir(dst_dir)
         .with_context(|| format!("Could not create {}", dst_dir.display()))?;
     let mut pl = concurrent_progress_logger!(
         item_name = "quad",
         display_memory = true,
         local_speed = true,
-        expected_updates = Some(num_quads.into_inner()),
+        expected_updates = Some(config.num_quads),
     );
     pl.start("Merging and writing quads...");
     sorted_quads
@@ -192,6 +203,12 @@ pub fn compress_quads(
             Ok(())
         })?;
     pl.done();
+
+    let config_path = dst_dir.join("config.json");
+    let config_file = File::create(&config_path)
+        .with_context(|| format!("Could not create {}", config_path.display()))?;
+    serde_json::to_writer_pretty(config_file, &config)
+        .context("Could not write terms store config")?;
 
     Ok(())
 }
