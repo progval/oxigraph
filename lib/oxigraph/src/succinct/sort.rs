@@ -406,13 +406,15 @@ impl<const N: usize> ExternalArraySorter<N> {
             .with_context(|| format!("Could not create {}", path.display()))?;
         self.num_files_in_first_tempdir += 1;
 
-        let mut writer = BufBitWriter::new(WordAdapter::<usize, _>::new(file));
+        let mut writer = BufBitWriter::new(WordAdapter::<usize, _>::new(BufWriter::new(file)));
         let num_quads = write_sorted_array_file(&mut writer, quads.into_iter(), no_logging!())
             .with_context(|| format!("Could not write quads to {}", path.display()))?;
         writer
-            .into_inner()
+            .into_inner() // BufBitWriter -> WordAdapter
             .with_context(|| format!("Could not flush {}", path.display()))?
-            .into_inner()
+            .into_inner() // WordAdapter -> BufWriter
+            .into_inner() // BufWriter -> File
+            .with_context(|| format!("Could not flush {}", path.display()))?
             .flush()
             .with_context(|| format!("Could not flush {}", path.display()))?;
 

@@ -6,7 +6,7 @@ use dsi_bitstream::prelude::*;
 use dsi_progress_logger::{ProgressLog, concurrent_progress_logger};
 use rayon::prelude::*;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use sux::traits::bit_field_slice::BitFieldSlice;
@@ -140,14 +140,16 @@ pub fn compress_quads(
             let path = dst_dir.join(format!("{partition_id}.quads.bitstream"));
             let file = File::create(&path)
                 .with_context(|| format!("Could not create {}", path.display()))?;
-            let mut writer = BufBitWriter::new(WordAdapter::<usize, _>::new(file));
+            let mut writer = BufBitWriter::new(WordAdapter::<usize, _>::new(BufWriter::new(file)));
             write_sorted_array_file(&mut writer, partition.into_iter(), pl)
                 .with_context(|| format!("Could not write quads to {}", path.display()))?;
-            let mut file = writer
-                .into_inner()
+            writer
+                .into_inner() // BufBitWriter -> WordAdapter
                 .with_context(|| format!("Could not flush {}", path.display()))?
-                .into_inner();
-            file.flush()
+                .into_inner() // WordAdapter -> BufWriter
+                .into_inner() // BufWriter -> File
+                .with_context(|| format!("Could not flush {}", path.display()))?
+                .flush()
                 .with_context(|| format!("Could not flush {}", path.display()))?;
             Ok(())
         })?;
