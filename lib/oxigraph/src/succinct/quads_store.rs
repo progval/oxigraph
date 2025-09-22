@@ -143,31 +143,34 @@ pub fn compress_quads(
         },
     )?;
 
-    let mut sorted_quads = sorter_pool
-        .into_iter()
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .map(|sorter| {
-            let mut sorter = sorter.into_inner().expect("could not get sorter"); // XXX debug
-            sorter.flush_buffers().expect("could not flush"); // XXX debug
-            Ok(sorter)
-        })
-        .reduce(
-            || {
-                Ok(
-                    ExternalArraySorter::<4>::new(max_value, max_buffer_size, num_partitions)
-                        .context("Could not create sorter ExternalArraySorter")?,
-                )
-            },
-            |left: Result<_>, right| {
-                Ok(
-                    left.unwrap()
-                        .merge(right.unwrap())
-                        .expect("Could not merge ExternalDeduplicatingStringSorter"),
-                    //.context("Could not merge ExternalDeduplicatingStringSorter")?,
-                )
-            },
-        )?;
+    let mut sorted_quads =
+        sorter_pool
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|sorter| {
+                let mut sorter = sorter.into_inner().expect("could not get sorter"); // XXX debug
+                sorter.flush_buffers().expect("could not flush"); // XXX debug
+                Ok(sorter)
+            })
+            .reduce(
+                || {
+                    Ok(ExternalArraySorter::<4>::new(
+                        max_value,
+                        max_buffer_size,
+                        config.num_partitions,
+                    )
+                    .context("Could not create sorter ExternalArraySorter")?)
+                },
+                |left: Result<_>, right| {
+                    Ok(
+                        left.unwrap()
+                            .merge(right.unwrap())
+                            .expect("Could not merge ExternalDeduplicatingStringSorter"),
+                        //.context("Could not merge ExternalDeduplicatingStringSorter")?,
+                    )
+                },
+            )?;
     pl.done();
 
     config.num_quads = num_quads.into_inner();
