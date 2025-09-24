@@ -3,8 +3,11 @@ use clap::{Args, Parser, Subcommand, ValueHint};
 use oxigraph::io::{RdfFormat, RdfParseError, RdfParser};
 use oxigraph::model::{NamedNode, Quad};
 use oxigraph::succinct;
+use oxigraph::succinct::quads_store::QuadsStoreConfiguration;
+use oxigraph::succinct::terms_store::TermsStoreConfiguration;
 use oxigraph_cli::utils::{rdf_format_from_name, rdf_format_from_path};
 use rayon::prelude::*;
+use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::PathBuf;
 
@@ -79,6 +82,37 @@ pub enum Commands {
         #[arg(long)]
         /// Provides an estimated time of completion
         approx_quads_per_file: Option<usize>,
+        #[arg(long)]
+        order: succinct::quads_store::QuadOrder,
+    },
+    /// Step 4: read all quads (from a quad store) and compress them as a symmetrized BGraph
+    SymmetricBv {
+        #[arg(long)]
+        order: succinct::quads_store::QuadOrder,
+    },
+    // Step 5:
+    //  * cargo install webgraph-cli
+    //  * webgraph build ef /srv/oxigraph-data/wikidata.succinct/symmetric_bvgraph/graph
+    //  * webgraph build dcf /srv/oxigraph-data/wikidata.succinct/symmetric_bvgraph/graph
+    /// Step 6 run LLP to cluster similar nodes together
+    Llp {
+        #[arg(long, default_values_t = vec!["-0".to_string(), "-1".to_string(), "-2".to_string(), "-3".to_string(), "-4".to_string(), "-5".to_string(), "-6".to_string(), "-7".to_string(), "-8".to_string(), "-9".to_string(), "-10".to_string()])]
+        gammas: Vec<String>,
+    },
+    /// Step ??: Build an index from the first term of each quad to its position in a compressed
+    /// quad list
+    IndexQuadsByFirstTerm {
+        #[arg(long)]
+        order: succinct::quads_store::QuadOrder,
+    },
+    /// Step ??: Build an index to the start of each frame
+    IndexQuadsFrames {
+        #[arg(long)]
+        order: succinct::quads_store::QuadOrder,
+    },
+    /// Step ??+1: Build an index from the first two terms of each quad to their position in a compressed
+    /// quad list
+    IndexQuadsByFirstTwoTerms {
         #[arg(long)]
         order: succinct::quads_store::QuadOrder,
     },
@@ -171,6 +205,58 @@ pub fn main() -> Result<()> {
                 .context("Could not compress quads")?
             }
         }
+        Commands::SymmetricBv { order } => {
+            let config_path = terms_path.join("config.json");
+            let config_file = File::open(&config_path)
+                .with_context(|| format!("Could not open {}", config_path.display()))?;
+            let terms_store_config: TermsStoreConfiguration = serde_json::from_reader(config_file)
+                .with_context(|| format!("Could not read config from {}", config_path.display()))?;
+
+            let quads_path = args.location.join(format!("quads-{order}"));
+            let config_path = quads_path.join("config.json");
+            let config_file = File::open(&config_path)
+                .with_context(|| format!("Could not open {}", config_path.display()))?;
+            let quads_store_config: QuadsStoreConfiguration = serde_json::from_reader(config_file)
+                .with_context(|| format!("Could not read config from {}", config_path.display()))?;
+
+            let quads = succinct::quads_store::par_iter_quads(&quads_path, *order)
+                .context("Could not start reading quads")?;
+            let symmetric_graph_path = args.location.join("symmetric_bvgraph");
+            succinct::webgraph::symmetric_bv(
+                quads,
+                &symmetric_graph_path,
+                terms_store_config.num_terms,
+                quads_store_config.num_quads,
+            )
+            .with_context(|| {
+                format!(
+                    "Could not BvComp quads from {} to {}",
+                    quads_path.display(),
+                    symmetric_graph_path.display()
+                )
+            })?;
+        }
+        Commands::Llp { gammas } => {
+            let symmetric_graph_path = args.location.join("symmetric_bvgraph");
+            let permutation_path = args.location.join("llp.perm");
+            succinct::webgraph::llp(&symmetric_graph_path, &permutation_path, gammas)
+                .context("Could not run LLP")?;
+        }
+        Commands::IndexQuadsByFirstTerm { order } => {
+            let quads_path = args.location.join(format!("quads-{order}"));
+            succinct::quads_store::index_quads_by_first_term(&quads_path)
+                .context("Could not index quads")?;
+        }
+        Commands::IndexQuadsByFirstTwoTerms { order } => {
+            let quads_path = args.location.join(format!("quads-{order}"));
+            succinct::quads_store::index_quads_by_first_two_terms(&quads_path)
+                .context("Could not index quads")?;
+        }
+        Commands::IndexQuadsFrames { order } => {
+            let quads_path = args.location.join(format!("quads-{order}"));
+            succinct::quads_store::index_frames(&quads_path)
+                .context("Could not index quads frames")?;
+        }
     }
 
     Ok(())
@@ -202,7 +288,7 @@ fn get_parallel_iterator_from_sequential_parsers(
                 get_quads(
                     file.display().to_string(),
                     deko::read::AnyDecoder::new(
-                        std::fs::File::open(file)
+                        File::open(file)
                             .with_context(|| format!("Could not open {}", file.display()))?,
                     ),
                     format.map_or_else(
@@ -258,7 +344,7 @@ fn get_parallel_iterator_from_parallel_parsers(
                 get_parallel_quads(
                     file.display().to_string(),
                     deko::read::AnyDecoder::new(
-                        std::fs::File::open(file)
+                        File::open(file)
                             .with_context(|| format!("Could not open {}", file.display()))?,
                     ),
                     format.map_or_else(

@@ -42,6 +42,7 @@ oxigraph.workspace = true
 oxiri.workspace = true
 rand.workspace = true
 rayon.workspace = true
+serde_json.workspace = true
 spargeo = { workspace = true, optional = true }
 url.workspace = true
 

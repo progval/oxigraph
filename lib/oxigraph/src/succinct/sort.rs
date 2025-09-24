@@ -4,7 +4,7 @@ use bytemuck::TransparentWrapper;
 use dsi_bitstream::prelude::*;
 use dsi_progress_logger::{ProgressLog, no_logging};
 use itertools::Itertools;
-use mmap_rs::{Mmap, MmapFlags, MmapOptions};
+use mmap_rs::{MmapFlags, MmapOptions};
 use rayon::prelude::*;
 use rdst::{RadixKey, RadixSort};
 use rustc_hash::FxHashSet;
@@ -304,7 +304,8 @@ impl<const N: usize> ExternalArraySorter<N> {
             "Got item {item:?}, but max value is {}",
             self.max_value
         );
-        Ok((item[0] * self.num_partitions) / (self.max_value + 1))
+        let num_values_per_partition = (self.max_value + 1).div_ceil(self.num_partitions);
+        Ok(item[0] / num_values_per_partition)
     }
 
     pub fn push(&mut self, item: [usize; N]) -> Result<()> {
@@ -629,9 +630,12 @@ pub fn write_sorted_array_file<const N: usize>(
     Ok(num_quads)
 }
 
-pub fn read_sorted_array_file<'a, const N: usize>(
-    mut reader: impl BitRead<LE> + GammaRead<LE> + 'a,
-) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'a> {
+/// Same as [`read_sorted_array_file`] but instead of quads, yields:
+/// * `(Some(bit_position), quad)` on the first quad of a frame,
+/// * and `(None, quad)` on quads inside a frame
+pub fn read_sorted_array_file_internal<'a, const N: usize>(
+    mut reader: impl BitRead<LE> + BitSeek + GammaRead<LE> + 'a,
+) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + 'a> {
     let mut actual_previous_item = [0usize; N];
     let mut previous_item = [0usize; N];
 
@@ -640,9 +644,12 @@ pub fn read_sorted_array_file<'a, const N: usize>(
             let mut item = [0usize; N];
 
             let new_frame = reader.read_bits(1).context("Could not read frame bit")? == 1;
-            if new_frame {
+            let bit_pos = if new_frame {
                 previous_item = [0; N];
-            }
+                Some(reader.bit_pos().context("Could not get bit position")?)
+            } else {
+                None
+            };
 
             // quads are sorted lexicographically, so the first term of a quad is guaranteed to be
             // >= the first term of the previous quad
@@ -692,9 +699,19 @@ pub fn read_sorted_array_file<'a, const N: usize>(
                 actual_previous_item = item;
             }
 
-            Ok(Some(item))
+            Ok(Some((bit_pos, item)))
         })()
         .transpose()
+    }))
+}
+
+/// Returns every quad in the given file
+pub fn read_sorted_array_file<'a, const N: usize>(
+    reader: impl BitRead<LE> + BitSeek + GammaRead<LE> + 'a,
+) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'a> {
+    Ok(read_sorted_array_file_internal(reader)?.map(|item| {
+        let (_bit_pos, quad) = item?;
+        Ok(quad)
     }))
 }
 

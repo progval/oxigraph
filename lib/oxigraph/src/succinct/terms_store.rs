@@ -326,7 +326,7 @@ pub fn index_terms(dir: &Path) -> Result<()> {
             let compressed_frames = compressed_frames.as_ref();
 
             let mut efb =
-                sux::dict::elias_fano::EliasFanoBuilder::new(num_terms, compressed_frames.len());
+                sux::dict::elias_fano::EliasFanoBuilder::new(num_terms, compressed_frames.len()); // .context("Could not initialize EliasFanoBuilder")?;
             let mut offset = 0;
             for frame_id in 0..num_frames {
                 ensure!(

@@ -56,6 +56,8 @@ tempfile.workspace = true
 thiserror.workspace = true
 thread_local.workspace = true
 webgraph.workspace = true
+webgraph-algo.workspace = true
+webgraph-cli.workspace = true
 zstd.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
