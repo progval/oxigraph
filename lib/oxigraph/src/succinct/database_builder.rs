@@ -18,7 +18,7 @@ pub struct DatabaseBuilder {
     quad_orders: Vec<QuadOrder>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ParseQuadsArgs {
     pub file: Vec<PathBuf>,
     pub format: Option<RdfFormat>,

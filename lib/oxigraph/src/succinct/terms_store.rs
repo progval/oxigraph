@@ -387,9 +387,9 @@ pub fn index_terms(dir: &Path) -> Result<()> {
                 compressed_frames[offset..].len()
             );
 
-            let ef = efb.build_with_seq();
+            let ef = efb.build_with_seq_and_dict();
 
-            let index_file_path = path.with_extension("frames.ef");
+            let index_file_path = path.with_extension("terms.ef");
             let mut index_file = File::create(&index_file_path)
                 .with_context(|| format!("Could not create {}", index_file_path.display()))?;
             ef.serialize(&mut index_file).with_context(|| {

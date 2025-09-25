@@ -293,6 +293,7 @@ impl<R: BufRead + Seek> RewindableIoLender<BoxedRawTerm> for ZstdLengthPrefixedS
     fn rewind(mut self) -> Result<Self, Self::Error> {
         let mut read = self.decoder.finish();
         read.rewind().context("Could not rewind")?;
+        self.string = None;
         self.decoder =
             Decoder::with_buffer(read).context("Could not create new decoder to rewind")?;
         Ok(self)
@@ -359,7 +360,7 @@ impl<T, L: RewindableIoLender<T>> RewindableIoLender<T> for RewindableIoFlattenL
 
     fn rewind(mut self) -> Result<Self, Self::Error> {
         let mut new_lenders = Vec::with_capacity(self.lenders.len());
-        for lender in self.lenders.drain(0..=self.current_index) {
+        for lender in self.lenders.drain(0..=self.current_index.min(self.lenders.len()-1)) {
             new_lenders.push(lender.rewind()?);
         }
         new_lenders.extend(self.lenders.drain(..));

@@ -11,6 +11,7 @@ use std::sync::RwLock;
 #[error("{0:#}")]
 pub struct SuccinctDatasetError(#[from] anyhow::Error);
 
+#[derive(Clone)]
 pub struct SuccinctDatasetView<'a>(pub &'a SuccinctDatasetViewInner);
 
 pub struct SuccinctDatasetViewInner {
