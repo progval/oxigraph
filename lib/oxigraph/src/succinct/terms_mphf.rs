@@ -57,28 +57,24 @@ impl sux::utils::ToSig<[u64; 2]> for BoxedRawTerm {
     }
 }
 
-pub struct TermMphf<D: BitFieldSlice<usize> = BitFieldVec<usize>> {
-    vfunc: MemCase<VFunc<RawTerm, usize, D>>,
-    marker: PhantomData<D>,
-}
-
-impl<D: BitFieldSlice<usize>> TermMphf<D> {
+// Turns a term into an integer
+pub trait TermHasher {
     /// Returns the number of known terms
-    pub fn len(&self) -> usize {
-        self.vfunc.len()
-    }
+    fn len(&self) -> usize;
 
-    pub fn hash_namedorblanknode(&self, term: &NamedOrBlankNode) -> Result<usize> {
+    fn hash_string(&self, s: impl AsRef<str>) -> Result<usize>;
+
+    fn hash_namedorblanknode(&self, term: &NamedOrBlankNode) -> Result<usize> {
         match term {
             NamedOrBlankNode::NamedNode(n) => self.hash_string(n.as_str()),
             NamedOrBlankNode::BlankNode(n) => self.hash_string(n.as_str()),
         }
     }
-    pub fn hash_namednode(&self, term: &NamedNode) -> Result<usize> {
+    fn hash_namednode(&self, term: &NamedNode) -> Result<usize> {
         self.hash_string(term.as_str())
     }
 
-    pub fn hash_term(&self, term: &Term) -> Result<usize> {
+    fn hash_term(&self, term: &Term) -> Result<usize> {
         match term {
             Term::NamedNode(n) => self.hash_string(n.as_str()),
             Term::BlankNode(n) => self.hash_string(n.as_str()),
@@ -88,12 +84,38 @@ impl<D: BitFieldSlice<usize>> TermMphf<D> {
         }
     }
 
-    pub fn hash_graphname(&self, graph_name: &GraphName) -> Result<usize> {
+    fn hash_graphname(&self, graph_name: &GraphName) -> Result<usize> {
         match graph_name {
             GraphName::NamedNode(n) => self.hash_string(n.as_str()),
             GraphName::BlankNode(n) => self.hash_string(n.as_str()),
-            GraphName::DefaultGraph => self.hash_string("".to_owned()), // XXX I guess?
+            GraphName::DefaultGraph => {
+                // XXX this doesn't conflict with any valid term, right?
+                //
+                // The empty string is very handy in datasets that have most of their quads
+                // in the default graph, because it comes first in the sorted list of terms,
+                // which means that the DefaultGraph gets hashed to id 0.
+                // And because sorted quad files have to write the graph at the beginning
+                // of each frame, the shorter the graph id is, the better.
+                // And because we use gamma coding
+                // (https://docs.rs/dsi-bitstream/latest/dsi_bitstream/codes/index.html),
+                // 0 is encoded as a single bit whereas any other value takes at least four bits.
+                self.hash_string("".to_owned())
+            }
         }
+    }
+}
+
+pub struct TermMphf<D: BitFieldSlice<usize> = BitFieldVec<usize>> {
+    vfunc: MemCase<VFunc<RawTerm, usize, D>>,
+    marker: PhantomData<D>,
+}
+
+pub type DefaultDeserializedTermMphf =
+    TermMphf<<BitFieldVec<usize> as EpDeserializeInner>::DeserType<'static>>;
+
+impl<D: BitFieldSlice<usize>> TermHasher for TermMphf<D> {
+    fn len(&self) -> usize {
+        self.vfunc.len()
     }
 
     fn hash_string(&self, s: impl AsRef<str>) -> Result<usize> {

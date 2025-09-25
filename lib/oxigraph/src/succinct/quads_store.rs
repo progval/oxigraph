@@ -2,13 +2,13 @@ use super::sort::{
     ExternalArraySorter, read_sorted_array_file, read_sorted_array_file_internal,
     write_sorted_array_file,
 };
-use super::terms_mphf::TermMphf;
+use super::terms_mphf::{TermHasher, TermMphf};
 use crate::model::Quad;
 use anyhow::{Context, Result, anyhow, ensure};
 use dsi_bitstream::prelude::*;
 use dsi_progress_logger::{ProgressLog, concurrent_progress_logger};
-use epserde::deser::Deserialize as EpDeserialize;
-use epserde::prelude::Flags;
+use epserde::deser::mem_case::{Flags, MemCase};
+use epserde::deser::{Deserialize as EpDeserialize, DeserializeInner as EpDeserializeInner};
 use epserde::ser::Serialize as EpSerialize;
 use lender::IteratorExt;
 use mmap_rs::MmapFlags;
@@ -19,8 +19,11 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use sux::bits::BitFieldVec;
-use sux::dict::elias_fano::EfSeq;
+use sux::dict::elias_fano::{EfSeq, EliasFanoBuilder};
+use sux::func::{VBuilder, VFunc};
+use sux::traits::IndexedSeq;
 use sux::traits::bit_field_slice::BitFieldSlice;
+use webgraph::utils::MmapHelper;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
 pub enum QuadOrder {
@@ -394,7 +397,7 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
         .into_par_iter()
         .enumerate()
         .try_for_each_with(pl.clone(), |pl, (partition_id, path)| {
-            let data = webgraph::utils::MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
+            let data = MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
                 .with_context(|| format!("Could not mmap array file {}", path.display()))?;
             let num_terms_in_partition = if partition_id == config.num_partitions - 1 {
                 config.num_terms.checked_sub(num_terms_per_partition * (config.num_partitions - 1)).unwrap()
@@ -412,7 +415,7 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
             let file_len_bits = usize::try_from(file_len * 8).with_context(|| {
                     format!("Size (in bits) of {} overflows usize", path.display())
                 })?;
-            let mut efb = sux::dict::elias_fano::EliasFanoBuilder::new(
+            let mut efb = EliasFanoBuilder::new(
                 num_terms_in_partition,
                 file_len_bits,
             );
@@ -564,7 +567,7 @@ pub fn index_quads_by_first_two_terms(dir: &Path) -> Result<()> {
                     .into_lender())
             })?;
 
-            let builder = sux::func::VBuilder::<_, BitFieldVec<usize>>::default()
+            let builder = VBuilder::<_, BitFieldVec<usize>>::default()
                 .offline(true) // Save memory by spilling to disk
                 .low_mem(true) // Save memory by using slightly more CPU;
                 ;
@@ -595,14 +598,293 @@ where
     }
 }
 
-// #[derive(Clone)]
-// struct FnIntoIter<'a, I: IntoIterator, F: FnMut() -> I>(&'a F);
-//
-// impl<'a, I: IntoIterator, F: FnMut() -> I> IntoIterator for FnIntoIter<'a, I, F> {
-// type IntoIter = I::IntoIter;
-// type Item = I::Item;
-//
-// fn into_iter(self) -> Self::IntoIter {
-// (self.0)().into_iter()
-// }
-// }
+pub struct QuadStore {
+    config: QuadStoreConfiguration,
+    path: PathBuf,
+    partitions: Vec<QuadPartition>,
+}
+
+impl QuadStore {
+    pub fn mmap(path: PathBuf) -> Result<Self> {
+        let (config, partition_paths) = get_quad_partitions(&path).with_context(|| {
+            format!(
+                "Could not read quad store configuration from {}",
+                path.display()
+            )
+        })?;
+
+        let num_terms_per_partition = config.num_terms.div_ceil(config.num_partitions);
+        let partitions = partition_paths
+            .into_par_iter()
+            .enumerate()
+            .map(|(partition_id, partition_path)| {
+                let first_first_term_in_partition = num_terms_per_partition * partition_id;
+                QuadPartition::mmap(first_first_term_in_partition, partition_path)
+            })
+            .collect::<Result<_>>()
+            .with_context(|| {
+                format!(
+                    "Could not open partitions of quad store at {}",
+                    path.display()
+                )
+            })?;
+
+        Ok(Self {
+            config,
+            path,
+            partitions,
+        })
+    }
+
+    fn get_partition(&self, term: usize) -> Result<&QuadPartition> {
+        ensure!(
+            term < self.config.num_terms,
+            "Invalid term: {term} (only {} terms in store {})",
+            self.config.num_terms, self.path.display()
+        );
+        let num_terms_per_partition = self.config.num_terms.div_ceil(self.config.num_partitions);
+        Ok(&self.partitions[term / num_terms_per_partition])
+    }
+
+    pub fn iter_quads_by_first_term(
+        &self,
+        term: usize,
+    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<'_>>> {
+        self.get_partition(term)?.iter_quads_by_first_term(term)
+    }
+
+    pub fn iter_quads_by_first_two_terms(
+        &self,
+        term1: usize,
+        term2: usize,
+    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<'_>>> {
+        self.get_partition(term1)?
+            .iter_quads_by_first_two_terms(term1, term2)
+    }
+}
+
+struct QuadPartition {
+    _path: PathBuf,
+    first_first_term: usize,
+    quads: MmapHelper<u64>,
+    /// frame_id -> bit_position
+    frame_index: MemCase<<EfSeq as EpDeserializeInner>::DeserType<'static>>,
+    /// term -> bit_position
+    first_term_index: MemCase<<EfSeq as EpDeserializeInner>::DeserType<'static>>,
+    /// TermsPair -> frame_id (may have false positives)
+    first_two_terms_index: MemCase<
+        <VFunc<TermsPair, usize, BitFieldVec<usize>> as EpDeserializeInner>::DeserType<'static>,
+    >,
+}
+
+impl QuadPartition {
+    pub fn mmap(first_first_term: usize, path: PathBuf) -> Result<Self> {
+        let quads = MmapHelper::mmap(&path, MmapFlags::RANDOM_ACCESS)
+            .with_context(|| format!("Could not mmap array file {}", path.display()))?;
+
+        let frame_index_path = path.with_extension("frames.ef");
+        let frame_index =
+            EfSeq::mmap(&frame_index_path, Flags::RANDOM_ACCESS).with_context(|| {
+                format!(
+                    "Could not epdeserialize frame index from {}",
+                    frame_index_path.display()
+                )
+            })?;
+
+        let first_term_index_path = path.with_extension("1term.ef");
+        let first_term_index = EfSeq::mmap(&first_term_index_path, Flags::RANDOM_ACCESS)
+            .with_context(|| {
+                format!(
+                    "Could not epdeserialize first-term index from {}",
+                    first_term_index_path.display()
+                )
+            })?;
+
+        let first_two_terms_index_path = path.with_extension("2terms.vfunc");
+        let first_two_terms_index = VFunc::<TermsPair, usize, BitFieldVec<usize>>::mmap(
+            &first_two_terms_index_path,
+            Flags::RANDOM_ACCESS,
+        )
+        .with_context(|| {
+            format!(
+                "Could not epdeserialize first-two-terms index from {}",
+                first_two_terms_index_path.display()
+            )
+        })?;
+        Ok(Self {
+            _path: path,
+            first_first_term,
+            quads,
+            frame_index,
+            first_term_index,
+            first_two_terms_index,
+        })
+    }
+
+    fn get_quads_reader(&self) -> impl BitRead<LE> + BitSeek + GammaRead<LE> + '_ {
+        BufBitReader::new(MemWordReader::<u64, _>::new(&self.quads))
+    }
+
+    pub fn iter_quads_by_first_term(
+        &self,
+        term: usize,
+    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>>>> {
+        // get the positition of the first frame that contains a quad with the term.
+        // If the first term is not in any quad, then this is the frame of a quad it
+        // would come right after
+        let from_bit_position = self.first_term_index.get(term - self.first_first_term);
+
+        let mut took_error = false;
+        Ok(Some(
+            read_sorted_array_file::<4>(self.get_quads_reader(), from_bit_position)?
+                .skip_while(move |quad| {
+                    if let Ok(quad) = quad {
+                        // skip quads until we find one that matches
+                        quad[0] < term
+                    } else {
+                        // in case of error, let it through ASAP
+                        false
+                    }
+                })
+                .take_while(move |quad| {
+                    if let Ok(quad) = quad {
+                        // take quads until we find one that doesn't matches
+                        quad[0] == term
+                    } else {
+                        // in case of errors, let the first one through then stop,
+                        // so that the caller 1. knows about it  2. doesn't materialize
+                        // a potentially infinite iterator of errors
+                        if took_error {
+                            false
+                        } else {
+                            took_error = true;
+                            true
+                        }
+                    }
+                }),
+        ))
+    }
+
+    pub fn iter_quads_by_first_two_terms(
+        &self,
+        term1: usize,
+        term2: usize,
+    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>>>> {
+        let relative_term1 = term1
+            .checked_sub(self.first_first_term)
+            .context("term1 is before the start of the partition")?;
+        ensure!(
+            relative_term1 < self.first_term_index.len(),
+            "term1 is after the end of the partition"
+        );
+
+        let maybe_first_frame_id = self
+            .first_two_terms_index
+            .get(TermsPair(relative_term1, term2));
+        if maybe_first_frame_id > self.frame_index.len() {
+            // frame does not exist, so the `first_two_terms_index` returned a false positive
+            return Ok(None);
+        }
+        let maybe_from_bit_position = self.frame_index.get(maybe_first_frame_id);
+
+        // Quick checks based only on the first term.
+        // They are redundant with the next checks (based on the first two terms) but
+        // are faster because they do a read in the frame index (small EF)
+        // instead of a read in the first-term index (larger EF) + a read in the quad file
+        if self.first_term_index.get(relative_term1) > maybe_from_bit_position {
+            // the first match of `(relative_term1, _, _, _)` has to be before (or equal to)
+            // the first match of `(relative_term1, term2, _, _)`'.
+            // If it is not, it means `first_two_terms_index` returned a false positive
+            return Ok(None);
+        }
+        if relative_term1 + 1 < self.first_term_index.len() {
+            if self.first_term_index.get(relative_term1 + 1) < maybe_from_bit_position {
+                // the first match of `(relative_term1+1, _, _, _)` has to be after (or equal to)
+                // the first match of `(relative_term1, term2, _, _)`'.
+                // If it is not, it means `first_two_terms_index` returned a false positive
+                return Ok(None);
+            }
+        }
+
+        if maybe_first_frame_id > 0 {
+            // maybe_first_frame_id is not the id of the first frame.
+            // Let's get the first quad of the previous frame
+            let previous_frame_bit_position = self.frame_index.get(maybe_first_frame_id - 1);
+            let first_quad_in_previous_frame =
+                read_sorted_array_file::<4>(self.get_quads_reader(), previous_frame_bit_position)?
+                    .next()
+                    .with_context(|| {
+                        format!("Got no quad when reading from frame {maybe_first_frame_id}-1")
+                    })?
+                    .with_context(|| format!("Could not peek frame {maybe_first_frame_id}-1"))?;
+            if (
+                first_quad_in_previous_frame[0],
+                first_quad_in_previous_frame[1],
+            ) > (term1, term2)
+            {
+                // maybe_first_frame_id was allegedly the id of the first frame
+                // containing (term1, term2, _, _).
+                // However, we find that maybe_first_frame_id-1 contains a quad
+                // that comes after (term1, term2, _, _).
+                // This means that maybe_first_frame_id was a false positive.
+                return Ok(None);
+            }
+        }
+
+        if maybe_first_frame_id + 1 < self.frame_index.len() {
+            // maybe_first_frame_id is not the id of the last frame.
+            // Let's get the first quad of the next frame
+            let next_frame_bit_position = self.frame_index.get(maybe_first_frame_id + 1);
+            let first_quad_in_next_frame =
+                read_sorted_array_file::<4>(self.get_quads_reader(), next_frame_bit_position)?
+                    .next()
+                    .with_context(|| {
+                        format!("Got no quad when reading from frame {maybe_first_frame_id}+1")
+                    })?
+                    .with_context(|| format!("Could not peek frame {maybe_first_frame_id}+1"))?;
+            if (first_quad_in_next_frame[0], first_quad_in_next_frame[1]) < (term1, term2) {
+                // maybe_first_frame_id was allegedly the id of the first frame
+                // containing (term1, term2, _, _).
+                // However, we find that maybe_first_frame_id+1 contains a quad
+                // that comes before (term1, term2, _, _).
+                // This means that maybe_first_frame_id was a false positive.
+                return Ok(None);
+            }
+        }
+
+        // At this point, we're still not sure `maybe_from_bit_position` is not a false
+        // positive.
+        // However, thanks to the previous checks we won't read more than one frame
+        // if it is a false positive.
+
+        let mut took_error = false;
+        Ok(Some(
+            read_sorted_array_file::<4>(self.get_quads_reader(), maybe_from_bit_position)?
+                .skip_while(move |quad| {
+                    if let Ok(quad) = quad {
+                        // skip quads until we find one that matches
+                        (quad[0], quad[1]) < (term1, term2)
+                    } else {
+                        // in case of error, let it through ASAP
+                        false
+                    }
+                })
+                .take_while(move |quad| {
+                    if let Ok(quad) = quad {
+                        // take quads until we find one that doesn't matches
+                        (quad[0], quad[1]) == (term1, term2)
+                    } else {
+                        // in case of errors, let the first one through then stop,
+                        // so that the caller 1. knows about it  2. doesn't materialize
+                        // a potentially infinite iterator of errors
+                        if took_error {
+                            false
+                        } else {
+                            took_error = true;
+                            true
+                        }
+                    }
+                }),
+        ))
+    }
+}

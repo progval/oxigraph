@@ -2,13 +2,18 @@ use super::sort::ExternalDeduplicatingStringSorter;
 use crate::model::{GraphName, NamedOrBlankNode, Quad, Term, Triple};
 use anyhow::{Context, Result, anyhow, ensure};
 use dsi_progress_logger::{ProgressLog, concurrent_progress_logger, progress_logger};
+use epserde::deser::mem_case::{Flags, MemCase};
+use epserde::deser::{Deserialize as EpDeserialize, DeserializeInner as EpDeserializeInner};
 use epserde::ser::Serialize as EpSerialize;
 use itertools::Itertools;
+use mmap_rs::Mmap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use sux::dict::elias_fano::{EfSeqDict, EliasFanoBuilder};
+use sux::traits::{IndexedDict, IndexedSeq};
 
 pub(super) fn write_length_prefixed_string(
     writer: &mut impl Write,
@@ -399,4 +404,144 @@ pub fn index_terms(dir: &Path) -> Result<()> {
     pl.done();
 
     Ok(())
+}
+
+pub struct TermStore {
+    config: TermStoreConfiguration,
+    path: PathBuf,
+    partitions: Vec<TermsPartition>,
+}
+
+impl TermStore {
+    pub fn mmap(path: PathBuf) -> Result<Self> {
+        let (config, files) = list_terms_files(&path).with_context(|| {
+            format!(
+                "Could not open term store configuration from {}",
+                path.display()
+            )
+        })?;
+
+        let partitions = files
+            .into_iter()
+            .enumerate()
+            .map(
+                |(partition_id, TermsFile {
+                     first_term_id,
+                     num_terms,
+                     path,
+                     compressed_frames,
+                 })| {
+                    let terms_index_path = path.with_extension("terms.ef");
+                    let terms_index = EfSeqDict::mmap(&terms_index_path, Flags::RANDOM_ACCESS)
+                        .with_context(|| {
+                            format!(
+                                "Could not epdeserialize terms index from {}",
+                                terms_index_path.display()
+                            )
+                        })?;
+                    ensure!(terms_index.len() == num_terms, "terms_index ({}) of partition {partition_id} does not match expected number of terms ({num_terms})", terms_index.len());
+
+                    Ok(TermsPartition {
+                        path,
+                        first_term_id,
+                        terms_index,
+                        compressed_frames,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            config,
+            path,
+            partitions,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.config.num_terms
+    }
+
+    pub fn get(&self, id: usize) -> Result<Option<String>> {
+        if id >= self.len() {
+            return Ok(None);
+        }
+
+        // TODO: add a small cache or something, so we don't have to decompress popular
+        // frames every time
+
+        // Compute which partition the term is in
+        let num_terms_per_partition = self.config.terms_per_frame * self.config.frames_per_file;
+        let partition_id = id / num_terms_per_partition;
+        let first_term_in_partition = num_terms_per_partition * partition_id;
+        let partition = &self.partitions[partition_id];
+
+        // Compute which frame the term is in
+        ensure!(
+            id - first_term_in_partition < partition.terms_index.len(),
+            "Inconsistent partition lengths in terms store {}",
+            self.path.display()
+        );
+        ensure!(
+            first_term_in_partition == partition.first_term_id,
+            "Unexpected first_term_id in partition {partition_id} of store {}",
+            self.path.display()
+        );
+        let frame_position = partition.terms_index.get(id - first_term_in_partition);
+
+        // Compute the offset of the term within the frame
+        let first_term_in_frame = partition.terms_index.index_of(frame_position).context(
+            "terms_index.get() returned a value, but terms_index.index_of() says it is missing",
+        )?;
+        let offset_in_frame = id - first_term_in_frame;
+
+        // Decompress the frame
+        let mut decompressed_frame = Vec::with_capacity(
+            usize::try_from(zstd::zstd_safe::BLOCKSIZE_MAX)
+                .context("decompressed zstd frame size overflows usize")?,
+        );
+        zstd::zstd_safe::decompress(
+            &mut decompressed_frame,
+            &partition.compressed_frames[frame_position..],
+        )
+        .map_err(|errno| {
+            anyhow!(
+                "Could not decompressed frame at offset {frame_position} of {}: {}",
+                partition.path.display(),
+                zstd::zstd_safe::get_error_name(errno)
+            )
+        })?;
+        let mut frame_reader = Cursor::new(decompressed_frame);
+
+        // Skip all terms before the one we are looking for, then read the right one
+        let mut last_term = None;
+        for _ in 0..=offset_in_frame {
+            last_term = Some(
+                read_length_prefixed_string(&mut frame_reader, |_| None)
+                    .with_context(|| {
+                        format!(
+                            "Could not read string frame at offset {frame_position} of {}",
+                            partition.path.display()
+                        )
+                    })?
+                    .with_context(|| {
+                        format!(
+                            "Frame at offset {frame_position} of {} has fewer terms than expected",
+                            partition.path.display()
+                        )
+                    })?,
+            );
+        }
+
+        Ok(Some(
+            String::from_utf8(last_term.expect("Loop didn't run").into())
+                .with_context(|| format!("Term {id} is not valid UTF-8"))?,
+        ))
+    }
+}
+
+struct TermsPartition {
+    path: PathBuf,
+    first_term_id: usize,
+    compressed_frames: Mmap,
+    terms_index: MemCase<<EfSeqDict as EpDeserializeInner>::DeserType<'static>>,
 }
