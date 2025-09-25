@@ -81,14 +81,59 @@ pub struct QuadStoreConfiguration {
     pub num_terms: usize,
 }
 
-pub fn compress_quads(
+pub fn compress_parsed_quads(
     quads: impl ParallelIterator<Item = Result<Quad>>,
     dst_dir: &Path,
     mphf: &TermMphf<impl BitFieldSlice<usize> + Sync + Send>,
     approx_num_quads: Option<usize>,
     order: QuadOrder,
 ) -> Result<()> {
-    let mut config = QuadsStoreConfiguration {
+    let compressed_quads = quads.map(|quad| {
+        let quad = quad.context("Could not read quad")?;
+        let Quad {
+            subject,
+            predicate,
+            object,
+            graph_name,
+        } = &quad;
+        let compressed_quad = [
+            mphf.hash_namedorblanknode(subject)
+                .with_context(|| format!("Unknown subject: {subject:?}"))
+                .unwrap(),
+            mphf.hash_namednode(predicate)
+                .with_context(|| format!("Unknown predicate: {predicate:?}"))
+                .unwrap(),
+            mphf.hash_term(object)
+                .with_context(|| format!("Unknown object: {object:?}"))
+                .unwrap(),
+            mphf.hash_graphname(graph_name)
+                .with_context(|| format!("Unknown graph name: {graph_name:?}"))
+                .unwrap(),
+        ];
+        ensure!(
+            compressed_quad.iter().all(|term_id| *term_id < mphf.len()),
+            "Got quad {compressed_quad:?} (from {quad:?}), but there are fewer known terms ({})",
+            mphf.len(),
+        );
+        Ok(compressed_quad)
+    });
+    compress_quads(
+        compressed_quads,
+        dst_dir,
+        mphf.len(),
+        approx_num_quads,
+        order,
+    )
+}
+
+pub fn compress_quads(
+    quads: impl ParallelIterator<Item = Result<[usize; 4]>>,
+    dst_dir: &Path,
+    num_terms: usize,
+    approx_num_quads: Option<usize>,
+    order: QuadOrder,
+) -> Result<()> {
+    let mut config = QuadStoreConfiguration {
         num_partitions: (4 * usize::from(
         std::thread::available_parallelism().context("Could not count CPU threads")?,
     ))
@@ -131,40 +176,12 @@ pub fn compress_quads(
             ))
         },
         |acc, quad| -> Result<_> {
-            let (pl, sorter) = acc.as_mut().unwrap(); // XXX debug
+            let (pl, sorter) = acc.as_mut().expect("Could not get sorter"); // FIXME don't panic
             let sorter = sorter
                 .as_mut()
                 .map_err(|e| anyhow!("Could not create sorter ExternalArraySorter: {e:#?}"))?;
-            // let (mut pl, mut sorter, num_quads) = acc?;
-            let quad = quad?;
-            let Quad {
-                subject,
-                predicate,
-                object,
-                graph_name,
-            } = &quad;
-            let compressed_quad = order_quad([
-                mphf.hash_namedorblanknode(subject)
-                    .with_context(|| format!("Unknown subject: {subject:?}"))
-                    .unwrap(),
-                mphf.hash_namednode(predicate)
-                    .with_context(|| format!("Unknown predicate: {predicate:?}"))
-                    .unwrap(),
-                mphf.hash_term(object)
-                    .with_context(|| format!("Unknown object: {object:?}"))
-                    .unwrap(),
-                mphf.hash_graphname(graph_name)
-                    .with_context(|| format!("Unknown graph name: {graph_name:?}"))
-                    .unwrap(),
-            ]);
-            assert!(
-                compressed_quad.iter().all(|term_id| *term_id <= max_value),
-                "Got quad {compressed_quad:?} (from {quad:?}), but max value is {}",
-                max_value,
-            );
-            sorter
-                .push(compressed_quad)
-                .context("Could not push quad to sorter")?;
+            let quad = order_quad(quad?);
+            sorter.push(quad).context("Could not push quad to sorter")?;
             pl.light_update();
             num_quads.fetch_add(1, Ordering::Relaxed);
             Ok(())

@@ -85,7 +85,19 @@ pub enum Commands {
         #[arg(long)]
         order: succinct::quads_store::QuadOrder,
     },
-    /// Step 4: read all quads (from a quad store) and compress them as a symmetrized BGraph
+    /// Step 4: Read compressed quads in one order, and write them to an other order
+    ///
+    /// This is more efficient than 'compress-quads', but requires that 'compress-quad'
+    /// already ran once.
+    ///
+    /// May error with ENOMEM if sysctl setting `vm.max_map_count` is too low.
+    RecompressQuads {
+        #[arg(long)]
+        from_order: succinct::quads_store::QuadOrder,
+        #[arg(long)]
+        to_order: succinct::quads_store::QuadOrder,
+    },
+    /// Step 5: read all quads (from a quad store) and compress them as a symmetrized BGraph
     SymmetricBv {
         #[arg(long)]
         order: succinct::quads_store::QuadOrder,
@@ -94,7 +106,7 @@ pub enum Commands {
     //  * cargo install webgraph-cli
     //  * webgraph build ef /srv/oxigraph-data/wikidata.succinct/symmetric_bvgraph/graph
     //  * webgraph build dcf /srv/oxigraph-data/wikidata.succinct/symmetric_bvgraph/graph
-    /// Step 6 run LLP to cluster similar nodes together
+    /// Step 7 run LLP to cluster similar nodes together
     Llp {
         #[arg(long, default_values_t = vec!["-0".to_string(), "-1".to_string(), "-2".to_string(), "-3".to_string(), "-4".to_string(), "-5".to_string(), "-6".to_string(), "-7".to_string(), "-8".to_string(), "-9".to_string(), "-10".to_string()])]
         gammas: Vec<String>,
@@ -185,7 +197,7 @@ pub fn main() -> Result<()> {
 
             if parse_args.parallel_parser {
                 // parse in parallel, process in parallel
-                succinct::quads_store::compress_quads(
+                succinct::quads_store::compress_parsed_quads(
                     get_parallel_iterator_from_parallel_parsers(&parse_args)?,
                     &quads_path,
                     &terms_mphf,
@@ -195,7 +207,7 @@ pub fn main() -> Result<()> {
                 .context("Could not compress quads")?
             } else {
                 // parse sequentially, process in parallel
-                succinct::quads_store::compress_quads(
+                succinct::quads_store::compress_parsed_quads(
                     get_parallel_iterator_from_sequential_parsers(&parse_args)?,
                     &quads_path,
                     &terms_mphf,
@@ -204,6 +216,31 @@ pub fn main() -> Result<()> {
                 )
                 .context("Could not compress quads")?
             }
+        }
+        Commands::RecompressQuads {
+            from_order,
+            to_order,
+        } => {
+            let quads_from_path = args.location.join(format!("quads-{from_order}"));
+            let quads_to_path = args.location.join(format!("quads-{to_order}"));
+
+            let config_path = quads_from_path.join("config.json");
+            let config_file = File::open(&config_path)
+                .with_context(|| format!("Could not open {}", config_path.display()))?;
+            let config: QuadStoreConfiguration = serde_json::from_reader(config_file)
+                .with_context(|| format!("Could not read config from {}", config_path.display()))?;
+            let quads = succinct::quads_store::par_iter_quads(&quads_from_path, *from_order)
+                .context("Could not start reading quads")?
+                .map(|quad| quad.map(from_order.reverse_mapper()));
+
+            succinct::quads_store::compress_quads(
+                quads,
+                &quads_to_path,
+                config.num_terms,
+                Some(config.num_quads),
+                *to_order,
+            )
+            .context("Could not compress quads")?
         }
         Commands::SymmetricBv { order } => {
             let config_path = terms_path.join("config.json");
