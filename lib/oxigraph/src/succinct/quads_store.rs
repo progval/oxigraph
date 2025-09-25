@@ -278,7 +278,7 @@ pub fn par_iter_quads(
             let data = webgraph::utils::MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
                 .with_context(|| format!("Could not mmap array file {}", path.display()))?;
             Ok(
-                read_sorted_array_file(BufBitReader::new(MemWordReader::<u64, _>::new(data)))
+                read_sorted_array_file(BufBitReader::new(MemWordReader::<u64, _>::new(data)), 0)
                     .with_context(|| format!("Could not read array file {}", path.display()))?
                     .map(move |quad| Ok(de_order_quad(quad?))),
             )
@@ -309,9 +309,10 @@ pub fn index_frames(dir: &Path) -> Result<()> {
                 .len();
 
             let mut num_frames = 0;
-            read_sorted_array_file_internal::<4>(BufBitReader::new(MemWordReader::<u64, _>::new(
-                &data,
-            )))
+            read_sorted_array_file_internal::<4>(
+                BufBitReader::new(MemWordReader::<u64, _>::new(&data)),
+                0,
+            )
             .with_context(|| format!("Could not read array file {}", path.display()))?
             .try_for_each(|item| -> Result<_> {
                 let (bit_pos, _quad) = item?;
@@ -319,9 +320,6 @@ pub fn index_frames(dir: &Path) -> Result<()> {
 
                 if bit_pos.is_some() {
                     num_frames += 1;
-                } else if num_frames == 0 {
-                    // first frame has bit_pos = None
-                    num_frames = 1;
                 }
                 Ok(())
             })
@@ -335,9 +333,10 @@ pub fn index_frames(dir: &Path) -> Result<()> {
                 efb.push(0); // first frame has bit_pos=None below
             }
 
-            read_sorted_array_file_internal::<4>(BufBitReader::new(MemWordReader::<u64, _>::new(
-                data,
-            )))
+            read_sorted_array_file_internal::<4>(
+                BufBitReader::new(MemWordReader::<u64, _>::new(data)),
+                0,
+            )
             .with_context(|| format!("Could not read array file {}", path.display()))?
             .try_for_each(|item| -> Result<_> {
                 let (bit_pos, _quad) = item?;
@@ -415,7 +414,7 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
             ); // .context("Could not initialize EliasFanoBuilder")?;
             read_sorted_array_file_internal::<4>(BufBitReader::new(MemWordReader::<u64, _>::new(
                 data,
-            )))
+            )), 0)
             .with_context(|| format!("Could not read array file {}", path.display()))?
             .try_for_each(|item| -> Result<_> {
                 let (bit_pos, quad) = item?;
@@ -496,8 +495,9 @@ pub fn index_quads_by_first_two_terms(dir: &Path) -> Result<()> {
             let get_iter = || {
                 read_sorted_array_file_internal::<4>(BufBitReader::new(
                     MemWordReader::<u64, _>::new(data),
-                ))
-                .with_context(|| format!("Could not read array file {}", path.display()))
+                ), 0)
+                .with_context(|| format!("Could not read array file {}", path.display()),
+                )
             };
 
             /*
@@ -530,20 +530,24 @@ pub fn index_quads_by_first_two_terms(dir: &Path) -> Result<()> {
                     .into_lender())
             })?;
             let values = sux::utils::lenders::FromResultLenderFactory::new(|| -> Result<_> {
-                let mut frame_id = 0usize;
+                let mut frame_id: Option<usize> = None;
                 let mut first_frame_id_of_current_first_term = 0;
                 let mut previous_pair = None;
                 Ok(get_iter()?
                     .map(
                         move |item: Result<(Option<u64>, [usize; 4])>| -> Result<_> {
                             let (position, quad) = item?;
-                            if position.is_some() {
-                                ensure!(
-                                    previous_pair.is_some(),
-                                    "Got position={position:?} for first frame"
-                                );
-                                frame_id += 1;
+                            if let Some(position) = position {
+                                if frame_id.is_none() {
+                                    ensure!(
+                                        position == 0,
+                                        "Got position={position:?} for first frame"
+                                    );
+                                }
+                                frame_id = Some(frame_id.map(|id| id + 1).unwrap_or(0));
                             }
+                            let frame_id = frame_id.context("Got quad before first frame")?;
+
                             let pair = TermsPair(quad[0], quad[1]);
                             if Some(pair) == previous_pair {
                                 return Ok(None);

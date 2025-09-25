@@ -524,7 +524,7 @@ impl<const N: usize> ExternalArraySorter<N> {
                 // };
                 let data = webgraph::utils::MmapHelper::mmap(path, MmapFlags::SEQUENTIAL)
                     .with_context(|| format!("Could not mmap array file {}", path.display()))?;
-                read_sorted_array_file(BufBitReader::new(MemWordReader::<u64, _>::new(data)))
+                read_sorted_array_file(BufBitReader::new(MemWordReader::<u64, _>::new(data)), 0)
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
@@ -635,9 +635,14 @@ pub fn write_sorted_array_file<const N: usize>(
 /// * and `(None, quad)` on quads inside a frame
 pub fn read_sorted_array_file_internal<'a, const N: usize>(
     mut reader: impl BitRead<LE> + BitSeek + GammaRead<LE> + 'a,
+    from_bit_position: usize,
 ) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + 'a> {
     let mut actual_previous_item = [0usize; N];
     let mut previous_item = [0usize; N];
+
+    reader
+        .set_bit_pos(u64::try_from(from_bit_position).context("bit position overflowed u64")?)
+        .with_context(|| format!("Could not seek to bit position {from_bit_position}"))?;
 
     Ok(std::iter::repeat(()).map_while(move |()| {
         (|| {
@@ -699,7 +704,13 @@ pub fn read_sorted_array_file_internal<'a, const N: usize>(
                 actual_previous_item = item;
             }
 
-            Ok(Some((bit_pos, item)))
+            if item == [0; N] {
+                let bit_pos = reader.bit_pos().context("Could not get bit position")?;
+                ensure!(bit_pos == 0, "zero quad at bit position {bit_pos}");
+                Ok(Some((Some(0), item)))
+            } else {
+                Ok(Some((bit_pos, item)))
+            }
         })()
         .transpose()
     }))
@@ -708,11 +719,14 @@ pub fn read_sorted_array_file_internal<'a, const N: usize>(
 /// Returns every quad in the given file
 pub fn read_sorted_array_file<'a, const N: usize>(
     reader: impl BitRead<LE> + BitSeek + GammaRead<LE> + 'a,
+    from_bit_position: usize,
 ) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'a> {
-    Ok(read_sorted_array_file_internal(reader)?.map(|item| {
-        let (_bit_pos, quad) = item?;
-        Ok(quad)
-    }))
+    Ok(
+        read_sorted_array_file_internal(reader, from_bit_position)?.map(|item| {
+            let (_bit_pos, quad) = item?;
+            Ok(quad)
+        }),
+    )
 }
 
 #[test]
@@ -725,7 +739,7 @@ fn test_read_write_sorted_array() -> Result<()> {
         no_logging!(),
     )?;
     assert_eq!(
-        read_sorted_array_file(BufBitReader::<LE, _>::new(MemWordReader::new(&buf)))?
+        read_sorted_array_file(BufBitReader::<LE, _>::new(MemWordReader::new(&buf)), 0)?
             .map(Result::unwrap)
             .collect::<Vec<_>>(),
         quads
