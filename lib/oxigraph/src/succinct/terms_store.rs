@@ -306,10 +306,10 @@ pub(super) fn list_terms_files(
 pub fn index_terms(dir: &Path) -> Result<()> {
     let (config, terms_files) = list_terms_files(dir)?;
     let mut pl = concurrent_progress_logger!(
-        item_name = "frame",
+        item_name = "term",
         display_memory = true,
         local_speed = true,
-        expected_updates = Some(config.num_terms / config.terms_per_frame),
+        expected_updates = Some(config.num_terms),
     );
     pl.start("Indexing terms...");
 
@@ -325,25 +325,55 @@ pub fn index_terms(dir: &Path) -> Result<()> {
             let num_frames = num_terms.div_ceil(config.terms_per_frame);
             let compressed_frames = compressed_frames.as_ref();
 
-            let mut efb =
-                sux::dict::elias_fano::EliasFanoBuilder::new(num_terms, compressed_frames.len()); // .context("Could not initialize EliasFanoBuilder")?;
+            let mut efb = EliasFanoBuilder::new(num_terms, compressed_frames.len());
             let mut offset = 0;
+            let mut decompressed_frame = Vec::with_capacity(
+                usize::try_from(zstd::zstd_safe::BLOCKSIZE_MAX)
+                    .context("decompressed zstd frame size overflows usize")?,
+            );
             for frame_id in 0..num_frames {
                 ensure!(
                     !compressed_frames[offset..].is_empty(),
                     "Expected {num_frames} in {}, but there are only {frame_id}",
                     path.display()
                 );
-                efb.push(offset);
-                offset += zstd::zstd_safe::find_frame_compressed_size(&compressed_frames[offset..])
-                    .map_err(|errno| {
-                        anyhow!(
-                            "Could not get compressed size of frame {frame_id} of {}: {}",
-                            path.display(),
-                            zstd::zstd_safe::get_error_name(errno)
+                let frame_compressed_size =
+                    zstd::zstd_safe::find_frame_compressed_size(&compressed_frames[offset..])
+                        .map_err(|errno| {
+                            anyhow!(
+                                "Could not get compressed size of frame {frame_id} of {}: {}",
+                                path.display(),
+                                zstd::zstd_safe::get_error_name(errno)
+                            )
+                        })?;
+                zstd::zstd_safe::decompress(
+                    &mut decompressed_frame,
+                    &compressed_frames[offset..offset + frame_compressed_size],
+                )
+                .map_err(|errno| {
+                    anyhow!(
+                        "Could not decompressed frame {frame_id} of {}: {}",
+                        path.display(),
+                        zstd::zstd_safe::get_error_name(errno)
+                    )
+                })?;
+
+                let mut frame_reader = Cursor::new(&decompressed_frame);
+                while read_length_prefixed_string(&mut frame_reader, |_| None)
+                    .with_context(|| {
+                        format!(
+                            "Could not read string in frame {frame_id} of {}",
+                            path.display()
                         )
-                    })?;
-                pl.light_update();
+                    })?
+                    .is_some()
+                {
+                    efb.push(offset);
+                    pl.light_update();
+                }
+                decompressed_frame.clear();
+
+                offset += frame_compressed_size;
             }
             ensure!(
                 compressed_frames[offset..].is_empty(),
@@ -354,7 +384,7 @@ pub fn index_terms(dir: &Path) -> Result<()> {
 
             let ef = efb.build_with_seq();
 
-            let index_file_path = path.with_extension("ef");
+            let index_file_path = path.with_extension("frames.ef");
             let mut index_file = File::create(&index_file_path)
                 .with_context(|| format!("Could not create {}", index_file_path.display()))?;
             ef.serialize(&mut index_file).with_context(|| {
