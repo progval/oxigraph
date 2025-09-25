@@ -327,11 +327,7 @@ pub fn index_frames(dir: &Path) -> Result<()> {
 
             let file_len_bits = usize::try_from(file_len * 8)
                 .with_context(|| format!("Size (in bits) of {} overflows usize", path.display()))?;
-            let mut efb = sux::dict::elias_fano::EliasFanoBuilder::new(num_frames, file_len_bits); // .context("Could not initialize EliasFanoBuilder")?;
-
-            if num_frames >= 1 {
-                efb.push(0); // first frame has bit_pos=None below
-            }
+            let mut efb = EliasFanoBuilder::new(num_frames, file_len_bits);
 
             read_sorted_array_file_internal::<4>(
                 BufBitReader::new(MemWordReader::<u64, _>::new(data)),
@@ -439,21 +435,23 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
                     "quad {quad:?} is in wrong partition {partition_id} (first term should be >= {} and < {}, num_terms_in_partition={num_terms_in_partition})",
                     first_first_term_in_partition, first_first_term_in_partition + num_terms_in_partition,
                 );
-                if previous_relative_first_term == relative_first_term {
-                    // new frame, but still has the same first term
-                    return Ok(());
+                if previous_relative_first_term != relative_first_term {
+                    // don't push to the Elias-Fano sequence if we already pushed
+                    // the position of the first frame containing the first_term
+                    ensure!(relative_first_term > previous_relative_first_term, "{} after {}", first_first_term_in_partition + relative_first_term, first_first_term_in_partition + previous_relative_first_term);
+
+                    // fill the blanks for terms with no quad
+                    for _ in (previous_relative_first_term + 1)..relative_first_term {
+                        efb.push(previous_bit_pos);
+                    }
+
+                    ensure!(bit_pos < file_len_bits, "bit_pos={bit_pos} is past the end of {} ({file_len_bits})", path.display());
+                    efb.push(bit_pos);
+
+                    previous_relative_first_term = relative_first_term;
                 }
-                ensure!(relative_first_term > previous_relative_first_term, "{} after {}", first_first_term_in_partition + relative_first_term, first_first_term_in_partition + previous_relative_first_term);
 
-                // fill the blanks for terms with no quad
-                for _ in (previous_relative_first_term + 1)..relative_first_term {
-                    efb.push(previous_bit_pos);
-                }
-
-                ensure!(bit_pos < file_len_bits, "bit_pos={bit_pos} is past the end of {} ({file_len_bits})", path.display());
-                efb.push(bit_pos);
-
-                previous_relative_first_term = relative_first_term;
+                // used as placeholder for terms that don't have any quad.
                 previous_bit_pos = bit_pos;
 
                 Ok(())

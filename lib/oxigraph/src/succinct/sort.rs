@@ -637,6 +637,7 @@ pub fn read_sorted_array_file_internal<'a, const N: usize>(
     mut reader: impl BitRead<LE> + BitSeek + GammaRead<LE> + 'a,
     from_bit_position: usize,
 ) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + 'a> {
+    let mut first_quad = true;
     let mut actual_previous_item = [0usize; N];
     let mut previous_item = [0usize; N];
 
@@ -704,9 +705,9 @@ pub fn read_sorted_array_file_internal<'a, const N: usize>(
                 actual_previous_item = item;
             }
 
-            if item == [0; N] {
-                let bit_pos = reader.bit_pos().context("Could not get bit position")?;
-                ensure!(bit_pos == 0, "zero quad at bit position {bit_pos}");
+            if first_quad {
+                // the very first quad
+                first_quad = false;
                 Ok(Some((Some(0), item)))
             } else {
                 Ok(Some((bit_pos, item)))
