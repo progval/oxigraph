@@ -33,7 +33,6 @@ geosparql = ["dep:spargeo"]
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
-deko.workspace = true
 env_logger.workspace = true
 flate2.workspace = true
 log.workspace = true

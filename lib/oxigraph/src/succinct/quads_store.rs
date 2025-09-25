@@ -640,7 +640,8 @@ impl QuadStore {
         ensure!(
             term < self.config.num_terms,
             "Invalid term: {term} (only {} terms in store {})",
-            self.config.num_terms, self.path.display()
+            self.config.num_terms,
+            self.path.display()
         );
         let num_terms_per_partition = self.config.num_terms.div_ceil(self.config.num_partitions);
         Ok(&self.partitions[term / num_terms_per_partition])

@@ -41,15 +41,13 @@ impl SuccinctDatasetViewInner {
 
         let mphf_path = path.join("terms_mphf");
         let terms_mphf = if mmap_mphf {
-            TermMphf::mmap(&mphf_path)
-                .with_context(|| {
-                    format!("Could not mmap terms MPHF from {}", mphf_path.display())
-                })?
+            TermMphf::mmap(&mphf_path).with_context(|| {
+                format!("Could not mmap terms MPHF from {}", mphf_path.display())
+            })?
         } else {
-            TermMphf::load(&mphf_path)
-                .with_context(|| {
-                    format!("Could not load terms MPHF from {}", mphf_path.display())
-                })?
+            TermMphf::load(&mphf_path).with_context(|| {
+                format!("Could not load terms MPHF from {}", mphf_path.display())
+            })?
         };
         let mut view = Self {
             terms_mphf,
@@ -119,12 +117,7 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView<'a> {
         let subject: Option<usize> = subject.copied();
         let predicate: Option<usize> = predicate.copied();
         let object: Option<usize> = object.copied();
-        match (
-            subject,
-            predicate,
-            object,
-            graph_name,
-        ) {
+        match (subject, predicate, object, graph_name) {
             (Some(subject), Some(predicate), _, _) => map_iterator(
                 inner
                     .spog_quads

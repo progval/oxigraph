@@ -1,3 +1,6 @@
+#![allow(clippy::shadow_same)]
+
+pub mod database_builder;
 pub mod quads_store;
 pub mod queryable_dataset;
 pub mod sort;

@@ -186,7 +186,7 @@ impl TermMphf<BitFieldVec<usize>> {
     }
 }
 
-pub fn build_terms_mph(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
+pub fn build_terms_mphf(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
     let (config, terms_files) = list_terms_files(dir)?;
 
     let terms_lender = RewindableIoFlattenLender::new(
