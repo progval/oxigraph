@@ -1157,7 +1157,7 @@ mod tests {
         storage.snapshot().validate()?;
 
         // We add quads and graph, then clear
-        storage.bulk_loader().load_batch(vec![
+        storage.bulk_loader()?.load_batch(vec![
             default_quad.into_owned(),
             named_graph_quad.into_owned(),
         ]);

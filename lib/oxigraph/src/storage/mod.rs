@@ -11,6 +11,10 @@ use crate::storage::rocksdb::{
     RocksDbStorageBulkLoader, RocksDbStorageReadableTransaction, RocksDbStorageReader,
     RocksDbStorageTransaction,
 };
+#[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+use crate::storage::succinct::{
+    SuccinctDecodingGraphIterator, SuccinctQuadIterator, SuccinctStorage, SuccinctStorageReader,
+};
 use oxrdf::Quad;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 use std::path::Path;
@@ -27,6 +31,8 @@ mod rocksdb;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 mod rocksdb_wrapper;
 pub mod small_string;
+#[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+mod succinct;
 
 pub const DEFAULT_BULK_LOAD_BATCH_SIZE: usize = 1_000_000;
 
@@ -40,6 +46,8 @@ pub struct Storage {
 enum StorageKind {
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
     RocksDb(RocksDbStorage),
+    #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+    Succinct(SuccinctStorage),
     Memory(MemoryStorage),
 }
 
@@ -51,14 +59,26 @@ impl Storage {
         })
     }
 
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "succinct")
+    ))]
     pub fn open(path: &Path) -> Result<Self, StorageError> {
-        Ok(Self {
-            kind: StorageKind::RocksDb(RocksDbStorage::open(path)?),
-        })
+        if std::fs::exists(path.join("terms"))? {
+            Ok(Self {
+                kind: StorageKind::Succinct(SuccinctStorage::open(path)?),
+            })
+        } else {
+            Ok(Self {
+                kind: StorageKind::RocksDb(RocksDbStorage::open(path)?),
+            })
+        }
     }
 
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "succinct")
+    ))]
     pub fn open_read_only(path: &Path) -> Result<Self, StorageError> {
         Ok(Self {
             kind: StorageKind::RocksDb(RocksDbStorage::open_read_only(path)?),
@@ -70,13 +90,18 @@ impl Storage {
             kind: match &self.kind {
                 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
                 StorageKind::RocksDb(storage) => StorageReaderKind::RocksDb(storage.snapshot()),
+                #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+                StorageKind::Succinct(storage) => StorageReaderKind::Succinct(storage.snapshot()),
                 StorageKind::Memory(storage) => StorageReaderKind::Memory(storage.snapshot()),
             },
         }
     }
 
     #[cfg_attr(
-        not(all(not(target_family = "wasm"), feature = "rocksdb")),
+        not(all(
+            not(target_family = "wasm"),
+            any(feature = "rocksdb", feature = "succinct")
+        )),
         expect(clippy::unnecessary_wraps)
     )]
     pub fn start_transaction(&self) -> Result<StorageTransaction<'_>, StorageError> {
@@ -86,6 +111,12 @@ impl Storage {
                 StorageKind::RocksDb(storage) => {
                     StorageTransactionKind::RocksDb(storage.start_transaction()?)
                 }
+                #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+                StorageKind::Succinct(_) => {
+                    return Err(StorageError::Other(
+                        "It is not possible to write to a succinct database".into(),
+                    ));
+                }
                 StorageKind::Memory(storage) => {
                     StorageTransactionKind::Memory(storage.start_transaction())
                 }
@@ -94,7 +125,10 @@ impl Storage {
     }
 
     #[cfg_attr(
-        not(all(not(target_family = "wasm"), feature = "rocksdb")),
+        not(all(
+            not(target_family = "wasm"),
+            any(feature = "rocksdb", feature = "succinct")
+        )),
         expect(clippy::unnecessary_wraps)
     )]
     pub fn start_readable_transaction(
@@ -106,6 +140,12 @@ impl Storage {
                 StorageKind::RocksDb(storage) => {
                     StorageReadableTransactionKind::RocksDb(storage.start_readable_transaction()?)
                 }
+                #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+                StorageKind::Succinct(_) => {
+                    return Err(StorageError::Other(
+                        "It is not possible to write to a succinct database".into(),
+                    ));
+                }
                 StorageKind::Memory(storage) => {
                     StorageReadableTransactionKind::Memory(storage.start_transaction())
                 }
@@ -113,44 +153,65 @@ impl Storage {
         })
     }
 
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "succinct")
+    ))]
     pub fn flush(&self) -> Result<(), StorageError> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageKind::RocksDb(storage) => storage.flush(),
+            #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+            StorageKind::Succinct(storage) => Ok(()),
             StorageKind::Memory(_) => Ok(()),
         }
     }
 
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "succinct")
+    ))]
     pub fn compact(&self) -> Result<(), StorageError> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageKind::RocksDb(storage) => storage.compact(),
+            #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+            StorageKind::Succinct(storage) => Ok(()),
             StorageKind::Memory(_) => Ok(()),
         }
     }
 
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "succinct")
+    ))]
     pub fn backup(&self, target_directory: &Path) -> Result<(), StorageError> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageKind::RocksDb(storage) => storage.backup(target_directory),
+            #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+            StorageKind::Succinct(storage) => Err(StorageError::Other(
+                "It is not possible to backup a succinct database".into(),
+            )),
             StorageKind::Memory(_) => Err(StorageError::Other(
                 "It is not possible to backup an in-memory database".into(),
             )),
         }
     }
 
-    pub fn bulk_loader(&self) -> StorageBulkLoader<'_> {
+    pub fn bulk_loader(&self) -> Result<StorageBulkLoader<'_>, StorageError> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
-            StorageKind::RocksDb(storage) => StorageBulkLoader {
+            StorageKind::RocksDb(storage) => Ok(StorageBulkLoader {
                 kind: StorageBulkLoaderKind::RocksDb(storage.bulk_loader()),
-            },
-            StorageKind::Memory(storage) => StorageBulkLoader {
+            }),
+            #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+            StorageKind::Succinct(storage) => Err(StorageError::Other(
+                "It is not possible to write to a succinct database".into(),
+            )),
+            StorageKind::Memory(storage) => Ok(StorageBulkLoader {
                 kind: StorageBulkLoaderKind::Memory(storage.bulk_loader()),
-            },
+            }),
         }
     }
 }
@@ -163,11 +224,16 @@ pub struct StorageReader<'a> {
 enum StorageReaderKind<'a> {
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
     RocksDb(RocksDbStorageReader<'a>),
+    #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+    Succinct(SuccinctStorageReader<'a>),
     Memory(MemoryStorageReader<'a>),
 }
 
 #[cfg_attr(
-    not(all(not(target_family = "wasm"), feature = "rocksdb")),
+    not(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "succinct")
+    )),
     expect(clippy::unnecessary_wraps)
 )]
 impl<'a> StorageReader<'a> {
@@ -175,6 +241,8 @@ impl<'a> StorageReader<'a> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.len(),
+            #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+            StorageReaderKind::Succinct(reader) => reader.len(),
             StorageReaderKind::Memory(reader) => Ok(reader.len()),
         }
     }
@@ -183,6 +251,8 @@ impl<'a> StorageReader<'a> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.is_empty(),
+            #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+            StorageReaderKind::Succinct(reader) => reader.is_empty(),
             StorageReaderKind::Memory(reader) => Ok(reader.is_empty()),
         }
     }
@@ -191,6 +261,8 @@ impl<'a> StorageReader<'a> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.contains(quad),
+            #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+            StorageReaderKind::Succinct(reader) => reader.contains(quad),
             StorageReaderKind::Memory(reader) => Ok(reader.contains(quad)),
         }
     }
@@ -208,6 +280,10 @@ impl<'a> StorageReader<'a> {
                 StorageReaderKind::RocksDb(reader) => DecodingQuadIteratorKind::RocksDb(
                     reader.quads_for_pattern(subject, predicate, object, graph_name),
                 ),
+                #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+                StorageReaderKind::Succinct(reader) => DecodingQuadIteratorKind::Succinct(
+                    reader.quads_for_pattern(subject, predicate, object, graph_name),
+                ),
                 StorageReaderKind::Memory(reader) => DecodingQuadIteratorKind::Memory(
                     reader.quads_for_pattern(subject, predicate, object, graph_name),
                 ),
@@ -222,6 +298,10 @@ impl<'a> StorageReader<'a> {
                 StorageReaderKind::RocksDb(reader) => {
                     DecodingGraphIteratorKind::RocksDb(reader.named_graphs())
                 }
+                #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+                StorageReaderKind::Succinct(reader) => {
+                    DecodingGraphIteratorKind::Succinct(reader.named_graphs())
+                }
                 StorageReaderKind::Memory(reader) => {
                     DecodingGraphIteratorKind::Memory(reader.named_graphs())
                 }
@@ -233,6 +313,8 @@ impl<'a> StorageReader<'a> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.contains_named_graph(graph_name),
+            #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+            StorageReaderKind::Succinct(reader) => reader.contains_named_graph(graph_name),
             StorageReaderKind::Memory(reader) => Ok(reader.contains_named_graph(graph_name)),
         }
     }
@@ -241,6 +323,8 @@ impl<'a> StorageReader<'a> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.contains_str(key),
+            #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+            StorageReaderKind::Succinct(reader) => reader.contains_str(key),
             StorageReaderKind::Memory(reader) => Ok(reader.contains_str(key)),
         }
     }
@@ -250,6 +334,8 @@ impl<'a> StorageReader<'a> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.validate(),
+            #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+            StorageReaderKind::Succinct(reader) => reader.validate(),
             StorageReaderKind::Memory(reader) => reader.validate(),
         }
     }
@@ -263,6 +349,8 @@ pub struct DecodingQuadIterator<'a> {
 enum DecodingQuadIteratorKind<'a> {
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
     RocksDb(RocksDbChainedDecodingQuadIterator<'a>),
+    #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+    Succinct(SuccinctQuadIterator<'a>),
     Memory(QuadIterator<'a>),
 }
 
@@ -273,6 +361,8 @@ impl Iterator for DecodingQuadIterator<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             DecodingQuadIteratorKind::RocksDb(iter) => iter.next(),
+            #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+            DecodingQuadIteratorKind::Succinct(iter) => iter.next(),
             DecodingQuadIteratorKind::Memory(iter) => iter.next().map(Ok),
         }
     }
@@ -286,6 +376,8 @@ pub struct DecodingGraphIterator<'a> {
 enum DecodingGraphIteratorKind<'a> {
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
     RocksDb(RocksDbDecodingGraphIterator<'a>),
+    #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+    Succinct(SuccinctDecodingGraphIterator<'a>),
     Memory(MemoryDecodingGraphIterator<'a>),
 }
 
@@ -296,6 +388,8 @@ impl Iterator for DecodingGraphIterator<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             DecodingGraphIteratorKind::RocksDb(iter) => iter.next(),
+            #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+            DecodingGraphIteratorKind::Succinct(iter) => iter.next(),
             DecodingGraphIteratorKind::Memory(iter) => iter.next().map(Ok),
         }
     }
@@ -306,6 +400,8 @@ impl StrLookup for StorageReader<'_> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.get_str(key),
+            #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
+            StorageReaderKind::Succinct(reader) => reader.get_str(key),
             StorageReaderKind::Memory(reader) => reader.get_str(key),
         }
     }

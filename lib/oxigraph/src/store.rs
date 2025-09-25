@@ -1002,7 +1002,7 @@ impl Store {
     /// // quads file insertion
     /// let file =
     ///     "<http://example.com> <http://example.com> <http://example.com> <http://example.com> .";
-    /// let mut loader = store.bulk_loader();
+    /// let mut loader = store.bulk_loader()?;
     /// loader.load_from_slice(RdfFormat::NQuads, file)?;
     /// loader.commit()?;
     ///
@@ -1011,13 +1011,13 @@ impl Store {
     /// assert!(store.contains(QuadRef::new(ex, ex, ex, ex))?);
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn bulk_loader(&self) -> BulkLoader<'_> {
-        BulkLoader {
-            storage: self.storage.bulk_loader(),
+    pub fn bulk_loader(&self) -> Result<BulkLoader<'_>, StorageError> {
+        Ok(BulkLoader {
+            storage: self.storage.bulk_loader()?,
             num_threads: None,
             max_memory_size: None,
             on_parse_error: None,
-        }
+        })
     }
 
     /// Validate that all the store invariants held in the data
@@ -1647,7 +1647,7 @@ impl Iterator for GraphNameIter<'_> {
 /// // quads file insertion
 /// let file =
 ///     "<http://example.com> <http://example.com> <http://example.com> <http://example.com> .";
-/// let mut loader = store.bulk_loader();
+/// let mut loader = store.bulk_loader()?;
 /// loader.load_from_slice(RdfFormat::NQuads, file)?;
 /// loader.commit()?;
 ///
@@ -1754,7 +1754,7 @@ impl BulkLoader<'_> {
     ///
     /// // insert a dataset file
     /// let file = "<http://example.com> <http://example.com> <http://example.com> <http://example.com/g> .";
-    /// let mut loader = store.bulk_loader();
+    /// let mut loader = store.bulk_loader()?;
     /// loader.load_from_reader(
     ///     RdfParser::from_format(RdfFormat::NQuads).lenient(), // we inject a custom parser with options
     ///     file.as_bytes()
@@ -1763,7 +1763,7 @@ impl BulkLoader<'_> {
     ///
     /// // insert a graph file
     /// let file = "<> <> <> .";
-    /// let mut loader = store.bulk_loader();
+    /// let mut loader = store.bulk_loader()?;
     /// loader.load_from_reader(
     ///     RdfParser::from_format(RdfFormat::Turtle)
     ///         .with_base_iri("http://example.com")?
@@ -1825,7 +1825,7 @@ impl BulkLoader<'_> {
     ///
     /// // insert a dataset file
     /// let file = "<http://example.com> <http://example.com> <http://example.com> <http://example.com/g> .";
-    /// let mut loader = store.bulk_loader();
+    /// let mut loader = store.bulk_loader()?;
     /// loader.load_from_slice(
     ///     RdfParser::from_format(RdfFormat::NQuads).lenient(), // we inject a custom parser with options
     ///     file
@@ -1834,7 +1834,7 @@ impl BulkLoader<'_> {
     ///
     /// // insert a graph file
     /// let file = "<> <> <> .";
-    /// let mut loader = store.bulk_loader();
+    /// let mut loader = store.bulk_loader()?;
     /// loader.load_from_slice(
     ///     RdfParser::from_format(RdfFormat::Turtle)
     ///         .with_base_iri("http://example.com")?
@@ -1898,7 +1898,7 @@ impl BulkLoader<'_> {
     ///
     /// // insert a dataset file
     /// let file = "<http://example.com> <http://example.com> <http://example.com> <http://example.com/g> .";
-    /// let mut loader = store.bulk_loader();
+    /// let mut loader = store.bulk_loader()?;
     /// loader.parallel_load_from_slice(
     ///     RdfParser::from_format(RdfFormat::NQuads).lenient(), // we inject a custom parser with options
     ///     file,
@@ -1907,7 +1907,7 @@ impl BulkLoader<'_> {
     ///
     /// // insert a graph file
     /// let file = "<http://example.com> <http://example.com> <http://example.com> .";
-    /// let mut loader = store.bulk_loader();
+    /// let mut loader = store.bulk_loader()?;
     /// loader.parallel_load_from_slice(
     ///     RdfParser::from_format(RdfFormat::NTriples)
     ///         .with_base_iri("http://example.com")?
@@ -2009,7 +2009,7 @@ impl BulkLoader<'_> {
     ///
     /// // insert a dataset file
     /// let file = "<http://example.com> <http://example.com> <http://example.com> <http://example.com/g> .";
-    /// let mut loader = store.bulk_loader();
+    /// let mut loader = store.bulk_loader()?;
     /// loader.parallel_load_from_slice(
     ///     RdfParser::from_format(RdfFormat::NQuads).lenient(), // we inject a custom parser with options
     ///     file,
@@ -2018,7 +2018,7 @@ impl BulkLoader<'_> {
     ///
     /// // insert a graph file
     /// let file = "<http://example.com> <http://example.com> <http://example.com> .";
-    /// let mut loader = store.bulk_loader();
+    /// let mut loader = store.bulk_loader()?;
     /// loader.parallel_load_from_slice(
     ///     RdfParser::from_format(RdfFormat::NTriples)
     ///         .with_base_iri("http://example.com")?
