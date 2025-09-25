@@ -329,7 +329,9 @@ pub fn index_frames(dir: &Path) -> Result<()> {
                 pl.light_update();
 
                 if bit_pos.is_some() {
-                    num_frames = num_frames.checked_add(1).context("number of frames overflowed usize")?;
+                    num_frames = num_frames
+                        .checked_add(1)
+                        .context("number of frames overflowed usize")?;
                 }
                 Ok(())
             })

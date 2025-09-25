@@ -360,7 +360,10 @@ impl<T, L: RewindableIoLender<T>> RewindableIoLender<T> for RewindableIoFlattenL
 
     fn rewind(mut self) -> Result<Self, Self::Error> {
         let mut new_lenders = Vec::with_capacity(self.lenders.len());
-        for lender in self.lenders.drain(0..=self.current_index.min(self.lenders.len()-1)) {
+        for lender in self
+            .lenders
+            .drain(0..=self.current_index.min(self.lenders.len() - 1))
+        {
             new_lenders.push(lender.rewind()?);
         }
         new_lenders.extend(self.lenders.drain(..));

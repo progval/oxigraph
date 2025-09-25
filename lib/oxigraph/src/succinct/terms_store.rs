@@ -330,12 +330,8 @@ pub fn index_terms(dir: &Path) -> Result<()> {
             let num_frames = num_terms.div_ceil(config.terms_per_frame);
             let compressed_frames = compressed_frames.as_ref();
 
-            let mut efb = EliasFanoBuilder::new(num_terms, compressed_frames.len());
+            let mut efb = EliasFanoBuilder::new(num_frames, compressed_frames.len());
             let mut offset = 0;
-            let mut decompressed_frame = Vec::with_capacity(
-                usize::try_from(zstd::zstd_safe::BLOCKSIZE_MAX)
-                    .context("decompressed zstd frame size overflows usize")?,
-            );
             for frame_id in 0..num_frames {
                 ensure!(
                     !compressed_frames[offset..].is_empty(),
@@ -351,32 +347,7 @@ pub fn index_terms(dir: &Path) -> Result<()> {
                                 zstd::zstd_safe::get_error_name(errno)
                             )
                         })?;
-                zstd::zstd_safe::decompress(
-                    &mut decompressed_frame,
-                    &compressed_frames[offset..offset + frame_compressed_size],
-                )
-                .map_err(|errno| {
-                    anyhow!(
-                        "Could not decompressed frame {frame_id} of {}: {}",
-                        path.display(),
-                        zstd::zstd_safe::get_error_name(errno)
-                    )
-                })?;
-
-                let mut frame_reader = Cursor::new(&decompressed_frame);
-                while read_length_prefixed_string(&mut frame_reader, |_| None)
-                    .with_context(|| {
-                        format!(
-                            "Could not read string in frame {frame_id} of {}",
-                            path.display()
-                        )
-                    })?
-                    .is_some()
-                {
-                    efb.push(offset);
-                    pl.light_update();
-                }
-                decompressed_frame.clear();
+                efb.push(offset);
 
                 offset += frame_compressed_size;
             }
@@ -389,7 +360,7 @@ pub fn index_terms(dir: &Path) -> Result<()> {
 
             let ef = efb.build_with_seq_and_dict();
 
-            let index_file_path = path.with_extension("terms.ef");
+            let index_file_path = path.with_extension("frames.ef");
             let mut index_file = File::create(&index_file_path)
                 .with_context(|| format!("Could not create {}", index_file_path.display()))?;
             ef.serialize(&mut index_file).with_context(|| {
@@ -431,20 +402,21 @@ impl TermStore {
                      path,
                      compressed_frames,
                  })| {
-                    let terms_index_path = path.with_extension("terms.ef");
-                    let terms_index = EfSeqDict::mmap(&terms_index_path, Flags::RANDOM_ACCESS)
+                    let num_frames = num_terms.div_ceil(config.terms_per_frame);
+                    let frames_index_path = path.with_extension("frames.ef");
+                    let frames_index = EfSeqDict::mmap(&frames_index_path, Flags::RANDOM_ACCESS)
                         .with_context(|| {
                             format!(
-                                "Could not epdeserialize terms index from {}",
-                                terms_index_path.display()
+                                "Could not epdeserialize frames index from {}",
+                                frames_index_path.display()
                             )
                         })?;
-                    ensure!(terms_index.len() == num_terms, "terms_index ({}) of partition {partition_id} does not match expected number of terms ({num_terms})", terms_index.len());
+                    ensure!(frames_index.len() == num_frames, "frames_index ({}) of partition {partition_id} does not match expected number of frames ({num_frames})", frames_index.len());
 
                     Ok(TermsPartition {
                         path,
                         first_term_id,
-                        terms_index,
+                        frames_index,
                         compressed_frames,
                     })
                 },
@@ -477,22 +449,20 @@ impl TermStore {
 
         // Compute which frame the term is in
         ensure!(
-            id - first_term_in_partition < partition.terms_index.len(),
-            "Inconsistent partition lengths in terms store {}",
-            self.path.display()
-        );
-        ensure!(
             first_term_in_partition == partition.first_term_id,
             "Unexpected first_term_id in partition {partition_id} of store {}",
             self.path.display()
         );
-        let frame_position = partition.terms_index.get(id - first_term_in_partition);
+        let frame_id = (id - first_term_in_partition) / self.config.terms_per_frame;
+        ensure!(
+            frame_id < partition.frames_index.len(),
+            "Inconsistent partition lengths in terms store {}",
+            self.path.display()
+        );
+        let frame_position = partition.frames_index.get(frame_id);
 
         // Compute the offset of the term within the frame
-        let first_term_in_frame = partition.terms_index.index_of(frame_position).context(
-            "terms_index.get() returned a value, but terms_index.index_of() says it is missing",
-        )?;
-        let offset_in_frame = id - first_term_in_frame;
+        let offset_in_frame = id % self.config.terms_per_frame;
 
         // Decompress the frame
         let mut decompressed_frame = Vec::with_capacity(
@@ -543,5 +513,5 @@ struct TermsPartition {
     path: PathBuf,
     first_term_id: usize,
     compressed_frames: Mmap,
-    terms_index: MemCase<<EfSeqDict as EpDeserializeInner>::DeserType<'static>>,
+    frames_index: MemCase<<EfSeqDict as EpDeserializeInner>::DeserType<'static>>,
 }
