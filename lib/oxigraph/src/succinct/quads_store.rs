@@ -318,7 +318,7 @@ pub fn index_frames(dir: &Path) -> Result<()> {
                 .with_context(|| format!("Could not stat array file {}", path.display()))?
                 .len();
 
-            let mut num_frames = 0;
+            let mut num_frames: usize = 0;
             read_sorted_array_file_internal::<4>(
                 BufBitReader::new(MemWordReader::<u64, _>::new(&data)),
                 0,
@@ -329,13 +329,15 @@ pub fn index_frames(dir: &Path) -> Result<()> {
                 pl.light_update();
 
                 if bit_pos.is_some() {
-                    num_frames += 1;
+                    num_frames = num_frames.checked_add(1).context("number of frames overflowed usize")?;
                 }
                 Ok(())
             })
             .with_context(|| format!("Could not read frame offsets from {}", path.display()))?;
 
-            let file_len_bits = usize::try_from(file_len * 8)
+            let file_len_bits = usize::try_from(file_len)
+                .with_context(|| format!("Size (in bytes) of {} overflows usize", path.display()))?
+                .checked_mul(8)
                 .with_context(|| format!("Size (in bits) of {} overflows usize", path.display()))?;
             let mut efb = EliasFanoBuilder::new(num_frames, file_len_bits);
 
@@ -400,7 +402,9 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
             let data = MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
                 .with_context(|| format!("Could not mmap array file {}", path.display()))?;
             let num_terms_in_partition = if partition_id == config.num_partitions - 1 {
-                config.num_terms.checked_sub(num_terms_per_partition * (config.num_partitions - 1)).unwrap()
+                // saturating_sub is needed when there are fewer terms than partitions
+                // (ie. in tiny databases)
+                config.num_terms.saturating_sub(num_terms_per_partition * (config.num_partitions - 1))
             } else {
                 num_terms_per_partition
             };
