@@ -11,12 +11,15 @@ use crate::storage::rocksdb::{
     RocksDbStorageBulkLoader, RocksDbStorageReadableTransaction, RocksDbStorageReader,
     RocksDbStorageTransaction,
 };
-#[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+#[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
 use crate::storage::succinct::{
     SuccinctDecodingGraphIterator, SuccinctQuadIterator, SuccinctStorage, SuccinctStorageReader,
 };
 use oxrdf::Quad;
-#[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "rocksdb", feature = "succinct")
+))]
 use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
 use std::{io, thread};
@@ -65,13 +68,27 @@ impl Storage {
     ))]
     pub fn open(path: &Path) -> Result<Self, StorageError> {
         if std::fs::exists(path.join("terms"))? {
-            Ok(Self {
-                kind: StorageKind::Succinct(SuccinctStorage::open(path)?),
-            })
+            #[cfg(feature = "succinct")]
+            {
+                Ok(Self {
+                    kind: StorageKind::Succinct(SuccinctStorage::open(path)?),
+                })
+            }
+            #[cfg(not(feature = "succinct"))]
+            Err(StorageError::Other(
+                "Succinct storage was not enabled at compile time".into(),
+            ))
         } else {
-            Ok(Self {
-                kind: StorageKind::RocksDb(RocksDbStorage::open(path)?),
-            })
+            #[cfg(feature = "rocksdb")]
+            {
+                Ok(Self {
+                    kind: StorageKind::RocksDb(RocksDbStorage::open(path)?),
+                })
+            }
+            #[cfg(not(feature = "rocksdb"))]
+            Err(StorageError::Other(
+                "RocksDB storage was not enabled at compile time".into(),
+            ))
         }
     }
 
@@ -80,9 +97,29 @@ impl Storage {
         any(feature = "rocksdb", feature = "succinct")
     ))]
     pub fn open_read_only(path: &Path) -> Result<Self, StorageError> {
-        Ok(Self {
-            kind: StorageKind::RocksDb(RocksDbStorage::open_read_only(path)?),
-        })
+        if std::fs::exists(path.join("terms"))? {
+            #[cfg(feature = "succinct")]
+            {
+                Ok(Self {
+                    kind: StorageKind::Succinct(SuccinctStorage::open(path)?),
+                })
+            }
+            #[cfg(not(feature = "succinct"))]
+            Err(StorageError::Other(
+                "Succinct storage was not enabled at compile time".into(),
+            ))
+        } else {
+            #[cfg(feature = "rocksdb")]
+            {
+                Ok(Self {
+                    kind: StorageKind::RocksDb(RocksDbStorage::open_read_only(path)?),
+                })
+            }
+            #[cfg(not(feature = "rocksdb"))]
+            Err(StorageError::Other(
+                "RocksDB storage was not enabled at compile time".into(),
+            ))
+        }
     }
 
     pub fn snapshot(&self) -> StorageReader<'static> {
@@ -185,6 +222,7 @@ impl Storage {
         not(target_family = "wasm"),
         any(feature = "rocksdb", feature = "succinct")
     ))]
+    #[cfg_attr(not(feature = "rocksdb"), expect(unused_variables))]
     pub fn backup(&self, target_directory: &Path) -> Result<(), StorageError> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]

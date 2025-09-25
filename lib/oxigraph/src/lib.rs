@@ -10,4 +10,5 @@ pub mod model;
 pub mod sparql;
 mod storage;
 pub mod store;
+#[cfg(feature = "succinct")]
 pub mod succinct;
