@@ -162,7 +162,7 @@ impl Storage {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageKind::RocksDb(storage) => storage.flush(),
             #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
-            StorageKind::Succinct(storage) => Ok(()),
+            StorageKind::Succinct(_) => Ok(()),
             StorageKind::Memory(_) => Ok(()),
         }
     }
@@ -176,7 +176,7 @@ impl Storage {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageKind::RocksDb(storage) => storage.compact(),
             #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
-            StorageKind::Succinct(storage) => Ok(()),
+            StorageKind::Succinct(_) => Ok(()),
             StorageKind::Memory(_) => Ok(()),
         }
     }
@@ -190,7 +190,7 @@ impl Storage {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageKind::RocksDb(storage) => storage.backup(target_directory),
             #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
-            StorageKind::Succinct(storage) => Err(StorageError::Other(
+            StorageKind::Succinct(_) => Err(StorageError::Other(
                 "It is not possible to backup a succinct database".into(),
             )),
             StorageKind::Memory(_) => Err(StorageError::Other(
@@ -206,7 +206,7 @@ impl Storage {
                 kind: StorageBulkLoaderKind::RocksDb(storage.bulk_loader()),
             }),
             #[cfg(all(not(target_family = "wasm"), feature = "succinct"))]
-            StorageKind::Succinct(storage) => Err(StorageError::Other(
+            StorageKind::Succinct(_) => Err(StorageError::Other(
                 "It is not possible to write to a succinct database".into(),
             )),
             StorageKind::Memory(storage) => Ok(StorageBulkLoader {

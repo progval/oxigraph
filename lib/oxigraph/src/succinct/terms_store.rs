@@ -137,7 +137,7 @@ fn deduplicate_terms(
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct TermsStoreConfiguration {
+pub struct TermStoreConfiguration {
     pub terms_per_frame: usize,
     pub frames_per_file: usize,
     pub num_terms: usize,
@@ -148,7 +148,7 @@ pub fn write_unique_terms(
     dir: &Path,
     approx_num_quads: Option<usize>,
 ) -> Result<()> {
-    let mut config = TermsStoreConfiguration {
+    let mut config = TermStoreConfiguration {
         terms_per_frame: 16,
         frames_per_file: 1024 * 1024,
         num_terms: 0,
@@ -231,11 +231,11 @@ pub(super) struct TermsFile<D> {
 
 pub(super) fn list_terms_files(
     dir: &Path,
-) -> Result<(TermsStoreConfiguration, Vec<TermsFile<impl AsRef<[u8]>>>)> {
+) -> Result<(TermStoreConfiguration, Vec<TermsFile<Mmap>>)> {
     let config_path = dir.join("config.json");
     let config_file = File::open(&config_path)
         .with_context(|| format!("Could not open {}", config_path.display()))?;
-    let config: TermsStoreConfiguration = serde_json::from_reader(config_file)
+    let config: TermStoreConfiguration = serde_json::from_reader(config_file)
         .with_context(|| format!("Could not read config from {}", config_path.display()))?;
 
     let mut entries = std::fs::read_dir(dir)

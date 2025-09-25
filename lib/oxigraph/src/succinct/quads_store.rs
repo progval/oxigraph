@@ -30,7 +30,7 @@ pub enum QuadOrder {
 
 impl QuadOrder {
     // returns a function that maps [s, p, o, g] to this order
-    pub fn predicate(self) -> fn([usize; 4]) -> [usize; 4] {
+    pub fn mapper(self) -> fn([usize; 4]) -> [usize; 4] {
         fn order_spog(quad: [usize; 4]) -> [usize; 4] {
             quad
         }
@@ -46,7 +46,7 @@ impl QuadOrder {
     }
 
     // returns a function that maps from this order to [s, p, o, g]
-    pub fn reverse_predicate(self) -> fn([usize; 4]) -> [usize; 4] {
+    pub fn reverse_mapper(self) -> fn([usize; 4]) -> [usize; 4] {
         fn order_spog(quad: [usize; 4]) -> [usize; 4] {
             quad
         }
@@ -75,7 +75,7 @@ impl std::fmt::Display for QuadOrder {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct QuadsStoreConfiguration {
+pub struct QuadStoreConfiguration {
     pub num_partitions: usize,
     pub num_quads: usize,
     pub num_terms: usize,
@@ -96,15 +96,14 @@ pub fn compress_quads(
     .max(256) // avoid too many files
     .next_power_of_two(),
         num_quads: 0,
-        num_terms: mphf.len(),
+        num_terms,
     };
 
-    let max_value = mphf.len() - 1;
+    let max_value = num_terms - 1;
 
     let sorter_pool = thread_local::ThreadLocal::new();
 
-    let order_quad = order.predicate();
-
+    let order_quad = order.mapper();
     // 500MiB in-memory buffer per thread
     let max_buffer_size = 500 * 1024 * 1024;
     let mut pl = concurrent_progress_logger!(
@@ -178,8 +177,8 @@ pub fn compress_quads(
             .collect::<Vec<_>>()
             .into_par_iter()
             .map(|sorter| {
-                let mut sorter = sorter.into_inner().expect("could not get sorter"); // XXX debug
-                sorter.flush_buffers().expect("could not flush"); // XXX debug
+                let mut sorter = sorter.into_inner().context("Could not get sorter")?;
+                sorter.flush_buffers().context("Could not flush")?;
                 Ok(sorter)
             })
             .reduce(
@@ -192,12 +191,9 @@ pub fn compress_quads(
                     .context("Could not create sorter ExternalArraySorter")?)
                 },
                 |left: Result<_>, right| {
-                    Ok(
-                        left.unwrap()
-                            .merge(right.unwrap())
-                            .expect("Could not merge ExternalDeduplicatingStringSorter"),
-                        //.context("Could not merge ExternalDeduplicatingStringSorter")?,
-                    )
+                    Ok(left?
+                        .merge(right?)
+                        .context("Could not merge ExternalDeduplicatingStringSorter")?)
                 },
             )?;
     pl.done();
@@ -245,23 +241,17 @@ pub fn compress_quads(
     Ok(())
 }
 
-/// Returns `[(partition_id, partition_bitstream_path)]`
-fn get_quad_partitions(dir: &Path) -> Result<(QuadsStoreConfiguration, Vec<(usize, PathBuf)>)> {
+fn get_quad_partitions(dir: &Path) -> Result<(QuadStoreConfiguration, Vec<PathBuf>)> {
     let config_path = dir.join("config.json");
     let config_file = File::open(&config_path)
         .with_context(|| format!("Could not open {}", config_path.display()))?;
-    let config: QuadsStoreConfiguration = serde_json::from_reader(config_file)
+    let config: QuadStoreConfiguration = serde_json::from_reader(config_file)
         .with_context(|| format!("Could not read config from {}", config_path.display()))?;
 
     Ok((
         config.clone(),
         (0..config.num_partitions)
-            .map(move |partition_id| {
-                (
-                    partition_id,
-                    dir.join(format!("{partition_id}.quads.bitstream")),
-                )
-            })
+            .map(move |partition_id| dir.join(format!("{partition_id}.quads.bitstream")))
             .collect(),
     ))
 }
@@ -273,9 +263,9 @@ pub fn par_iter_quads(
     let (_config, partitions) = get_quad_partitions(dir)?;
     Ok(partitions
         .into_par_iter()
-        .map(|(_partition_id, path)| {
-            let de_order_quad = order.predicate();
-            let data = webgraph::utils::MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
+        .map(|path| {
+            let de_order_quad = order.mapper();
+            let data = MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
                 .with_context(|| format!("Could not mmap array file {}", path.display()))?;
             Ok(
                 read_sorted_array_file(BufBitReader::new(MemWordReader::<u64, _>::new(data)), 0)
@@ -300,8 +290,8 @@ pub fn index_frames(dir: &Path) -> Result<()> {
 
     partitions
         .into_par_iter()
-        .try_for_each_with(pl.clone(), |pl, (_partition_id, path)| {
-            let data = webgraph::utils::MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
+        .try_for_each_with(pl.clone(), |pl, path| {
+            let data = MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
                 .with_context(|| format!("Could not mmap array file {}", path.display()))?;
 
             let file_len = std::fs::metadata(&path)
@@ -385,6 +375,7 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
     let num_terms_per_partition = config.num_terms.div_ceil(config.num_partitions);
     partitions
         .into_par_iter()
+        .enumerate()
         .try_for_each_with(pl.clone(), |pl, (partition_id, path)| {
             let data = webgraph::utils::MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
                 .with_context(|| format!("Could not mmap array file {}", path.display()))?;
@@ -407,7 +398,7 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
             let mut efb = sux::dict::elias_fano::EliasFanoBuilder::new(
                 num_terms_in_partition,
                 file_len_bits,
-            ); // .context("Could not initialize EliasFanoBuilder")?;
+            );
             read_sorted_array_file_internal::<4>(BufBitReader::new(MemWordReader::<u64, _>::new(
                 data,
             )), 0)
@@ -485,8 +476,8 @@ pub fn index_quads_by_first_two_terms(dir: &Path) -> Result<()> {
 
     partitions
         .into_par_iter()
-        .try_for_each_with(pl.clone(), |pl, (_partition_id, path)| {
-            let data = webgraph::utils::MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
+        .try_for_each_with(pl.clone(), |pl, path| {
+            let data = MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
                 .with_context(|| format!("Could not mmap array file {}", path.display()))?;
 
             let data = &data;
@@ -497,18 +488,6 @@ pub fn index_quads_by_first_two_terms(dir: &Path) -> Result<()> {
                 .with_context(|| format!("Could not read array file {}", path.display()),
                 )
             };
-
-            /*
-            let frame_index_file_path = path.with_extension("frames.ef");
-            let ef =
-                <EfSeq>::mmap(&frame_index_file_path, Flags::default()).with_context(|| {
-                    format!(
-                        "Could not mmap frame index {}",
-                        frame_index_file_path.display()
-                    )
-                })?;
-            let num_frames = ef.len();
-            */
 
             let keys = sux::utils::lenders::FromResultLenderFactory::new(|| -> Result<_, _> {
                 let mut previous_pair = None;

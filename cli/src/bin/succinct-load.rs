@@ -3,8 +3,8 @@ use clap::{Args, Parser, Subcommand, ValueHint};
 use oxigraph::io::{RdfFormat, RdfParseError, RdfParser};
 use oxigraph::model::{NamedNode, Quad};
 use oxigraph::succinct;
-use oxigraph::succinct::quads_store::QuadsStoreConfiguration;
-use oxigraph::succinct::terms_store::TermsStoreConfiguration;
+use oxigraph::succinct::quads_store::QuadStoreConfiguration;
+use oxigraph::succinct::terms_store::TermStoreConfiguration;
 use oxigraph_cli::utils::{rdf_format_from_name, rdf_format_from_path};
 use rayon::prelude::*;
 use std::fs::File;
@@ -209,14 +209,14 @@ pub fn main() -> Result<()> {
             let config_path = terms_path.join("config.json");
             let config_file = File::open(&config_path)
                 .with_context(|| format!("Could not open {}", config_path.display()))?;
-            let terms_store_config: TermsStoreConfiguration = serde_json::from_reader(config_file)
+            let terms_store_config: TermStoreConfiguration = serde_json::from_reader(config_file)
                 .with_context(|| format!("Could not read config from {}", config_path.display()))?;
 
             let quads_path = args.location.join(format!("quads-{order}"));
             let config_path = quads_path.join("config.json");
             let config_file = File::open(&config_path)
                 .with_context(|| format!("Could not open {}", config_path.display()))?;
-            let quads_store_config: QuadsStoreConfiguration = serde_json::from_reader(config_file)
+            let quads_store_config: QuadStoreConfiguration = serde_json::from_reader(config_file)
                 .with_context(|| format!("Could not read config from {}", config_path.display()))?;
 
             let quads = succinct::quads_store::par_iter_quads(&quads_path, *order)
