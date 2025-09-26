@@ -15,15 +15,33 @@ use spareval::QueryEvaluator;
 use spargebra::algebra::{GraphPattern, QueryDataset};
 use spargebra::{Query, SparqlParser};
 use std::sync::OnceLock;
+use std::io::Write;
+use std::sync::Arc;
+use spareval::QueryableDataset;
+use oxigraph::succinct::database_builder::{DatabaseBuilder, ParseQuadsArgs};
+use oxigraph::succinct::queryable_dataset::{SuccinctDatasetView, SuccinctDatasetViewInner};
 
 fuzz_target!(|data: sparql_smith::Query| {
-    static STORE: OnceLock<Store> = OnceLock::new();
-    let store = STORE.get_or_init(|| {
-        let store = Store::new().unwrap();
-        store
-            .load_from_slice(RdfFormat::TriG, sparql_smith::DATA_TRIG)
-            .unwrap();
-        store
+    static SUCCINCT_DATASET: OnceLock<Arc<SuccinctDatasetViewInner>> = OnceLock::new();
+    let succinct_dataset = SUCCINCT_DATASET.get_or_init(|| {
+        let location = tempfile::tempdir().expect("Could not create temp dir");
+        let mut input_file = tempfile::NamedTempFile::with_suffix(".trig").expect("Could not create temp file");
+        input_file.write_all(sparql_smith::DATA_TRIG.as_bytes()).expect("Could not write to temp file");
+        input_file.flush().expect("Could not flush temp file");
+
+
+        DatabaseBuilder::new(location.path().to_owned())
+            .with_parse_quad_args(Some(ParseQuadsArgs {
+                file: vec![input_file.path().to_owned()],
+                format: Some(RdfFormat::TriG),
+                ..Default::default()
+            }))
+            .build_all()
+            .expect(&format!("Could not build succinct database to {}", location.path().display()));
+
+        Arc::new(SuccinctDatasetViewInner::new(
+            location.path(), false
+        ).expect("Could not open succinct database"))
     });
 
     static DATASET: OnceLock<Dataset> = OnceLock::new();
@@ -36,17 +54,16 @@ fuzz_target!(|data: sparql_smith::Query| {
 
     let query_str = data.to_string();
     if let Ok(query) = SparqlParser::new().parse_query(&query_str) {
-        let with_opt = SparqlEvaluator::new()
-            .with_default_service_handler(StoreServiceHandler {
-                store: store.clone(),
+        let with_opt = QueryEvaluator::new()
+            .without_optimizations()
+            .with_default_service_handler(DatasetServiceHandler {
+                dataset: SuccinctDatasetView(&*succinct_dataset),
             })
-            .for_query(query.clone())
-            .on_store(store)
-            .execute();
+            .execute(dataset, &query);
         let without_opt = QueryEvaluator::new()
             .without_optimizations()
             .with_default_service_handler(DatasetServiceHandler {
-                dataset: dataset.clone(),
+                dataset: dataset,
             })
             .execute(dataset, &query);
         match (with_opt, without_opt) {
@@ -148,11 +165,11 @@ impl DefaultServiceHandler for StoreServiceHandler {
 }
 
 #[derive(Clone)]
-struct DatasetServiceHandler {
-    dataset: Dataset,
+struct DatasetServiceHandler<D: QueryableDataset<'static> + Clone + Send + Sync> {
+    dataset: D,
 }
 
-impl DefaultServiceHandler for DatasetServiceHandler {
+impl<D: QueryableDataset<'static> + Clone + Send + Sync> DefaultServiceHandler for DatasetServiceHandler<D> {
     type Error = QueryEvaluationError;
 
     fn handle(
@@ -161,15 +178,21 @@ impl DefaultServiceHandler for DatasetServiceHandler {
         pattern: &GraphPattern,
         base_iri: Option<&Iri<String>>,
     ) -> Result<QuerySolutionIter<'static>, QueryEvaluationError> {
+        let internalized_service_name =
+            self
+                .dataset
+                .internalize_term(service_name.clone().into())
+                .expect("Could not internalize");
         if self
             .dataset
-            .quads_for_graph_name(service_name)
+            .internal_quads_for_pattern(None, None, None, Some(Some(&internalized_service_name)))
             .next()
             .is_none()
         {
             return Err(QueryEvaluationError::Service("Graph does not exist".into()));
         }
 
+        /*
         let dataset = self
             .dataset
             .iter()
@@ -186,11 +209,12 @@ impl DefaultServiceHandler for DatasetServiceHandler {
                 }
             })
             .collect::<Dataset>();
+        */
         let evaluator = QueryEvaluator::new().with_default_service_handler(DatasetServiceHandler {
-            dataset: dataset.clone(),
+            dataset: self.dataset.clone(),
         });
         let QueryResults::Solutions(iter) = evaluator.execute(
-            &dataset,
+            self.dataset.clone(),
             &Query::Select {
                 dataset: None,
                 pattern: pattern.clone(),

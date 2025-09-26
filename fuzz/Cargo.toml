@@ -23,6 +23,7 @@ sparesults.path = "../lib/sparesults"
 spargebra.path = "../lib/spargebra"
 spareval.path = "../lib/spareval"
 sparql-smith = { path = "../lib/sparql-smith", features = ["sep-0006"] }
+tempfile = "3.1"
 
 [profile.release]
 codegen-units = 1
