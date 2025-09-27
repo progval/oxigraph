@@ -39,14 +39,14 @@ use crate::sparql::{
 #[cfg(not(target_family = "wasm"))]
 use crate::storage::map_thread_result;
 use crate::storage::numeric_encoder::{Decoder, EncodedQuad, EncodedTerm};
+use crate::updatable_dataset::{
+    BulkLoader as BulkLoaderTrait, ReadWriteTransaction, Reader, UpdatableDataset,
+    WriteOnlyTransaction,
+};
 pub use crate::storage::{CorruptionError, LoaderError, SerializerError, StorageError};
 use crate::storage::{
     DEFAULT_BULK_LOAD_BATCH_SIZE, DecodingGraphIterator, DecodingQuadIterator, Storage,
     StorageBulkLoader, StorageReadableTransaction, StorageReader,
-};
-use crate::updatable_dataset::{
-    BulkLoader as BulkLoaderTrait, ReadWriteTransaction, Reader, UpdatableDataset,
-    WriteOnlyTransaction,
 };
 #[cfg(not(target_family = "wasm"))]
 use std::cmp::max;
@@ -1369,29 +1369,6 @@ impl<'a> Transaction<'a> {
         Ok(())
     }
 
-    /// Adds a quad to this store.
-    ///
-    /// Returns `true` if the quad was not already in the store.
-    ///
-    /// Usage example:
-    /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
-    ///
-    /// let ex = NamedNodeRef::new_unchecked("http://example.com");
-    /// let quad = QuadRef::new(ex, ex, ex, GraphNameRef::DefaultGraph);
-    ///
-    /// let store = Store::new()?;
-    /// let mut transaction = store.start_transaction()?;
-    /// transaction.insert(quad);
-    /// transaction.commit()?;
-    /// assert!(store.contains(quad)?);
-    /// # Result::<_,oxigraph::store::StorageError>::Ok(())
-    /// ```
-    pub fn insert<'b>(&mut self, quad: impl Into<QuadRef<'b>>) {
-        self.inner.insert(quad.into())
-    }
-
     /// Adds a set of quads to this store.
     ///
     /// Usage example:
@@ -1415,29 +1392,6 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    /// Removes a quad from this store.
-    ///
-    /// Returns `true` if the quad was in the store and has been removed.
-    ///
-    /// Usage example:
-    /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
-    ///
-    /// let ex = NamedNodeRef::new_unchecked("http://example.com");
-    /// let quad = QuadRef::new(ex, ex, ex, GraphNameRef::DefaultGraph);
-    /// let store = Store::new()?;
-    /// let mut transaction = store.start_transaction()?;
-    /// transaction.insert(quad);
-    /// transaction.remove(quad);
-    /// transaction.commit()?;
-    /// assert!(!store.contains(quad)?);
-    /// # Result::<_,oxigraph::store::StorageError>::Ok(())
-    /// ```
-    pub fn remove<'b>(&mut self, quad: impl Into<QuadRef<'b>>) {
-        self.inner.remove(quad.into())
-    }
-
     /// Returns all the named graphs in the store.
     pub fn named_graphs(&self) -> GraphNameIter<'_> {
         let reader = self.inner.reader();
@@ -1455,55 +1409,6 @@ impl<'a> Transaction<'a> {
         self.inner
             .reader()
             .contains_named_graph(&EncodedTerm::from(graph_name.into()))
-    }
-
-    /// Inserts a graph into this store.
-    ///
-    /// Returns `true` if the graph was not already in the store.
-    ///
-    /// Usage example:
-    /// ```
-    /// use oxigraph::model::NamedNodeRef;
-    /// use oxigraph::store::Store;
-    ///
-    /// let ex = NamedNodeRef::new_unchecked("http://example.com");
-    /// let store = Store::new()?;
-    /// let mut transaction = store.start_transaction()?;
-    /// transaction.insert_named_graph(ex);
-    /// transaction.commit()?;
-    /// assert_eq!(
-    ///     store.named_graphs().collect::<Result<Vec<_>, _>>()?,
-    ///     vec![ex.into_owned().into()]
-    /// );
-    /// # Result::<_,oxigraph::store::StorageError>::Ok(())
-    /// ```
-    pub fn insert_named_graph<'b>(&mut self, graph_name: impl Into<NamedOrBlankNodeRef<'b>>) {
-        self.inner.insert_named_graph(graph_name.into())
-    }
-
-    /// Clears a graph from this store.
-    ///
-    /// Usage example:
-    /// ```
-    /// use oxigraph::model::{NamedNodeRef, QuadRef};
-    /// use oxigraph::store::Store;
-    ///
-    /// let ex = NamedNodeRef::new_unchecked("http://example.com");
-    /// let quad = QuadRef::new(ex, ex, ex, ex);
-    /// let store = Store::new()?;
-    /// let mut transaction = store.start_transaction()?;
-    /// transaction.insert(quad);
-    /// transaction.clear_graph(ex)?;
-    /// transaction.commit()?;
-    /// assert!(store.is_empty()?);
-    /// assert_eq!(1, store.named_graphs().count());
-    /// # Result::<_,oxigraph::store::StorageError>::Ok(())
-    /// ```
-    pub fn clear_graph<'b>(
-        &mut self,
-        graph_name: impl Into<GraphNameRef<'b>>,
-    ) -> Result<(), StorageError> {
-        self.inner.clear_graph(graph_name.into())
     }
 
     /// Removes a graph from this store.
@@ -1526,51 +1431,6 @@ impl<'a> Transaction<'a> {
     /// assert_eq!(0, store.named_graphs().count());
     /// # Result::<_,oxigraph::store::StorageError>::Ok(())
     /// ```
-    pub fn remove_named_graph<'b>(
-        &mut self,
-        graph_name: impl Into<NamedOrBlankNodeRef<'b>>,
-    ) -> Result<(), StorageError> {
-        self.inner.remove_named_graph(graph_name.into())
-    }
-
-    /// Clears the store.
-    ///
-    /// Usage example:
-    /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
-    ///
-    /// let ex = NamedNodeRef::new_unchecked("http://example.com");
-    /// let store = Store::new()?;
-    /// let mut transaction = store.start_transaction()?;
-    /// transaction.insert(QuadRef::new(ex, ex, ex, ex));
-    /// transaction.clear()?;
-    /// transaction.commit()?;
-    /// assert!(store.is_empty()?);
-    /// # Result::<_,oxigraph::store::StorageError>::Ok(())
-    /// ```
-    pub fn clear(&mut self) -> Result<(), StorageError> {
-        self.inner.clear()
-    }
-
-    /// Commits the transaction, i.e., apply its modifications to the underlying store.
-    ///
-    /// Usage example:
-    /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
-    ///
-    /// let ex = NamedNodeRef::new_unchecked("http://example.com");
-    /// let store = Store::new()?;
-    /// let mut transaction = store.start_transaction()?;
-    /// transaction.insert(QuadRef::new(ex, ex, ex, ex));
-    /// transaction.commit()?;
-    /// assert!(store.contains(QuadRef::new(ex, ex, ex, ex))?);
-    /// # Result::<_,oxigraph::store::StorageError>::Ok(())
-    /// ```
-    pub fn commit(self) -> Result<(), StorageError> {
-        self.inner.commit()
-    }
 
     pub(super) fn inner(&self) -> &StorageReadableTransaction<'a> {
         &self.inner
@@ -1578,6 +1438,53 @@ impl<'a> Transaction<'a> {
 
     pub(super) fn inner_mut(&mut self) -> &mut StorageReadableTransaction<'a> {
         &mut self.inner
+    }
+
+    pub fn remove_named_graph<'b>(
+        &mut self,
+        graph_name: impl Into<NamedOrBlankNodeRef<'b>>,
+    ) -> Result<(), StorageError> {
+        self.inner.remove_named_graph(graph_name.into())
+    }
+}
+
+impl WriteOnlyTransaction<'_> for Transaction<'_> {
+    type Error = StorageError;
+
+    fn insert(&mut self, quad: QuadRef<'_>) {
+        self.inner.insert(quad.into())
+    }
+
+    fn insert_named_graph(&mut self, graph_name: NamedOrBlankNodeRef<'_>) {
+        self.inner.insert_named_graph(graph_name.into())
+    }
+
+    fn remove(&mut self, quad: QuadRef<'_>) {
+        self.inner.remove(quad.into())
+    }
+
+    fn clear_graph(&mut self, graph_name: GraphNameRef<'_>) -> Result<(), StorageError> {
+        self.inner.clear_graph(graph_name.into())
+    }
+
+    fn clear_all_graphs(&mut self) -> Result<(), StorageError> {
+        self.inner.clear_all_graphs()
+    }
+
+    fn clear_all_named_graphs(&mut self) -> Result<(), StorageError> {
+        self.inner.clear_all_named_graphs()
+    }
+
+    fn remove_all_named_graphs(&mut self) -> Result<(), StorageError> {
+        self.inner.remove_all_named_graphs()
+    }
+
+    fn clear(&mut self) -> Result<(), StorageError> {
+        self.inner.clear()
+    }
+
+    fn commit(self) -> Result<(), StorageError> {
+        self.inner.commit()
     }
 }
 
