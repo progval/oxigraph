@@ -10,11 +10,12 @@ use rdst::{RadixKey, RadixSort};
 use rustc_hash::FxHashSet;
 use std::fs::File;
 use std::io::{BufWriter, Cursor, Seek, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use sux::bits::BitFieldVec;
 use sux::traits::BitFieldSlice;
 use sux::traits::bit_field_slice::BitFieldSliceCore;
 use tempfile::TempDir;
+use webgraph::utils::MmapHelper;
 
 /// Sorts and deduplicates strings and spills to disk to save memory
 ///
@@ -358,12 +359,6 @@ impl<const N: usize> ExternalArraySorter<N> {
             quads.push(quad);
         }
 
-        // if N != 4 {
-        // todo!("Add support for N != 4");
-        // }
-        // FIXME: replace '4' with 'N' (https://github.com/rust-lang/rust/issues/76560)
-        // bytemuck::cast_slice_mut::<_, [u8; (4 * (usize::BITS / 8)) as usize]>(&mut sorted_vec)
-        // .radix_sort_unstable();
         #[derive(TransparentWrapper, Clone, Copy)]
         #[repr(transparent)]
         struct Quad<const N: usize>([usize; N]);
@@ -403,21 +398,14 @@ impl<const N: usize> ExternalArraySorter<N> {
             .unwrap()
             .path()
             .join(format!("{}", self.num_files_in_first_tempdir));
-        let file = File::create_new(&path)
-            .with_context(|| format!("Could not create {}", path.display()))?;
+        let mut num_quads = 0;
+        SortedArraysFile::create(
+            &path,
+            quads.into_iter().inspect(|_| num_quads += 1),
+            no_logging!(),
+        )
+        .with_context(|| format!("Could not write quads to {}", path.display()))?;
         self.num_files_in_first_tempdir += 1;
-
-        let mut writer = BufBitWriter::new(WordAdapter::<usize, _>::new(BufWriter::new(file)));
-        let num_quads = write_sorted_array_file(&mut writer, quads.into_iter(), no_logging!())
-            .with_context(|| format!("Could not write quads to {}", path.display()))?;
-        writer
-            .into_inner() // BufBitWriter -> WordAdapter
-            .with_context(|| format!("Could not flush {}", path.display()))?
-            .into_inner() // WordAdapter -> BufWriter
-            .into_inner() // BufWriter -> File
-            .with_context(|| format!("Could not flush {}", path.display()))?
-            .flush()
-            .with_context(|| format!("Could not flush {}", path.display()))?;
 
         self.sorted_files[partition_id].push(path);
 
@@ -501,31 +489,7 @@ impl<const N: usize> ExternalArraySorter<N> {
     fn iter_written_quads(files: &[PathBuf]) -> Result<impl Iterator<Item = Result<[usize; N]>>> {
         Ok(files
             .iter()
-            .map(|path| {
-                // let file = File::open(&path).with_context(|| {
-                // format!("Could not open sorted array file {}", path.display())
-                // })?;
-                //
-                // let file_len = usize::try_from(
-                // file.metadata()
-                // .with_context(|| {
-                // format!("Could not stat sorted array file {}", path.display())
-                // })?
-                // .len(),
-                // )
-                // .context("file size overflowed usize")?;
-                // let data = unsafe {
-                // MmapOptions::new(file_len)
-                // .context("Could not initialize mmap")?
-                // .with_flags(MmapFlags::SEQUENTIAL)
-                // .with_file(&file, 0)
-                // .map()
-                // .with_context(|| format!("Could not mmap array file {}", path.display()))?
-                // };
-                let data = webgraph::utils::MmapHelper::mmap(path, MmapFlags::SEQUENTIAL)
-                    .with_context(|| format!("Could not mmap array file {}", path.display()))?;
-                read_sorted_array_file(BufBitReader::new(MemWordReader::<u64, _>::new(data)), 0)
-            })
+            .map(|path| SortedArraysFile::mmap(path)?.into_iter())
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .kmerge_by(|left, right| match (left, right) {
@@ -537,150 +501,80 @@ impl<const N: usize> ExternalArraySorter<N> {
     }
 }
 
-pub fn write_sorted_array_file<const N: usize>(
-    writer: &mut (impl BitWrite<LE> + GammaWrite<LE>),
-    items: impl Iterator<Item = Result<[usize; N]>>,
-    pl: &mut impl ProgressLog,
-) -> Result<usize> {
-    // TODO: configurable.
-    // lower frame size: inversely higher space usage
-    // higher frame size: linearly higher random access time
-    let min_frame_size = 100;
-    let max_frame_size = 10000;
-
-    let mut num_quads = 0;
-    let mut previous_item = [0; N];
-    let mut actual_previous_item = [0; N];
-    let mut current_frame_size = 0;
-    for item in items {
-        let item = item?;
-        assert!(
-            item >= previous_item,
-            "{item:?} after {previous_item:?} (actually: {actual_previous_item:?})"
-        );
-        assert!(
-            item >= actual_previous_item,
-            "{item:?} after {previous_item:?} (actually: {actual_previous_item:?})"
-        );
-
-        assert!(item != [0; N], "invalid quad: {item:?}");
-
-        if (current_frame_size > min_frame_size && item[0] != previous_item[0])
-            || current_frame_size >= max_frame_size
-        {
-            // new frame
-            previous_item = [0; N];
-            current_frame_size = 0;
-            writer
-                .write_bits(1, 1)
-                .context("Could not write frame bit")?;
-        } else {
-            writer
-                .write_bits(0, 1)
-                .context("Could not write non-frame bit")?;
-        }
-
-        // quads are sorted lexicographically, so the first term of a quad is guaranteed to be
-        // >= the first term of the previous quad
-        let mut must_zigzag = false;
-        for (&previous_cell, &cell) in previous_item.iter().zip(item.iter()) {
-            if must_zigzag {
-                let diff = i64::try_from(cell).context("value overflows i64")?
-                    - i64::try_from(previous_cell).context("value overflows i64")?;
-                let zigzag = diff.to_nat();
-                writer
-                    .write_gamma(zigzag)
-                    .context("Could not write gamma")?;
-            } else {
-                let diff = u64::try_from(cell)
-                    .context("value overflows u64")?
-                    .checked_sub(u64::try_from(previous_cell).context("value overflows u64")?)
-                    .context(
-                        "write_sorted_array_file got non-sorted quads after the initial check",
-                    )?;
-                writer.write_gamma(diff).context("Could not write gamma")?;
-
-                if cell > previous_cell {
-                    // this term is a strict increase, so terms after it in the quad are
-                    // not guaranteed to be >= the corresponding term in the previous quad,
-                    // so we must zigzag-encode them all for the rest of this term.
-                    must_zigzag = true;
-                }
-            }
-        }
-        previous_item = item;
-        actual_previous_item = item;
-
-        current_frame_size += 1;
-
-        pl.light_update();
-        num_quads += 1;
-    }
-
-    // mark end of file
-    writer
-        .write_bits(1, 1)
-        .context("Could not write last frame bit")?;
-    for _ in 0..N {
-        writer
-            .write_gamma(0)
-            .context("Could not write final gammas")?;
-    }
-
-    Ok(num_quads)
+pub struct SortedArraysFile<const N: usize> {
+    data: MmapHelper<u64>,
 }
 
-/// Same as [`read_sorted_array_file`] but instead of quads, yields:
-/// * `(Some(bit_position), quad)` on the first quad of a frame,
-/// * and `(None, quad)` on quads inside a frame
-pub fn read_sorted_array_file_internal<'a, const N: usize>(
-    mut reader: impl BitRead<LE> + BitSeek + GammaRead<LE> + 'a,
-    from_bit_position: usize,
-) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + 'a> {
-    let mut first_quad = true;
-    let mut actual_previous_item = [0usize; N];
-    let mut previous_item = [0usize; N];
+impl<const N: usize> SortedArraysFile<N> {
+    pub fn create(
+        path: impl AsRef<Path>,
+        items: impl Iterator<Item = Result<[usize; N]>>,
+        pl: &mut impl ProgressLog,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let file = File::create_new(path)
+            .with_context(|| format!("Could not create {}", path.display()))?;
 
-    reader
-        .set_bit_pos(u64::try_from(from_bit_position).context("bit position overflowed u64")?)
-        .with_context(|| format!("Could not seek to bit position {from_bit_position}"))?;
+        let mut writer =
+            BufBitWriter::<LE, _>::new(WordAdapter::<usize, _>::new(BufWriter::new(file)));
+        // TODO: configurable.
+        // lower frame size: inversely higher space usage
+        // higher frame size: linearly higher random access time
+        let min_frame_size = 100;
+        let max_frame_size = 10000;
 
-    Ok(std::iter::repeat(()).map_while(move |()| {
-        (|| {
-            let mut item = [0usize; N];
+        let mut previous_item = [0; N];
+        let mut actual_previous_item = [0; N];
+        let mut current_frame_size = 0;
+        for item in items {
+            let item = item?;
+            assert!(
+                item >= previous_item,
+                "{item:?} after {previous_item:?} (actually: {actual_previous_item:?})"
+            );
+            assert!(
+                item >= actual_previous_item,
+                "{item:?} after {previous_item:?} (actually: {actual_previous_item:?})"
+            );
 
-            let new_frame = reader.read_bits(1).context("Could not read frame bit")? == 1;
-            let bit_pos = if new_frame {
+            assert!(item != [0; N], "invalid quad: {item:?}");
+
+            if (current_frame_size > min_frame_size && item[0] != previous_item[0])
+                || current_frame_size >= max_frame_size
+            {
+                // new frame
                 previous_item = [0; N];
-                Some(reader.bit_pos().context("Could not get bit position")?)
+                current_frame_size = 0;
+                writer
+                    .write_bits(1, 1)
+                    .context("Could not write frame bit")?;
             } else {
-                None
-            };
+                writer
+                    .write_bits(0, 1)
+                    .context("Could not write non-frame bit")?;
+            }
 
             // quads are sorted lexicographically, so the first term of a quad is guaranteed to be
             // >= the first term of the previous quad
             let mut must_zigzag = false;
-            for (&previous_cell, cell) in previous_item.iter().zip(item.iter_mut()) {
+            for (&previous_cell, &cell) in previous_item.iter().zip(item.iter()) {
                 if must_zigzag {
-                    let zigzag = reader.read_gamma().context("Could not read gamma")?;
-                    let diff = zigzag.to_int();
-
-                    *cell = u64::try_from(previous_cell)
-                        .context("previous value overflows u64")?
-                        .checked_add_signed(diff)
-                        .context("value overflows u64")?
-                        .try_into()
-                        .context("value overflows usize")?;
+                    let diff = i64::try_from(cell).context("value overflows i64")?
+                        - i64::try_from(previous_cell).context("value overflows i64")?;
+                    let zigzag = diff.to_nat();
+                    writer
+                        .write_gamma(zigzag)
+                        .context("Could not write gamma")?;
                 } else {
-                    let diff = reader.read_gamma().context("Could not read gamma")?;
-                    *cell = u64::try_from(previous_cell)
-                        .context("previous value overflows u64")?
-                        .checked_add(diff)
+                    let diff = u64::try_from(cell)
                         .context("value overflows u64")?
-                        .try_into()
-                        .context("value overflows usize")?;
+                        .checked_sub(u64::try_from(previous_cell).context("value overflows u64")?)
+                        .context(
+                            "write_sorted_array_file got non-sorted quads after the initial check",
+                        )?;
+                    writer.write_gamma(diff).context("Could not write gamma")?;
 
-                    if diff > 0 {
+                    if cell > previous_cell {
                         // this term is a strict increase, so terms after it in the quad are
                         // not guaranteed to be >= the corresponding term in the previous quad,
                         // so we must zigzag-encode them all for the rest of this term.
@@ -688,59 +582,199 @@ pub fn read_sorted_array_file_internal<'a, const N: usize>(
                     }
                 }
             }
+            previous_item = item;
+            actual_previous_item = item;
 
-            if new_frame && item == [0; N] {
-                // zeroed item marks the end of the file
-                return Ok(None);
-            } else {
-                assert!(
-                    item >= previous_item,
-                    "{item:?} {actual_previous_item:?} {previous_item:?}"
-                );
-                assert!(
-                    item >= actual_previous_item,
-                    "{item:?} {actual_previous_item:?} {previous_item:?}"
-                );
-                previous_item = item;
-                actual_previous_item = item;
-            }
+            current_frame_size += 1;
 
-            if first_quad {
-                // the very first quad
-                first_quad = false;
-                Ok(Some((Some(0), item)))
-            } else {
-                Ok(Some((bit_pos, item)))
-            }
-        })()
-        .transpose()
-    }))
-}
+            pl.light_update();
+        }
 
-/// Returns every quad in the given file
-pub fn read_sorted_array_file<'a, const N: usize>(
-    reader: impl BitRead<LE> + BitSeek + GammaRead<LE> + 'a,
-    from_bit_position: usize,
-) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'a> {
-    Ok(
-        read_sorted_array_file_internal(reader, from_bit_position)?.map(|item| {
+        // mark end of file
+        writer
+            .write_bits(1, 1)
+            .context("Could not write last frame bit")?;
+        for _ in 0..N {
+            writer
+                .write_gamma(0)
+                .context("Could not write final gammas")?;
+        }
+
+        writer
+            .into_inner() // BufBitWriter -> WordAdapter
+            .with_context(|| format!("Could not flush {}", path.display()))?
+            .into_inner() // WordAdapter -> BufWriter
+            .into_inner() // BufWriter -> File
+            .with_context(|| format!("Could not flush {}", path.display()))?
+            .flush()
+            .with_context(|| format!("Could not flush {}", path.display()))?;
+
+        Self::mmap(path)
+    }
+
+    pub fn mmap(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let data = MmapHelper::mmap(path, MmapFlags::SEQUENTIAL)
+            .with_context(|| format!("Could not mmap array file {}", path.display()))?;
+
+        Ok(Self { data })
+    }
+
+    pub fn file_len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Same as [`Self::iter`] but instead of quads, yields:
+    /// * `(Some(bit_position), quad)` on the first quad of a frame,
+    /// * and `(None, quad)` on quads inside a frame
+    pub fn iter_with_positions(
+        &self,
+        from_bit_position: usize,
+    ) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + '_> {
+        Self::_iter_with_positions(&self.data, from_bit_position)
+    }
+
+    /// Same as [`Self::iter_with_positions`] but consumes self
+    pub fn into_iter_with_positions(
+        self,
+        from_bit_position: usize,
+    ) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + 'static> {
+        Self::_iter_with_positions(self.data, from_bit_position)
+    }
+
+    fn _iter_with_positions<'a>(
+        data: impl AsRef<[u64]> + 'a,
+        from_bit_position: usize,
+    ) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + 'a> {
+        let mut reader = BufBitReader::<LE, _>::new(MemWordReader::<u64, _>::new(data));
+
+        let mut first_quad = true;
+        let mut actual_previous_item = [0usize; N];
+        let mut previous_item = [0usize; N];
+
+        reader
+            .set_bit_pos(u64::try_from(from_bit_position).context("bit position overflowed u64")?)
+            .with_context(|| format!("Could not seek to bit position {from_bit_position}"))?;
+
+        Ok(std::iter::repeat(()).map_while(move |()| {
+            (|| {
+                let mut item = [0usize; N];
+
+                let new_frame = reader.read_bits(1).context("Could not read frame bit")? == 1;
+                let bit_pos = if new_frame {
+                    previous_item = [0; N];
+                    Some(reader.bit_pos().context("Could not get bit position")?)
+                } else {
+                    None
+                };
+
+                // quads are sorted lexicographically, so the first term of a quad is guaranteed to be
+                // >= the first term of the previous quad
+                let mut must_zigzag = false;
+                for (&previous_cell, cell) in previous_item.iter().zip(item.iter_mut()) {
+                    if must_zigzag {
+                        let zigzag = reader.read_gamma().context("Could not read gamma")?;
+                        let diff = zigzag.to_int();
+
+                        *cell = u64::try_from(previous_cell)
+                            .context("previous value overflows u64")?
+                            .checked_add_signed(diff)
+                            .context("value overflows u64")?
+                            .try_into()
+                            .context("value overflows usize")?;
+                    } else {
+                        let diff = reader.read_gamma().context("Could not read gamma")?;
+                        *cell = u64::try_from(previous_cell)
+                            .context("previous value overflows u64")?
+                            .checked_add(diff)
+                            .context("value overflows u64")?
+                            .try_into()
+                            .context("value overflows usize")?;
+
+                        if diff > 0 {
+                            // this term is a strict increase, so terms after it in the quad are
+                            // not guaranteed to be >= the corresponding term in the previous quad,
+                            // so we must zigzag-encode them all for the rest of this term.
+                            must_zigzag = true;
+                        }
+                    }
+                }
+
+                if new_frame && item == [0; N] {
+                    // zeroed item marks the end of the file
+                    return Ok(None);
+                } else {
+                    assert!(
+                        item >= previous_item,
+                        "{item:?} {actual_previous_item:?} {previous_item:?}"
+                    );
+                    assert!(
+                        item >= actual_previous_item,
+                        "{item:?} {actual_previous_item:?} {previous_item:?}"
+                    );
+                    previous_item = item;
+                    actual_previous_item = item;
+                }
+
+                if first_quad {
+                    // the very first quad
+                    first_quad = false;
+                    Ok(Some((Some(0), item)))
+                } else {
+                    Ok(Some((bit_pos, item)))
+                }
+            })()
+            .transpose()
+        }))
+    }
+
+    /// Same as [`Self::iter`] but starts from a specific frame
+    pub fn iter_from_position(
+        &self,
+        from_bit_position: usize,
+    ) -> Result<impl Iterator<Item = Result<[usize; N]>> + '_> {
+        Ok(self.iter_with_positions(from_bit_position)?.map(|item| {
             let (_bit_pos, quad) = item?;
             Ok(quad)
-        }),
-    )
+        }))
+    }
+
+    /// Same as [`Self::iter_with_positions`] but consumes self
+    pub fn into_iter_from_position(
+        self,
+        from_bit_position: usize,
+    ) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'static> {
+        Ok(self
+            .into_iter_with_positions(from_bit_position)?
+            .map(|item| {
+                let (_bit_pos, quad) = item?;
+                Ok(quad)
+            }))
+    }
+
+    /// Returns every quad in the given file
+    pub fn iter(&self) -> Result<impl Iterator<Item = Result<[usize; N]>> + '_> {
+        self.iter_from_position(0)
+    }
+
+    /// Same as [`Self::iter`] but consumes self
+    pub fn into_iter(self) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'static> {
+        self.into_iter_from_position(0)
+    }
 }
 
 #[test]
 fn test_read_write_sorted_array() -> Result<()> {
-    let mut buf = Vec::<u64>::new();
+    let tempdir = tempfile::tempdir().context("Could nto create temp dir")?;
     let quads: Vec<_> = vec![[1, 2, 2, 2], [1, 2, 3, 4]];
-    write_sorted_array_file(
-        &mut BufBitWriter::<LE, _>::new(MemWordWriterVec::new(&mut buf)),
+    let array_file = SortedArraysFile::create(
+        tempdir.path().join("test.bitstream"),
         quads.iter().copied().map(Ok),
         no_logging!(),
     )?;
     assert_eq!(
-        read_sorted_array_file(BufBitReader::<LE, _>::new(MemWordReader::new(&buf)), 0)?
+        array_file
+            .iter()?
             .map(Result::unwrap)
             .collect::<Vec<_>>(),
         quads

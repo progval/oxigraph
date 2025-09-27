@@ -1,21 +1,15 @@
-use super::sort::{
-    ExternalArraySorter, read_sorted_array_file, read_sorted_array_file_internal,
-    write_sorted_array_file,
-};
+use super::sort::{ExternalArraySorter, SortedArraysFile};
 use super::terms_mphf::{TermHasher, TermMphf};
 use crate::model::Quad;
 use anyhow::{Context, Result, anyhow, ensure};
-use dsi_bitstream::prelude::*;
 use dsi_progress_logger::{ProgressLog, concurrent_progress_logger};
 use epserde::deser::mem_case::{Flags, MemCase};
 use epserde::deser::{Deserialize as EpDeserialize, DeserializeInner as EpDeserializeInner};
 use epserde::ser::Serialize as EpSerialize;
 use lender::IteratorExt;
-use mmap_rs::MmapFlags;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use sux::bits::BitFieldVec;
@@ -23,7 +17,6 @@ use sux::dict::elias_fano::{EfSeq, EliasFanoBuilder};
 use sux::func::{VBuilder, VFunc};
 use sux::traits::IndexedSeq;
 use sux::traits::bit_field_slice::BitFieldSlice;
-use webgraph::utils::MmapHelper;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
 pub enum QuadOrder {
@@ -235,19 +228,8 @@ pub fn compress_quads(
         .enumerate()
         .try_for_each_with(pl.clone(), |pl, (partition_id, partition)| -> Result<_> {
             let path = dst_dir.join(format!("{partition_id}.quads.bitstream"));
-            let file = File::create(&path)
-                .with_context(|| format!("Could not create {}", path.display()))?;
-            let mut writer = BufBitWriter::new(WordAdapter::<usize, _>::new(BufWriter::new(file)));
-            write_sorted_array_file(&mut writer, partition.into_iter(), pl)
+            SortedArraysFile::create(&path, partition.into_iter(), pl)
                 .with_context(|| format!("Could not write quads to {}", path.display()))?;
-            writer
-                .into_inner() // BufBitWriter -> WordAdapter
-                .with_context(|| format!("Could not flush {}", path.display()))?
-                .into_inner() // WordAdapter -> BufWriter
-                .into_inner() // BufWriter -> File
-                .with_context(|| format!("Could not flush {}", path.display()))?
-                .flush()
-                .with_context(|| format!("Could not flush {}", path.display()))?;
             Ok(())
         })?;
     pl.done();
@@ -285,13 +267,11 @@ pub fn par_iter_quads(
         .into_par_iter()
         .map(|path| {
             let de_order_quad = order.mapper();
-            let data = MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
-                .with_context(|| format!("Could not mmap array file {}", path.display()))?;
-            Ok(
-                read_sorted_array_file(BufBitReader::new(MemWordReader::<u64, _>::new(data)), 0)
-                    .with_context(|| format!("Could not read array file {}", path.display()))?
-                    .map(move |quad| Ok(de_order_quad(quad?))),
-            )
+            Ok(SortedArraysFile::mmap(&path)
+                .with_context(|| format!("Could not mmap array file {}", path.display()))?
+                .into_iter()
+                .with_context(|| format!("Could not read array file {}", path.display()))?
+                .map(move |quad| Ok(de_order_quad(quad?))))
         })
         .collect::<Result<Vec<_>>>()?
         .into_par_iter()
@@ -311,65 +291,57 @@ pub fn index_frames(dir: &Path) -> Result<()> {
     partitions
         .into_par_iter()
         .try_for_each_with(pl.clone(), |pl, path| {
-            let data = MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
+            let arrays_file = SortedArraysFile::<4>::mmap(&path)
                 .with_context(|| format!("Could not mmap array file {}", path.display()))?;
 
-            let file_len = std::fs::metadata(&path)
-                .with_context(|| format!("Could not stat array file {}", path.display()))?
-                .len();
-
             let mut num_frames: usize = 0;
-            read_sorted_array_file_internal::<4>(
-                BufBitReader::new(MemWordReader::<u64, _>::new(&data)),
-                0,
-            )
-            .with_context(|| format!("Could not read array file {}", path.display()))?
-            .try_for_each(|item| -> Result<_> {
-                let (bit_pos, _quad) = item?;
-                pl.light_update();
+            arrays_file
+                .iter_with_positions(0)
+                .with_context(|| format!("Could not read array file {}", path.display()))?
+                .try_for_each(|item| -> Result<_> {
+                    let (bit_pos, _quad) = item?;
+                    pl.light_update();
 
-                if bit_pos.is_some() {
-                    num_frames = num_frames
-                        .checked_add(1)
-                        .context("number of frames overflowed usize")?;
-                }
-                Ok(())
-            })
-            .with_context(|| format!("Could not read frame offsets from {}", path.display()))?;
+                    if bit_pos.is_some() {
+                        num_frames = num_frames
+                            .checked_add(1)
+                            .context("number of frames overflowed usize")?;
+                    }
+                    Ok(())
+                })
+                .with_context(|| format!("Could not read frame offsets from {}", path.display()))?;
 
-            let file_len_bits = usize::try_from(file_len)
+            let file_len_bits = usize::try_from(arrays_file.file_len())
                 .with_context(|| format!("Size (in bytes) of {} overflows usize", path.display()))?
                 .checked_mul(8)
                 .with_context(|| format!("Size (in bits) of {} overflows usize", path.display()))?;
             let mut efb = EliasFanoBuilder::new(num_frames, file_len_bits);
 
-            read_sorted_array_file_internal::<4>(
-                BufBitReader::new(MemWordReader::<u64, _>::new(data)),
-                0,
-            )
-            .with_context(|| format!("Could not read array file {}", path.display()))?
-            .try_for_each(|item| -> Result<_> {
-                let (bit_pos, _quad) = item?;
-                pl.light_update();
+            arrays_file
+                .iter_with_positions(0)
+                .with_context(|| format!("Could not read array file {}", path.display()))?
+                .try_for_each(|item| -> Result<_> {
+                    let (bit_pos, _quad) = item?;
+                    pl.light_update();
 
-                let Some(bit_pos) = bit_pos else {
-                    // not a new frame
-                    return Ok(());
-                };
+                    let Some(bit_pos) = bit_pos else {
+                        // not a new frame
+                        return Ok(());
+                    };
 
-                // Shouldn't fail, we checked the file size before
-                let bit_pos = usize::try_from(bit_pos).context("bit pos overflowed usize")?;
+                    // Shouldn't fail, we checked the file size before
+                    let bit_pos = usize::try_from(bit_pos).context("bit pos overflowed usize")?;
 
-                ensure!(
-                    bit_pos < file_len_bits,
-                    "bit_pos={bit_pos} is past the end of {} ({file_len_bits})",
-                    path.display()
-                );
-                efb.push(bit_pos);
+                    ensure!(
+                        bit_pos < file_len_bits,
+                        "bit_pos={bit_pos} is past the end of {} ({file_len_bits})",
+                        path.display()
+                    );
+                    efb.push(bit_pos);
 
-                Ok(())
-            })
-            .with_context(|| format!("Could not read frame offsets from {}", path.display()))?;
+                    Ok(())
+                })
+                .with_context(|| format!("Could not read frame offsets from {}", path.display()))?;
             let ef = efb.build_with_seq();
 
             let index_file_path = path.with_extension("frames.ef");
@@ -401,8 +373,6 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
         .into_par_iter()
         .enumerate()
         .try_for_each_with(pl.clone(), |pl, (partition_id, path)| {
-            let data = MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
-                .with_context(|| format!("Could not mmap array file {}", path.display()))?;
             let num_terms_in_partition = if partition_id == config.num_partitions - 1 {
                 // saturating_sub is needed when there are fewer terms than partitions
                 // (ie. in tiny databases)
@@ -425,9 +395,10 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
                 num_terms_in_partition,
                 file_len_bits,
             );
-            read_sorted_array_file_internal::<4>(BufBitReader::new(MemWordReader::<u64, _>::new(
-                data,
-            )), 0)
+
+            SortedArraysFile::<4>::mmap(&path)
+            .with_context(|| format!("Could not mmap array file {}", path.display()))?
+            .iter_with_positions(0)
             .with_context(|| format!("Could not read array file {}", path.display()))?
             .try_for_each(|item| -> Result<_> {
                 let (bit_pos, quad) = item?;
@@ -503,16 +474,12 @@ pub fn index_quads_by_first_two_terms(dir: &Path) -> Result<()> {
     partitions
         .into_par_iter()
         .try_for_each_with(pl.clone(), |pl, path| {
-            let data = MmapHelper::mmap(&path, MmapFlags::SEQUENTIAL)
+            let array_file = SortedArraysFile::mmap(&path)
                 .with_context(|| format!("Could not mmap array file {}", path.display()))?;
 
-            let data = &data;
             let get_iter = || {
-                read_sorted_array_file_internal::<4>(BufBitReader::new(
-                    MemWordReader::<u64, _>::new(data),
-                ), 0)
-                .with_context(|| format!("Could not read array file {}", path.display()),
-                )
+                array_file.iter_with_positions(0)
+                .with_context(|| format!("Could not read array file {}", path.display()))
             };
 
             let keys = sux::utils::lenders::FromResultLenderFactory::new(|| -> Result<_, _> {
@@ -673,7 +640,7 @@ impl QuadStore {
 struct QuadPartition {
     _path: PathBuf,
     first_first_term: usize,
-    quads: MmapHelper<u64>,
+    quads: SortedArraysFile<4>,
     /// frame_id -> bit_position
     frame_index: MemCase<<EfSeq as EpDeserializeInner>::DeserType<'static>>,
     /// term -> bit_position
@@ -686,7 +653,7 @@ struct QuadPartition {
 
 impl QuadPartition {
     pub fn mmap(first_first_term: usize, path: PathBuf) -> Result<Self> {
-        let quads = MmapHelper::mmap(&path, MmapFlags::RANDOM_ACCESS)
+        let quads = SortedArraysFile::mmap(&path)
             .with_context(|| format!("Could not mmap array file {}", path.display()))?;
 
         let frame_index_path = path.with_extension("frames.ef");
@@ -728,10 +695,6 @@ impl QuadPartition {
         })
     }
 
-    fn get_quads_reader(&self) -> impl BitRead<LE> + BitSeek + GammaRead<LE> + '_ {
-        BufBitReader::new(MemWordReader::<u64, _>::new(&self.quads))
-    }
-
     pub fn iter_quads_by_first_term(
         &self,
         term: usize,
@@ -743,7 +706,8 @@ impl QuadPartition {
 
         let mut took_error = false;
         Ok(Some(
-            read_sorted_array_file::<4>(self.get_quads_reader(), from_bit_position)?
+            self.quads
+                .iter_from_position(from_bit_position)?
                 .skip_while(move |quad| {
                     if let Ok(quad) = quad {
                         // skip quads until we find one that matches
@@ -817,13 +781,14 @@ impl QuadPartition {
             // maybe_first_frame_id is not the id of the first frame.
             // Let's get the first quad of the previous frame
             let previous_frame_bit_position = self.frame_index.get(maybe_first_frame_id - 1);
-            let first_quad_in_previous_frame =
-                read_sorted_array_file::<4>(self.get_quads_reader(), previous_frame_bit_position)?
-                    .next()
-                    .with_context(|| {
-                        format!("Got no quad when reading from frame {maybe_first_frame_id}-1")
-                    })?
-                    .with_context(|| format!("Could not peek frame {maybe_first_frame_id}-1"))?;
+            let first_quad_in_previous_frame = self
+                .quads
+                .iter_from_position(previous_frame_bit_position)?
+                .next()
+                .with_context(|| {
+                    format!("Got no quad when reading from frame {maybe_first_frame_id}-1")
+                })?
+                .with_context(|| format!("Could not peek frame {maybe_first_frame_id}-1"))?;
             if (
                 first_quad_in_previous_frame[0],
                 first_quad_in_previous_frame[1],
@@ -842,13 +807,14 @@ impl QuadPartition {
             // maybe_first_frame_id is not the id of the last frame.
             // Let's get the first quad of the next frame
             let next_frame_bit_position = self.frame_index.get(maybe_first_frame_id + 1);
-            let first_quad_in_next_frame =
-                read_sorted_array_file::<4>(self.get_quads_reader(), next_frame_bit_position)?
-                    .next()
-                    .with_context(|| {
-                        format!("Got no quad when reading from frame {maybe_first_frame_id}+1")
-                    })?
-                    .with_context(|| format!("Could not peek frame {maybe_first_frame_id}+1"))?;
+            let first_quad_in_next_frame = self
+                .quads
+                .iter_from_position(next_frame_bit_position)?
+                .next()
+                .with_context(|| {
+                    format!("Got no quad when reading from frame {maybe_first_frame_id}+1")
+                })?
+                .with_context(|| format!("Could not peek frame {maybe_first_frame_id}+1"))?;
             if (first_quad_in_next_frame[0], first_quad_in_next_frame[1]) < (term1, term2) {
                 // maybe_first_frame_id was allegedly the id of the first frame
                 // containing (term1, term2, _, _).
@@ -866,7 +832,8 @@ impl QuadPartition {
 
         let mut took_error = false;
         Ok(Some(
-            read_sorted_array_file::<4>(self.get_quads_reader(), maybe_from_bit_position)?
+            self.quads
+                .iter_from_position(maybe_from_bit_position)?
                 .skip_while(move |quad| {
                     if let Ok(quad) = quad {
                         // skip quads until we find one that matches
