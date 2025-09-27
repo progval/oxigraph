@@ -1,5 +1,6 @@
 #![allow(clippy::panic)]
 
+use oxigraph::updatable_dataset::BulkLoader;
 use bzip2::read::MultiBzDecoder;
 use codspeed_criterion_compat::{Criterion, Throughput, criterion_group, criterion_main};
 use oxhttp::model::{Request, Uri};

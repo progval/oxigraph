@@ -8,11 +8,11 @@ use crate::sparql::dataset::DatasetView;
 use crate::sparql::error::UpdateEvaluationError;
 #[cfg(feature = "http-client")]
 use crate::sparql::http::Client;
-use crate::storage::updatable_dataset::{
-    ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction,
-};
 use crate::storage::{Storage, StorageError, StorageReadableTransaction, StorageTransaction};
 use crate::store::{Store, Transaction};
+use crate::updatable_dataset::{
+    ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction,
+};
 use oxiri::Iri;
 #[cfg(feature = "http-client")]
 use oxrdfio::LoadedDocument;

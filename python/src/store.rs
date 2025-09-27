@@ -8,6 +8,7 @@ use oxigraph::io::{RdfParser, RdfSerializer};
 use oxigraph::model::GraphNameRef;
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::{self, LoaderError, SerializerError, StorageError, Store};
+use oxigraph::updatable_dataset::BulkLoader as _;
 use pyo3::exceptions::{PyRuntimeError, PySyntaxError, PyValueError};
 use pyo3::prelude::*;
 use std::collections::{BTreeMap, HashMap};

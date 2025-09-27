@@ -4,8 +4,8 @@ use crate::storage::numeric_encoder::EncodedTriple;
 use crate::storage::numeric_encoder::{
     Decoder, EncodedTerm, StrHash, StrHashHasher, StrLookup, insert_term,
 };
-use crate::storage::updatable_dataset::Reader;
 use crate::storage::{CorruptionError, StorageError, StorageReader};
+use crate::updatable_dataset::Reader;
 use oxrdf::Term;
 use oxsdatatypes::Boolean;
 #[cfg(feature = "rdf-12")]

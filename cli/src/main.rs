@@ -19,6 +19,7 @@ use oxigraph::model::{
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
 use oxigraph::sparql::{CancellationToken, QueryResults, SparqlEvaluator};
 use oxigraph::store::{BulkLoader, LoaderError, Store};
+use oxigraph::updatable_dataset::BulkLoader as _;
 use oxiri::Iri;
 use rand::random;
 use rayon_core::ThreadPoolBuilder;

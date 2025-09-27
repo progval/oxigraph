@@ -1,6 +1,7 @@
 #![cfg(test)]
 #![allow(clippy::panic_in_result_fn)]
 
+use oxigraph::updatable_dataset::BulkLoader;
 use oxigraph::io::RdfFormat;
 use oxigraph::model::vocab::{rdf, xsd};
 use oxigraph::model::*;

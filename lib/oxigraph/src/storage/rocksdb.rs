@@ -1,6 +1,3 @@
-use super::updatable_dataset::{
-    BulkLoader, ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction,
-};
 #[cfg(feature = "rdf-12")]
 use crate::model::vocab::rdf;
 #[cfg(feature = "rdf-12")]
@@ -21,6 +18,9 @@ use crate::storage::rocksdb_wrapper::{
     Transaction,
 };
 use crate::storage::{DEFAULT_BULK_LOAD_BATCH_SIZE, map_thread_result};
+use crate::updatable_dataset::{
+    BulkLoader, ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction,
+};
 use rustc_hash::{FxBuildHasher, FxHashSet};
 #[cfg(feature = "rdf-12")]
 use siphasher::sip128::{Hasher128, SipHasher24};

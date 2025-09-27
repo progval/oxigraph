@@ -11,13 +11,13 @@ use crate::storage::rocksdb::{
     RocksDbStorageBulkLoader, RocksDbStorageReadableTransaction, RocksDbStorageReader,
     RocksDbStorageTransaction,
 };
+use crate::updatable_dataset::{
+    BulkLoader, ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction,
+};
 use oxrdf::Quad;
 use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
 use std::{io, thread};
-use updatable_dataset::{
-    BulkLoader, ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction,
-};
 
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 mod binary_encoder;
@@ -29,7 +29,6 @@ mod rocksdb;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 mod rocksdb_wrapper;
 pub mod small_string;
-pub(crate) mod updatable_dataset;
 
 pub const DEFAULT_BULK_LOAD_BATCH_SIZE: usize = 1_000_000;
 

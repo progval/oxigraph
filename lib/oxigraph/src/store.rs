@@ -39,13 +39,14 @@ use crate::sparql::{
 #[cfg(not(target_family = "wasm"))]
 use crate::storage::map_thread_result;
 use crate::storage::numeric_encoder::{Decoder, EncodedQuad, EncodedTerm};
-use crate::storage::updatable_dataset::{
-    BulkLoader as _, ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction,
-};
 pub use crate::storage::{CorruptionError, LoaderError, SerializerError, StorageError};
 use crate::storage::{
     DEFAULT_BULK_LOAD_BATCH_SIZE, DecodingGraphIterator, DecodingQuadIterator, Storage,
     StorageBulkLoader, StorageReadableTransaction, StorageReader,
+};
+use crate::updatable_dataset::{
+    BulkLoader as BulkLoaderTrait, ReadWriteTransaction, Reader, UpdatableDataset,
+    WriteOnlyTransaction,
 };
 #[cfg(not(target_family = "wasm"))]
 use std::cmp::max;
@@ -1713,20 +1714,6 @@ impl BulkLoader<'_> {
         }
     }
 
-    /// Allow the bulk loader to save also data to the database during the bulk loading instead of only when [`commit`](Self::commit) is called.
-    ///
-    /// When used with the RocksDB storage, it allows the storage to compact the data while the loading continues.
-    pub fn without_atomicity(mut self) -> Self {
-        self.storage = self.storage.without_atomicity();
-        self
-    }
-
-    /// Adds a `callback` evaluated from time to time with the number of loaded triples.
-    pub fn on_progress(mut self, callback: impl Fn(u64) + Send + Sync + 'static) -> Self {
-        self.storage = self.storage.on_progress(callback);
-        self
-    }
-
     /// Adds a `callback` catching all parse errors and choosing if the parsing should continue
     /// by returning `Ok` or fail by returning `Err`.
     ///
@@ -2102,16 +2089,6 @@ impl BulkLoader<'_> {
         })
     }
 
-    /// Adds a set of quads using the bulk loader.
-    ///
-    /// See [the struct](Self) documentation for more details.
-    pub fn load_quads(
-        &mut self,
-        quads: impl IntoIterator<Item = impl Into<Quad>>,
-    ) -> Result<(), StorageError> {
-        self.load_ok_quads(quads.into_iter().map(Ok::<_, StorageError>))
-    }
-
     /// Adds a set of quads using the bulk loader while breaking in the middle of the process in case of error.
     ///
     /// See [the struct](Self) documentation for more details.
@@ -2127,7 +2104,7 @@ impl BulkLoader<'_> {
             if batch.len() >= target_batch_size {
                 let mut batch_to_save = Vec::with_capacity(target_batch_size);
                 swap(&mut batch, &mut batch_to_save);
-                self.storage.load_batch(batch_to_save, target_num_threads)?;
+                self.load_batch(batch_to_save, target_num_threads)?;
             }
         }
         if !batch.is_empty() {
@@ -2136,8 +2113,36 @@ impl BulkLoader<'_> {
         Ok(())
     }
 
+    /// Adds a set of quads using the bulk loader.
+    ///
+    /// See [the struct](Self) documentation for more details.
+    pub fn load_quads(
+        &mut self,
+        quads: impl IntoIterator<Item = impl Into<Quad>>,
+    ) -> Result<(), StorageError> {
+        self.load_ok_quads(quads.into_iter().map(Ok::<_, StorageError>))
+    }
+}
+
+impl BulkLoaderTrait<'_> for BulkLoader<'_> {
+    type Error = StorageError;
+
+    fn without_atomicity(mut self) -> Self {
+        self.storage = self.storage.without_atomicity();
+        self
+    }
+
+    fn on_progress(mut self, callback: impl Fn(u64) + Send + Sync + 'static) -> Self {
+        self.storage = self.storage.on_progress(callback);
+        self
+    }
+
+    fn load_batch(&mut self, quads: Vec<Quad>, max_num_threads: usize) -> Result<(), StorageError> {
+        self.storage.load_batch(quads, max_num_threads)
+    }
+
     /// Saves all the quads loaded using the bulk loader into the store.
-    pub fn commit(self) -> Result<(), StorageError> {
+    fn commit(self) -> Result<(), StorageError> {
         self.storage.commit()
     }
 }

@@ -96,8 +96,19 @@ pub trait ReadWriteTransaction<'a>: WriteOnlyTransaction<'a> {
 pub trait BulkLoader<'a> {
     type Error: Error;
 
+    /// Adds a `callback` evaluated from time to time with the number of loaded triples.
     fn on_progress(self, callback: impl Fn(u64) + Send + Sync + 'static) -> Self;
+
+    /// Allow the bulk loader to save also data to the database during the bulk loading instead of only when [`commit`](Self::commit) is called.
+    ///
+    /// When used with the RocksDB storage, it allows the storage to compact the data while the loading continues.
     fn without_atomicity(self) -> Self;
+
+    /// Adds a set of quads using the bulk loader.
+    ///
+    /// See [the struct](Self) documentation for more details.
     fn load_batch(&mut self, quads: Vec<Quad>, max_num_threads: usize) -> Result<(), Self::Error>;
+
+    /// Saves all the quads loaded using the bulk loader into the dataset.
     fn commit(self) -> Result<(), Self::Error>;
 }
