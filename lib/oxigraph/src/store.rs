@@ -7,6 +7,7 @@
 //! use oxigraph::model::*;
 //! use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 //! use oxigraph::store::Store;
+//! use oxigraph::updatable_dataset::*;
 //!
 //! let store = Store::new()?;
 //!
@@ -39,14 +40,14 @@ use crate::sparql::{
 #[cfg(not(target_family = "wasm"))]
 use crate::storage::map_thread_result;
 use crate::storage::numeric_encoder::{Decoder, EncodedQuad, EncodedTerm};
-use crate::updatable_dataset::{
-    BulkLoader as BulkLoaderTrait, ReadWriteTransaction, Reader, UpdatableDataset,
-    WriteOnlyTransaction,
-};
 pub use crate::storage::{CorruptionError, LoaderError, SerializerError, StorageError};
 use crate::storage::{
     DEFAULT_BULK_LOAD_BATCH_SIZE, DecodingGraphIterator, DecodingQuadIterator, Storage,
     StorageBulkLoader, StorageReadableTransaction, StorageReader,
+};
+use crate::updatable_dataset::{
+    BulkLoader as BulkLoaderTrait, ReadWriteTransaction, Reader, UpdatableDataset,
+    WriteOnlyTransaction,
 };
 #[cfg(not(target_family = "wasm"))]
 use std::cmp::max;
@@ -80,6 +81,7 @@ use std::thread::available_parallelism;
 /// use oxigraph::model::*;
 /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 /// use oxigraph::store::Store;
+/// use oxigraph::updatable_dataset::*;
 ///
 /// let store = Store::new()?;
 ///
@@ -144,6 +146,7 @@ impl Store {
     /// use oxigraph::model::*;
     /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -180,6 +183,7 @@ impl Store {
     /// use oxigraph::model::*;
     /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// if let QueryResults::Solutions(mut solutions) = SparqlEvaluator::new()
     ///     .with_custom_function(
@@ -216,6 +220,7 @@ impl Store {
     /// use oxigraph::model::{Literal, Variable};
     /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// if let QueryResults::Solutions(mut solutions) = SparqlEvaluator::new()
     ///     .parse_query("SELECT ?v WHERE {}")?
@@ -254,6 +259,7 @@ impl Store {
     /// ```
     /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// if let (Ok(QueryResults::Solutions(solutions)), explanation) = SparqlEvaluator::new()
     ///     .parse_query("SELECT ?s WHERE { VALUES ?s { 1 2 3 } }")?
@@ -301,6 +307,7 @@ impl Store {
     /// use oxigraph::model::{Literal, Variable};
     /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// if let (Ok(QueryResults::Solutions(solutions)), explanation) = SparqlEvaluator::new()
     ///     .parse_query("SELECT ?s WHERE {}")?
@@ -349,6 +356,7 @@ impl Store {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -377,7 +385,7 @@ impl Store {
                 subject.map(EncodedTerm::from).as_ref(),
                 predicate.map(EncodedTerm::from).as_ref(),
                 object.map(EncodedTerm::from).as_ref(),
-                graph_name.map(EncodedTerm::from).as_ref(),
+                graph_name.map(EncodedTerm::from).as_ref().map(Some)
             ),
             reader,
         }
@@ -389,6 +397,7 @@ impl Store {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -412,6 +421,7 @@ impl Store {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new("http://example.com")?;
     /// let quad = QuadRef::new(ex, ex, ex, ex);
@@ -436,6 +446,7 @@ impl Store {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new("http://example.com")?;
     /// let store = Store::new()?;
@@ -454,6 +465,7 @@ impl Store {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     /// assert!(store.is_empty()?);
@@ -482,6 +494,7 @@ impl Store {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     /// let a = NamedNodeRef::new("http://example.com/a")?;
@@ -516,6 +529,7 @@ impl Store {
     /// use oxigraph::model::*;
     /// use oxigraph::sparql::SparqlEvaluator;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -543,9 +557,10 @@ impl Store {
     /// Executes a [SPARQL 1.1 update](https://www.w3.org/TR/sparql11-update/) with some options.
     ///
     /// ```
-    /// use oxigraph::store::Store;
     /// use oxigraph::model::*;
     /// use oxigraph::sparql::QueryOptions;
+    /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     /// store.update_opt(
@@ -575,9 +590,10 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::store::Store;
     /// use oxigraph::io::{RdfFormat, RdfParser};
     /// use oxigraph::model::*;
+    /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -620,9 +636,10 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::store::Store;
     /// use oxigraph::io::{RdfParser, RdfFormat};
     /// use oxigraph::model::*;
+    /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -667,6 +684,7 @@ impl Store {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new("http://example.com")?;
     /// let quad = QuadRef::new(ex, ex, ex, GraphNameRef::DefaultGraph);
@@ -709,6 +727,7 @@ impl Store {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new("http://example.com")?;
     /// let quad = QuadRef::new(ex, ex, ex, GraphNameRef::DefaultGraph);
@@ -732,6 +751,7 @@ impl Store {
     /// ```
     /// use oxigraph::io::RdfFormat;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let file =
     ///     "<http://example.com> <http://example.com> <http://example.com> <http://example.com> .\n";
@@ -766,6 +786,7 @@ impl Store {
     /// use oxigraph::io::RdfFormat;
     /// use oxigraph::model::GraphNameRef;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let file = "<http://example.com> <http://example.com> <http://example.com> .\n";
     ///
@@ -796,6 +817,7 @@ impl Store {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNode::new("http://example.com")?;
     /// let store = Store::new()?;
@@ -821,6 +843,7 @@ impl Store {
     /// ```
     /// use oxigraph::model::{NamedNode, QuadRef};
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNode::new("http://example.com")?;
     /// let store = Store::new()?;
@@ -844,6 +867,7 @@ impl Store {
     /// ```
     /// use oxigraph::model::NamedNodeRef;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new("http://example.com")?;
     /// let store = Store::new()?;
@@ -871,6 +895,7 @@ impl Store {
     /// ```
     /// use oxigraph::model::{NamedNodeRef, QuadRef};
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new("http://example.com")?;
     /// let quad = QuadRef::new(ex, ex, ex, ex);
@@ -907,6 +932,7 @@ impl Store {
     /// ```
     /// use oxigraph::model::{NamedNodeRef, QuadRef};
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new("http://example.com")?;
     /// let quad = QuadRef::new(ex, ex, ex, ex);
@@ -935,6 +961,7 @@ impl Store {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new("http://example.com")?;
     /// let store = Store::new()?;
@@ -1000,6 +1027,7 @@ impl Store {
     /// use oxigraph::io::RdfFormat;
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -1070,6 +1098,7 @@ impl<'a> Transaction<'a> {
     /// use oxigraph::model::*;
     /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     /// let mut transaction = store.start_transaction()?;
@@ -1112,6 +1141,7 @@ impl<'a> Transaction<'a> {
     /// use oxigraph::model::*;
     /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     /// let mut transaction = store.start_transaction()?;
@@ -1158,75 +1188,82 @@ impl<'a> Transaction<'a> {
             .execute()
     }
 
-    /// Retrieves quads with a filter on each quad component.
-    ///
-    /// Usage example:
-    /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
-    ///
-    /// let store = Store::new()?;
-    /// let a = NamedNodeRef::new("http://example.com/a")?;
-    /// let b = NamedNodeRef::new("http://example.com/b")?;
-    ///
-    /// // Copy all triples about ex:a to triples about ex:b
-    /// let mut transaction = store.start_transaction()?;
-    /// let triples = transaction
-    ///     .quads_for_pattern(Some(a.into()), None, None, None)
-    ///     .collect::<Result<Vec<_>, _>>()?;
-    /// for triple in triples {
-    ///     transaction.insert(QuadRef::new(
-    ///         b,
-    ///         &triple.predicate,
-    ///         &triple.object,
-    ///         &triple.graph_name,
-    ///     ));
-    /// }
-    /// transaction.commit()?;
-    /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
-    /// ```
-    pub fn quads_for_pattern(
+    /// Returns all the quads contained in the store.
+    fn iter(&self) -> QuadIter<'_> {
+        self.quads_for_pattern(None, None, None, None)
+    }
+}
+
+impl<'a> Reader<'a> for Transaction<'a> {
+    type Error = StorageError;
+    type InternalTerm = Term;
+    type InternalQuad = Quad;
+    type TermIterator<'iter>
+        = GraphNameIter<'iter>
+    where
+        Self: 'iter;
+    type QuadIterator<'iter>
+        = QuadIter<'iter>
+    where
+        Self: 'iter;
+
+    fn quads_for_pattern<'b>(
         &self,
-        subject: Option<NamedOrBlankNodeRef<'_>>,
-        predicate: Option<NamedNodeRef<'_>>,
-        object: Option<TermRef<'_>>,
-        graph_name: Option<GraphNameRef<'_>>,
-    ) -> QuadIter<'_> {
-        let reader = self.inner.reader();
+        subject: Option<&'b Self::InternalTerm>,
+        predicate: Option<&'b Self::InternalTerm>,
+        object: Option<&'b Self::InternalTerm>,
+        graph_name: Option<Option<&'b Self::InternalTerm>>,
+    ) -> QuadIter<'a> {
+        let reader: StorageReader<'a> = self.inner.reader();
+        let graph_name: Option<Option<EncodedTerm>> = graph_name.map(|g| g.map(EncodedTerm::from));
         QuadIter {
             iter: reader.quads_for_pattern(
                 subject.map(EncodedTerm::from).as_ref(),
                 predicate.map(EncodedTerm::from).as_ref(),
                 object.map(EncodedTerm::from).as_ref(),
-                graph_name.map(EncodedTerm::from).as_ref(),
+                graph_name.as_ref().map(|g| g.as_ref()),
             ),
             reader,
         }
     }
 
-    /// Returns all the quads contained in the store.
-    pub fn iter(&self) -> QuadIter<'_> {
-        self.quads_for_pattern(None, None, None, None)
-    }
-
-    /// Checks if this store contains a given quad.
-    pub fn contains<'b>(&self, quad: impl Into<QuadRef<'b>>) -> Result<bool, StorageError> {
-        let quad = EncodedQuad::from(quad.into());
+    fn contains(&self, quad: &Quad) -> Result<bool, StorageError> {
+        let quad = EncodedQuad::from(quad.as_ref());
         self.inner.reader().contains(&quad)
     }
 
-    /// Returns the number of quads in the store.
-    ///
-    /// <div class="warning">this function executes a full scan.</div>
-    pub fn len(&self) -> Result<usize, StorageError> {
+    fn len(&self) -> Result<usize, StorageError> {
         self.inner.reader().len()
     }
 
-    /// Returns if the store is empty.
-    pub fn is_empty(&self) -> Result<bool, StorageError> {
+    fn is_empty(&self) -> Result<bool, StorageError> {
         self.inner.reader().is_empty()
     }
 
+    /// Returns all the named graphs in the store.
+    fn named_graphs(&self) -> GraphNameIter<'a> {
+        let reader = self.inner.reader();
+        GraphNameIter {
+            iter: reader.named_graphs(),
+            reader,
+        }
+    }
+
+    /// Checks if the store contains a given graph.
+    fn contains_named_graph(&self, graph_name: &Term) -> Result<bool, StorageError> {
+        self.inner
+            .reader()
+            .contains_named_graph(&EncodedTerm::from(graph_name))
+    }
+
+    /// Validate that all the store invariants held in the data
+    #[doc(hidden)]
+    fn validate(&self) -> Result<(), StorageError> {
+        self.inner.reader().validate()
+    }
+}
+
+impl<'a> Transaction<'a> {
     /// Executes a [SPARQL 1.1 update](https://www.w3.org/TR/sparql11-update/).
     ///
     /// Usage example:
@@ -1234,6 +1271,7 @@ impl<'a> Transaction<'a> {
     /// use oxigraph::model::*;
     /// use oxigraph::sparql::SparqlEvaluator;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     /// let mut transaction = store.start_transaction()?;
@@ -1279,9 +1317,10 @@ impl<'a> Transaction<'a> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::store::Store;
     /// use oxigraph::io::{RdfParser, RdfFormat};
     /// use oxigraph::model::*;
+    /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -1327,9 +1366,10 @@ impl<'a> Transaction<'a> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::store::Store;
     /// use oxigraph::io::{RdfParser, RdfFormat};
     /// use oxigraph::model::*;
+    /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -1375,6 +1415,7 @@ impl<'a> Transaction<'a> {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new_unchecked("http://example.com");
     /// let quad = QuadRef::new(ex, ex, ex, GraphNameRef::DefaultGraph);
@@ -1392,25 +1433,6 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    /// Returns all the named graphs in the store.
-    pub fn named_graphs(&self) -> GraphNameIter<'_> {
-        let reader = self.inner.reader();
-        GraphNameIter {
-            iter: reader.named_graphs(),
-            reader,
-        }
-    }
-
-    /// Checks if the store contains a given graph.
-    pub fn contains_named_graph<'b>(
-        &self,
-        graph_name: impl Into<NamedOrBlankNodeRef<'b>>,
-    ) -> Result<bool, StorageError> {
-        self.inner
-            .reader()
-            .contains_named_graph(&EncodedTerm::from(graph_name.into()))
-    }
-
     /// Removes a graph from this store.
     ///
     /// Returns `true` if the graph was in the store and has been removed.
@@ -1419,6 +1441,7 @@ impl<'a> Transaction<'a> {
     /// ```
     /// use oxigraph::model::{NamedNodeRef, QuadRef};
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new_unchecked("http://example.com");
     /// let quad = QuadRef::new(ex, ex, ex, ex);
@@ -1431,6 +1454,12 @@ impl<'a> Transaction<'a> {
     /// assert_eq!(0, store.named_graphs().count());
     /// # Result::<_,oxigraph::store::StorageError>::Ok(())
     /// ```
+    pub fn remove_named_graph<'b>(
+        &mut self,
+        graph_name: impl Into<NamedOrBlankNodeRef<'b>>,
+    ) -> Result<(), StorageError> {
+        self.inner.remove_named_graph(graph_name.into())
+    }
 
     pub(super) fn inner(&self) -> &StorageReadableTransaction<'a> {
         &self.inner
@@ -1438,13 +1467,6 @@ impl<'a> Transaction<'a> {
 
     pub(super) fn inner_mut(&mut self) -> &mut StorageReadableTransaction<'a> {
         &mut self.inner
-    }
-
-    pub fn remove_named_graph<'b>(
-        &mut self,
-        graph_name: impl Into<NamedOrBlankNodeRef<'b>>,
-    ) -> Result<(), StorageError> {
-        self.inner.remove_named_graph(graph_name.into())
     }
 }
 
@@ -1524,13 +1546,14 @@ pub struct GraphNameIter<'a> {
 }
 
 impl Iterator for GraphNameIter<'_> {
-    type Item = Result<NamedOrBlankNode, StorageError>;
+    type Item = Result<Term, StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         Some(
             self.iter
                 .next()?
-                .and_then(|graph_name| self.reader.decode_named_or_blank_node(&graph_name)),
+                .and_then(|graph_name| self.reader.decode_named_or_blank_node(&graph_name))
+                .map(Into::into),
         )
     }
 
@@ -1552,6 +1575,7 @@ impl Iterator for GraphNameIter<'_> {
 /// use oxigraph::io::RdfFormat;
 /// use oxigraph::model::*;
 /// use oxigraph::store::Store;
+/// use oxigraph::updatable_dataset::*;
 ///
 /// let store = Store::new()?;
 ///
@@ -1643,9 +1667,10 @@ impl BulkLoader<'_> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::store::Store;
     /// use oxigraph::io::{RdfParser, RdfFormat};
     /// use oxigraph::model::*;
+    /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -1714,9 +1739,10 @@ impl BulkLoader<'_> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::store::Store;
     /// use oxigraph::io::{RdfParser, RdfFormat};
     /// use oxigraph::model::*;
+    /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -1787,9 +1813,10 @@ impl BulkLoader<'_> {
     ///
     /// Usage example:
     /// ```no_run
-    /// use oxigraph::store::Store;
     /// use oxigraph::io::{RdfParser, RdfFormat};
     /// use oxigraph::model::*;
+    /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -1898,9 +1925,10 @@ impl BulkLoader<'_> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::store::Store;
     /// use oxigraph::io::{RdfParser, RdfFormat};
     /// use oxigraph::model::*;
+    /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let store = Store::new()?;
     ///

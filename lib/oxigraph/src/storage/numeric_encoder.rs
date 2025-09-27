@@ -146,6 +146,12 @@ pub enum EncodedTerm {
     Triple(Arc<EncodedTriple>),
 }
 
+impl AsRef<EncodedTerm> for EncodedTerm {
+    fn as_ref(&self) -> &Self {
+        self
+    }
+}
+
 impl PartialEq for EncodedTerm {
     fn eq(&self, other: &Self) -> bool {
         discriminant(self) == discriminant(other)
@@ -639,6 +645,13 @@ impl From<NamedOrBlankNodeRef<'_>> for EncodedTerm {
         }
     }
 }
+
+impl From<&Term> for EncodedTerm {
+    fn from(term: &Term) -> Self {
+        term.as_ref().into()
+    }
+}
+
 
 impl From<TermRef<'_>> for EncodedTerm {
     fn from(term: TermRef<'_>) -> Self {

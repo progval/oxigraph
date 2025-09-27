@@ -44,7 +44,9 @@ impl<'a, R: Reader<'a>> DatasetView<'a, R> {
             marker: PhantomData,
         }
     }
+}
 
+impl<'a> DatasetView<'a> {
     pub fn insert_str(&self, key: &StrHash, value: &str) {
         if let Entry::Vacant(e) = self.extra.borrow_mut().entry(*key) {
             if !matches!(self.reader.contains_str(key), Ok(true)) {
@@ -75,7 +77,12 @@ impl<'a> QueryableDataset<'a> for DatasetView<'a> {
                 {
                     Box::new(
                         self.reader
-                            .quads_for_pattern(subject, predicate, object, Some(graph_name))
+                            .quads_for_pattern(
+                                subject.into(),
+                                predicate.into(),
+                                object.into(),
+                                Some(graph_name.into()),
+                            )
                             .map(|quad| {
                                 let quad = quad?;
                                 Ok(InternalQuad {
@@ -102,7 +109,7 @@ impl<'a> QueryableDataset<'a> for DatasetView<'a> {
                                 subject,
                                 predicate,
                                 object,
-                                Some(&default_graph_graphs[0]),
+                                Some(Some(&default_graph_graphs[0])),
                             )
                             .map(|quad| {
                                 let quad = quad?;
@@ -122,7 +129,7 @@ impl<'a> QueryableDataset<'a> for DatasetView<'a> {
                                 subject,
                                 predicate,
                                 object,
-                                Some(graph_name),
+                                Some(Some(graph_name)),
                             )
                         })
                         .collect::<Vec<_>>();
@@ -155,8 +162,12 @@ impl<'a> QueryableDataset<'a> for DatasetView<'a> {
             let iters = named_graphs
                 .iter()
                 .map(|graph_name| {
-                    self.reader
-                        .quads_for_pattern(subject, predicate, object, Some(graph_name))
+                    self.reader.quads_for_pattern(
+                        subject,
+                        predicate,
+                        object,
+                        Some(Some(graph_name)),
+                    )
                 })
                 .collect::<Vec<_>>();
             Box::new(iters.into_iter().flatten().map(|quad| {

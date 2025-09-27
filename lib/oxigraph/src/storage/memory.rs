@@ -132,8 +132,17 @@ pub struct MemoryStorageReader<'a> {
     _lifetime: PhantomData<&'a ()>,
 }
 
+impl MemoryStorageReader<'_> {
+    pub fn contains_str(&self, key: &StrHash) -> Result<bool, StorageError> {
+        Ok(self.storage.id2str.contains_key(key))
+    }
+}
+
 impl<'a> Reader<'a> for MemoryStorageReader<'a> {
     type Error = StorageError;
+    type InternalTerm = EncodedTerm;
+    type InternalQuad = EncodedQuad;
+
     type QuadIterator<'iter>
         = QuadIterator<'iter>
     where
@@ -171,13 +180,16 @@ impl<'a> Reader<'a> for MemoryStorageReader<'a> {
             .is_some_and(|node| self.is_node_in_range(&node)))
     }
 
-    fn quads_for_pattern(
+    fn quads_for_pattern<'b>(
         &self,
-        subject: Option<&EncodedTerm>,
-        predicate: Option<&EncodedTerm>,
-        object: Option<&EncodedTerm>,
-        graph_name: Option<&EncodedTerm>,
+        subject: Option<&'b Self::InternalTerm>,
+        predicate: Option<&'b Self::InternalTerm>,
+        object: Option<&'b Self::InternalTerm>,
+        graph_name: Option<Option<&Self::InternalTerm>>,
     ) -> QuadIterator<'a> {
+        let default_graph_name = GraphNameRef::DefaultGraph.into();
+        let graph_name: Option<&Self::InternalTerm> = graph_name.map(|g| g.unwrap_or(&default_graph_name));
+
         fn get_start_and_count(
             map: &DashMap<EncodedTerm, (Weak<QuadListNode>, u64), BuildHasherDefault<FxHasher>>,
             term: Option<&EncodedTerm>,
@@ -257,17 +269,13 @@ impl<'a> Reader<'a> for MemoryStorageReader<'a> {
         }
     }
 
-    fn contains_named_graph(&self, graph_name: &EncodedTerm) -> Result<bool, StorageError> {
+    fn contains_named_graph(&self, graph_name: &Self::InternalTerm) -> Result<bool, StorageError> {
         Ok(self
             .storage
             .content
             .graphs
             .get(graph_name)
             .is_some_and(|range| self.is_in_range(&range)))
-    }
-
-    fn contains_str(&self, key: &StrHash) -> Result<bool, StorageError> {
-        Ok(self.storage.id2str.contains_key(key))
     }
 
     /// Validate that all the storage invariants held in the data
@@ -469,13 +477,13 @@ pub struct MemoryStorageTransaction<'a> {
     committed: bool,
 }
 
-impl ReadWriteTransaction<'_> for MemoryStorageTransaction<'_> {
+impl<'a> ReadWriteTransaction<'a> for MemoryStorageTransaction<'a> {
     type Reader<'reader>
         = MemoryStorageReader<'reader>
     where
         Self: 'reader;
 
-    fn reader(&self) -> MemoryStorageReader<'_> {
+    fn reader(&self) -> MemoryStorageReader<'a> {
         MemoryStorageReader {
             storage: self.storage.clone(),
             snapshot_id: self.transaction_id,

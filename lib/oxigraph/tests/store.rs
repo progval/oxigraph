@@ -1,11 +1,11 @@
 #![cfg(test)]
 #![allow(clippy::panic_in_result_fn)]
 
-use oxigraph::updatable_dataset::BulkLoader;
 use oxigraph::io::RdfFormat;
 use oxigraph::model::vocab::{rdf, xsd};
 use oxigraph::model::*;
 use oxigraph::store::Store;
+use oxigraph::updatable_dataset::BulkLoader;
 use std::error::Error;
 #[cfg(all(target_os = "linux", feature = "rocksdb"))]
 use std::fs::remove_dir_all;
@@ -485,7 +485,7 @@ fn test_backward_compatibility() -> Result<(), Box<dyn Error>> {
         }
         assert!(store.contains_named_graph(graph_name)?);
         assert_eq!(
-            vec![NamedOrBlankNode::from(graph_name)],
+            vec![Term::from(graph_name)],
             store.named_graphs().collect::<Result<Vec<_>, _>>()?
         );
     }

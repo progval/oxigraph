@@ -15,6 +15,7 @@ use crate::updatable_dataset::{
     BulkLoader, ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction,
 };
 use oxrdf::Quad;
+use spareval::InternalQuad;
 use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
 use std::{io, thread};
@@ -31,6 +32,27 @@ mod rocksdb_wrapper;
 pub mod small_string;
 
 pub const DEFAULT_BULK_LOAD_BATCH_SIZE: usize = 1_000_000;
+
+impl From<EncodedQuad> for InternalQuad<EncodedTerm> {
+    fn from(value: EncodedQuad) -> Self {
+        let EncodedQuad {
+            subject,
+            predicate,
+            object,
+            graph_name,
+        } = value;
+        Self {
+            subject,
+            predicate,
+            object,
+            graph_name: if graph_name == GraphNameRef::DefaultGraph.into() {
+                None
+            } else {
+                Some(graph_name)
+            },
+        }
+    }
+}
 
 /// Low level storage primitives
 #[derive(Clone)]
@@ -161,8 +183,21 @@ enum StorageReaderKind<'a> {
     Memory(MemoryStorageReader<'a>),
 }
 
+impl StorageReader<'_> {
+    pub fn contains_str(&self, key: &StrHash) -> Result<bool, StorageError> {
+        match &self.kind {
+            #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+            StorageReaderKind::RocksDb(reader) => reader.contains_str(key),
+            StorageReaderKind::Memory(reader) => reader.contains_str(key),
+        }
+    }
+}
+
 impl<'a> Reader<'a> for StorageReader<'a> {
     type Error = StorageError;
+    type InternalTerm = EncodedTerm;
+    type InternalQuad = EncodedQuad;
+
     type QuadIterator<'iter>
         = DecodingQuadIterator<'iter>
     where
@@ -198,10 +233,10 @@ impl<'a> Reader<'a> for StorageReader<'a> {
 
     fn quads_for_pattern(
         &self,
-        subject: Option<&EncodedTerm>,
-        predicate: Option<&EncodedTerm>,
-        object: Option<&EncodedTerm>,
-        graph_name: Option<&EncodedTerm>,
+        subject: Option<&Self::InternalTerm>,
+        predicate: Option<&Self::InternalTerm>,
+        object: Option<&Self::InternalTerm>,
+        graph_name: Option<Option<&Self::InternalTerm>>,
     ) -> Self::QuadIterator<'a> {
         DecodingQuadIterator {
             kind: match &self.kind {
@@ -230,19 +265,11 @@ impl<'a> Reader<'a> for StorageReader<'a> {
         }
     }
 
-    fn contains_named_graph(&self, graph_name: &EncodedTerm) -> Result<bool, StorageError> {
+    fn contains_named_graph(&self, graph_name: &Self::InternalTerm) -> Result<bool, StorageError> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.contains_named_graph(graph_name),
             StorageReaderKind::Memory(reader) => reader.contains_named_graph(graph_name),
-        }
-    }
-
-    fn contains_str(&self, key: &StrHash) -> Result<bool, StorageError> {
-        match &self.kind {
-            #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
-            StorageReaderKind::RocksDb(reader) => reader.contains_str(key),
-            StorageReaderKind::Memory(reader) => reader.contains_str(key),
         }
     }
 
@@ -425,13 +452,13 @@ enum StorageReadableTransactionKind<'a> {
     Memory(MemoryStorageTransaction<'a>),
 }
 
-impl ReadWriteTransaction<'_> for StorageReadableTransaction<'_> {
+impl<'a> ReadWriteTransaction<'a> for StorageReadableTransaction<'a> {
     type Reader<'reader>
         = StorageReader<'reader>
     where
         Self: 'reader;
 
-    fn reader(&self) -> StorageReader<'_> {
+    fn reader(&self) -> StorageReader<'a> {
         StorageReader {
             kind: match &self.kind {
                 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]

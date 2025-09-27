@@ -5,7 +5,7 @@ use crate::io::{
 use crate::model::*;
 use crate::sparql::*;
 use oxigraph::io::{RdfParser, RdfSerializer};
-use oxigraph::model::GraphNameRef;
+use oxigraph::model::{GraphNameRef, NamedOrBlankNode};
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::{self, LoaderError, SerializerError, StorageError, Store};
 use oxigraph::updatable_dataset::BulkLoader as _;
@@ -877,7 +877,10 @@ impl GraphNameIter {
     fn __next__(&mut self) -> PyResult<Option<PyNamedOrBlankNode>> {
         self.inner
             .next()
-            .map(|q| Ok(q.map_err(map_storage_error)?.into()))
+            .map(|q| match NamedOrBlankNode::try_from(q.map_err(map_storage_error)?) {
+                Ok(node) => Ok(node.into()),
+                Err(e) => Err(PyRuntimeError::new_err(format!("GraphNameIter contains a non-node: {e}"))),
+            })
             .transpose()
     }
 }

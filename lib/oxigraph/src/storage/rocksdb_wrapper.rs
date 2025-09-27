@@ -944,8 +944,8 @@ impl Drop for ReadableTransaction<'_> {
     }
 }
 
-impl ReadableTransaction<'_> {
-    pub fn reader(&self) -> Reader<'_> {
+impl<'a> ReadableTransaction<'a> {
+    pub fn reader(&self) -> Reader<'a> {
         Reader {
             inner: InnerReader::Transaction(TransactionReader {
                 db: self.db,

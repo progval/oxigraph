@@ -1,6 +1,6 @@
 use crate::model::{GraphNameRef, NamedOrBlankNodeRef, QuadRef};
-use crate::storage::numeric_encoder::{EncodedQuad, EncodedTerm, StrHash};
 use oxrdf::Quad;
+use spareval::InternalQuad;
 use std::error::Error;
 use std::path::Path;
 
@@ -43,26 +43,66 @@ pub trait UpdatableDataset<'a> {
 
 pub trait Reader<'a> {
     type Error: Error;
-    type TermIterator<'iter>: Iterator<Item = Result<EncodedTerm, Self::Error>> + 'iter
+    type InternalTerm;
+    type InternalQuad: Into<InternalQuad<Self::InternalTerm>>;
+    type TermIterator<'iter>: Iterator<Item = Result<Self::InternalTerm, Self::Error>> + 'iter
     where
         Self: 'iter;
-    type QuadIterator<'iter>: Iterator<Item = Result<EncodedQuad, Self::Error>> + 'iter
+    type QuadIterator<'iter>: Iterator<Item = Result<Self::InternalQuad, Self::Error>> + 'iter
     where
         Self: 'iter;
 
+    /// Returns the number of quads in the store.
+    ///
+    /// <div class="warning">this function executes a full scan.</div>
     fn len(&self) -> Result<usize, Self::Error>;
+
+    /// Returns if the store is empty.
     fn is_empty(&self) -> Result<bool, Self::Error>;
-    fn contains(&self, quad: &EncodedQuad) -> Result<bool, Self::Error>;
-    fn quads_for_pattern(
+
+    /// Checks if this store contains a given quad.
+    fn contains(&self, quad: &Self::InternalQuad) -> Result<bool, Self::Error>;
+
+    /// Retrieves quads with a filter on each quad component.
+    ///
+    /// Usage example:
+    /// ```
+    /// use oxigraph::model::*;
+    /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
+    ///
+    /// let store = Store::new()?;
+    /// let a = NamedNodeRef::new("http://example.com/a")?;
+    /// let b = NamedNodeRef::new("http://example.com/b")?;
+    ///
+    /// // Copy all triples about ex:a to triples about ex:b
+    /// let mut transaction = store.start_transaction()?;
+    /// let triples = transaction
+    ///     .quads_for_pattern(Some(a.into()), None, None, None)
+    ///     .collect::<Result<Vec<_>, _>>()?;
+    /// for triple in triples {
+    ///     transaction.insert(QuadRef::new(
+    ///         b,
+    ///         &triple.predicate,
+    ///         &triple.object,
+    ///         &triple.graph_name,
+    ///     ));
+    /// }
+    /// transaction.commit()?;
+    /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
+    /// ```
+    fn quads_for_pattern<'b>(
         &self,
-        subject: Option<&EncodedTerm>,
-        predicate: Option<&EncodedTerm>,
-        object: Option<&EncodedTerm>,
-        graph_name: Option<&EncodedTerm>,
+        subject: Option<&'b Self::InternalTerm>,
+        predicate: Option<&'b Self::InternalTerm>,
+        object: Option<&'b Self::InternalTerm>,
+        graph_name: Option<Option<&'b Self::InternalTerm>>,
     ) -> Self::QuadIterator<'a>;
+
     fn named_graphs(&self) -> Self::TermIterator<'a>;
-    fn contains_named_graph(&self, graph_name: &EncodedTerm) -> Result<bool, Self::Error>;
-    fn contains_str(&self, key: &StrHash) -> Result<bool, Self::Error>;
+
+    fn contains_named_graph(&self, graph_name: &Self::InternalTerm) -> Result<bool, Self::Error>;
+
     /// Validate that all the storage invariants held in the data
     fn validate(&self) -> Result<(), Self::Error>;
 }
@@ -78,6 +118,7 @@ pub trait WriteOnlyTransaction<'a> {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new_unchecked("http://example.com");
     /// let quad = QuadRef::new(ex, ex, ex, GraphNameRef::DefaultGraph);
@@ -99,11 +140,12 @@ pub trait WriteOnlyTransaction<'a> {
     /// ```
     /// use oxigraph::model::NamedNodeRef;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new_unchecked("http://example.com");
     /// let store = Store::new()?;
     /// let mut transaction = store.start_transaction()?;
-    /// transaction.insert_named_graph(ex);
+    /// transaction.insert_named_graph(ex.into());
     /// transaction.commit()?;
     /// assert_eq!(
     ///     store.named_graphs().collect::<Result<Vec<_>, _>>()?,
@@ -121,6 +163,7 @@ pub trait WriteOnlyTransaction<'a> {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new_unchecked("http://example.com");
     /// let quad = QuadRef::new(ex, ex, ex, GraphNameRef::DefaultGraph);
@@ -144,6 +187,7 @@ pub trait WriteOnlyTransaction<'a> {
     /// ```
     /// use oxigraph::model::{NamedNodeRef, QuadRef};
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new_unchecked("http://example.com");
     /// let quad = QuadRef::new(ex, ex, ex, ex);
@@ -170,6 +214,7 @@ pub trait WriteOnlyTransaction<'a> {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new_unchecked("http://example.com");
     /// let store = Store::new()?;
@@ -188,6 +233,7 @@ pub trait WriteOnlyTransaction<'a> {
     /// ```
     /// use oxigraph::model::*;
     /// use oxigraph::store::Store;
+    /// use oxigraph::updatable_dataset::*;
     ///
     /// let ex = NamedNodeRef::new_unchecked("http://example.com");
     /// let store = Store::new()?;
@@ -205,7 +251,8 @@ pub trait ReadWriteTransaction<'a>: WriteOnlyTransaction<'a> {
     where
         Self: 'reader;
 
-    fn reader(&self) -> Self::Reader<'_>;
+    fn reader(&self) -> Self::Reader<'a>;
+
     fn remove_named_graph(
         &mut self,
         graph_name: NamedOrBlankNodeRef<'_>,

@@ -1,8 +1,8 @@
 #[cfg(feature = "sparql-12")]
 use oxrdf::BaseDirection;
 use oxrdf::{
-    BlankNode, Dataset, GraphNameRef, Literal, NamedNode, NamedOrBlankNodeRef, QuadRef, Term,
-    TermRef,
+    BlankNode, Dataset, GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNodeRef, Quad,
+    QuadRef, Term, TermRef,
 };
 #[cfg(feature = "sparql-12")]
 use oxrdf::{NamedOrBlankNode, Triple};
@@ -239,6 +239,27 @@ pub struct InternalQuad<T> {
     pub object: T,
     /// `None` if the quad is in the default graph
     pub graph_name: Option<T>,
+}
+
+impl From<Quad> for InternalQuad<Term> {
+    fn from(quad: Quad) -> Self {
+        let Quad {
+            subject,
+            predicate,
+            object,
+            graph_name,
+        } = quad;
+        Self {
+            subject: subject.into(),
+            predicate: predicate.into(),
+            object,
+            graph_name: match graph_name {
+                GraphName::DefaultGraph => None,
+                GraphName::NamedNode(node) => Some(node.into()),
+                GraphName::BlankNode(node) => Some(node.into()),
+            },
+        }
+    }
 }
 
 /// A term as understood by the expression evaluator

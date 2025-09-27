@@ -401,8 +401,19 @@ pub struct RocksDbStorageReader<'a> {
     storage: RocksDbStorage,
 }
 
+impl RocksDbStorageReader<'_> {
+    pub fn contains_str(&self, key: &StrHash) -> Result<bool, StorageError> {
+        self.storage
+            .db
+            .contains_key(&self.storage.id2str_cf, &key.to_be_bytes())
+    }
+}
+
 impl<'a> Reader<'a> for RocksDbStorageReader<'a> {
     type Error = StorageError;
+    type InternalTerm = EncodedTerm;
+    type InternalQuad = EncodedQuad;
+
     type QuadIterator<'iter>
         = RocksDbChainedDecodingQuadIterator<'iter>
     where
@@ -432,13 +443,16 @@ impl<'a> Reader<'a> for RocksDbStorageReader<'a> {
         }
     }
 
-    fn quads_for_pattern(
+    fn quads_for_pattern<'b>(
         &self,
-        subject: Option<&EncodedTerm>,
-        predicate: Option<&EncodedTerm>,
-        object: Option<&EncodedTerm>,
-        graph_name: Option<&EncodedTerm>,
+        subject: Option<&'b Self::InternalTerm>,
+        predicate: Option<&'b Self::InternalTerm>,
+        object: Option<&'b Self::InternalTerm>,
+        graph_name: Option<Option<&'b Self::InternalTerm>>,
     ) -> RocksDbChainedDecodingQuadIterator<'a> {
+        let default_graph_name = GraphNameRef::DefaultGraph.into();
+        let graph_name: Option<&Self::InternalTerm> = graph_name.map(|g| g.unwrap_or(&default_graph_name));
+
         match subject {
             Some(subject) => match predicate {
                 Some(predicate) => match object {
@@ -501,15 +515,9 @@ impl<'a> Reader<'a> for RocksDbStorageReader<'a> {
         }
     }
 
-    fn contains_named_graph(&self, graph_name: &EncodedTerm) -> Result<bool, StorageError> {
+    fn contains_named_graph(&self, graph_name: &Self::InternalTerm) -> Result<bool, StorageError> {
         self.reader
             .contains_key(&self.storage.graphs_cf, &encode_term(graph_name))
-    }
-
-    fn contains_str(&self, key: &StrHash) -> Result<bool, StorageError> {
-        self.storage
-            .db
-            .contains_key(&self.storage.id2str_cf, &key.to_be_bytes())
     }
 
     /// Validate that all the storage invariants held in the data
@@ -1246,15 +1254,16 @@ impl RocksDbStorageReadableTransaction<'_> {
     }
 }
 
-impl ReadWriteTransaction<'_> for RocksDbStorageReadableTransaction<'_> {
+impl<'a> ReadWriteTransaction<'a> for RocksDbStorageReadableTransaction<'a> {
     type Reader<'reader>
         = RocksDbStorageReader<'reader>
     where
         Self: 'reader;
 
-    fn reader(&self) -> RocksDbStorageReader<'_> {
+    fn reader(&self) -> RocksDbStorageReader<'a> {
+        let reader: RocksdbReader<'a> = self.transaction.reader();
         RocksDbStorageReader {
-            reader: self.transaction.reader(),
+            reader,
             storage: self.storage.clone(),
         }
     }

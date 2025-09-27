@@ -1,12 +1,12 @@
 #![allow(clippy::panic)]
 
-use oxigraph::updatable_dataset::BulkLoader;
 use bzip2::read::MultiBzDecoder;
 use codspeed_criterion_compat::{Criterion, Throughput, criterion_group, criterion_main};
 use oxhttp::model::{Request, Uri};
 use oxigraph::io::{JsonLdProfile, JsonLdProfileSet, RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
+use oxigraph::updatable_dataset::BulkLoader;
 use spargebra::{Query, Update};
 use std::fs::File;
 use std::io::Read;
