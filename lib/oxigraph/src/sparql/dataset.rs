@@ -75,7 +75,7 @@ impl<'a> QueryableDataset<'a> for DatasetView<'a> {
                 {
                     Box::new(
                         self.reader
-                            .quads_for_pattern(subject, predicate, object, Some(graph_name))
+                            .quads_for_pattern(subject, predicate, object, Some(Some(graph_name)))
                             .map(|quad| {
                                 let quad = quad?;
                                 Ok(InternalQuad {
@@ -98,12 +98,7 @@ impl<'a> QueryableDataset<'a> for DatasetView<'a> {
                     // Single graph optimization
                     Box::new(
                         self.reader
-                            .quads_for_pattern(
-                                subject,
-                                predicate,
-                                object,
-                                Some(&default_graph_graphs[0]),
-                            )
+                            .quads_for_pattern(subject, predicate, object, Some(None))
                             .map(|quad| {
                                 let quad = quad?;
                                 Ok(InternalQuad {
@@ -122,7 +117,7 @@ impl<'a> QueryableDataset<'a> for DatasetView<'a> {
                                 subject,
                                 predicate,
                                 object,
-                                Some(graph_name),
+                                Some(Some(graph_name)),
                             )
                         })
                         .collect::<Vec<_>>();
@@ -155,8 +150,12 @@ impl<'a> QueryableDataset<'a> for DatasetView<'a> {
             let iters = named_graphs
                 .iter()
                 .map(|graph_name| {
-                    self.reader
-                        .quads_for_pattern(subject, predicate, object, Some(graph_name))
+                    self.reader.quads_for_pattern(
+                        subject,
+                        predicate,
+                        object,
+                        Some(Some(graph_name)),
+                    )
                 })
                 .collect::<Vec<_>>();
             Box::new(iters.into_iter().flatten().map(|quad| {

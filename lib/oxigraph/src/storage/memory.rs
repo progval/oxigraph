@@ -1,7 +1,10 @@
 use super::updatable_dataset::{
     BulkLoader, ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction,
 };
+use super::{StorageReader, StorageReaderKind};
 use crate::model::{GraphNameRef, NamedOrBlankNodeRef, QuadRef, TermRef};
+use crate::sparql::QueryDataset;
+use crate::sparql::dataset::DatasetView;
 use crate::storage::CorruptionError;
 pub use crate::storage::error::StorageError;
 use crate::storage::numeric_encoder::{
@@ -10,7 +13,7 @@ use crate::storage::numeric_encoder::{
 use dashmap::iter::Iter;
 use dashmap::mapref::entry::Entry;
 use dashmap::{DashMap, DashSet};
-use oxrdf::Quad;
+use oxrdf::{Quad, Term};
 use rustc_hash::FxHasher;
 use std::borrow::Borrow;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
@@ -134,6 +137,7 @@ pub struct MemoryStorageReader<'a> {
 
 impl<'a> Reader<'a> for MemoryStorageReader<'a> {
     type Error = StorageError;
+    type InternalTerm = EncodedTerm;
     type QuadIterator<'iter>
         = QuadIterator<'iter>
     where
@@ -162,6 +166,17 @@ impl<'a> Reader<'a> for MemoryStorageReader<'a> {
             .any(|e| self.is_node_in_range(&e)))
     }
 
+    fn internalize_term(&self, term: Term) -> Result<Option<EncodedTerm>, StorageError> {
+        Ok(Some(term.as_ref().into()))
+    }
+
+    fn externalize_term(&self, term: EncodedTerm) -> Result<Option<Term>, StorageError> {
+        Err(StorageError::Other(
+            "MemoryStorageReader::externalize_term not not implemented. Use a DatasetView instead."
+                .into(),
+        ))
+    }
+
     fn contains(&self, quad: &EncodedQuad) -> Result<bool, StorageError> {
         Ok(self
             .storage
@@ -176,7 +191,7 @@ impl<'a> Reader<'a> for MemoryStorageReader<'a> {
         subject: Option<&EncodedTerm>,
         predicate: Option<&EncodedTerm>,
         object: Option<&EncodedTerm>,
-        graph_name: Option<&EncodedTerm>,
+        graph_name: Option<Option<&EncodedTerm>>,
     ) -> QuadIterator<'a> {
         fn get_start_and_count(
             map: &DashMap<EncodedTerm, (Weak<QuadListNode>, u64), BuildHasherDefault<FxHasher>>,
@@ -188,6 +203,9 @@ impl<'a> Reader<'a> for MemoryStorageReader<'a> {
             map.view(term, |_, (node, count)| (Some(Weak::clone(node)), *count))
                 .unwrap_or_default()
         }
+
+        let default_graph = &GraphNameRef::DefaultGraph.into();
+        let graph_name = graph_name.map(|g| g.unwrap_or(&default_graph));
 
         let (subject_start, subject_count) =
             get_start_and_count(&self.storage.content.last_quad_by_subject, subject);
@@ -439,6 +457,17 @@ impl<'a> Reader<'a> for MemoryStorageReader<'a> {
         }
 
         Ok(())
+    }
+
+    type QueryableDataset = DatasetView<'a, StorageReader<'a>>;
+
+    fn into_queryable_dataset(self, using: &QueryDataset) -> Self::QueryableDataset {
+        DatasetView::new(
+            StorageReader {
+                kind: StorageReaderKind::Memory(self),
+            },
+            using,
+        )
     }
 }
 

@@ -1,4 +1,6 @@
 use crate::model::{GraphNameRef, NamedOrBlankNodeRef, QuadRef};
+use crate::sparql::QueryDataset;
+use crate::sparql::dataset::DatasetView;
 pub use crate::storage::error::{CorruptionError, LoaderError, SerializerError, StorageError};
 use crate::storage::memory::{
     MemoryDecodingGraphIterator, MemoryStorage, MemoryStorageBulkLoader, MemoryStorageReader,
@@ -11,7 +13,7 @@ use crate::storage::rocksdb::{
     RocksDbStorageBulkLoader, RocksDbStorageReadableTransaction, RocksDbStorageReader,
     RocksDbStorageTransaction,
 };
-use oxrdf::Quad;
+use oxrdf::{Quad, Term};
 use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
 use std::{io, thread};
@@ -164,6 +166,7 @@ enum StorageReaderKind<'a> {
 
 impl<'a> Reader<'a> for StorageReader<'a> {
     type Error = StorageError;
+    type InternalTerm = EncodedTerm;
     type QuadIterator<'iter>
         = DecodingQuadIterator<'iter>
     where
@@ -189,6 +192,22 @@ impl<'a> Reader<'a> for StorageReader<'a> {
         }
     }
 
+    fn internalize_term(&self, term: Term) -> Result<Option<EncodedTerm>, StorageError> {
+        match &self.kind {
+            #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+            StorageReaderKind::RocksDb(reader) => reader.internalize_term(term),
+            StorageReaderKind::Memory(reader) => reader.internalize_term(term),
+        }
+    }
+
+    fn externalize_term(&self, term: EncodedTerm) -> Result<Option<Term>, StorageError> {
+        match &self.kind {
+            #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+            StorageReaderKind::RocksDb(reader) => reader.externalize_term(term),
+            StorageReaderKind::Memory(reader) => reader.externalize_term(term),
+        }
+    }
+
     fn contains(&self, quad: &EncodedQuad) -> Result<bool, StorageError> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
@@ -202,7 +221,7 @@ impl<'a> Reader<'a> for StorageReader<'a> {
         subject: Option<&EncodedTerm>,
         predicate: Option<&EncodedTerm>,
         object: Option<&EncodedTerm>,
-        graph_name: Option<&EncodedTerm>,
+        graph_name: Option<Option<&EncodedTerm>>,
     ) -> Self::QuadIterator<'a> {
         DecodingQuadIterator {
             kind: match &self.kind {
@@ -253,6 +272,12 @@ impl<'a> Reader<'a> for StorageReader<'a> {
             StorageReaderKind::RocksDb(reader) => reader.validate(),
             StorageReaderKind::Memory(reader) => reader.validate(),
         }
+    }
+
+    type QueryableDataset = DatasetView<'a>;
+
+    fn into_queryable_dataset(self, using: &QueryDataset) -> Self::QueryableDataset {
+        DatasetView::new(self, using)
     }
 }
 

@@ -1,11 +1,13 @@
 use crate::model::{GraphNameRef, NamedOrBlankNodeRef, QuadRef};
-use crate::storage::numeric_encoder::{EncodedQuad, EncodedTerm, StrHash};
-use oxrdf::Quad;
+use crate::sparql::UpdateEvaluationError;
+use crate::storage::numeric_encoder::{EncodedQuad, StrHash};
+use oxrdf::{Quad, Term};
+use spareval::QueryableDataset;
 use std::error::Error;
 use std::path::Path;
 
 pub trait UpdatableDataset<'a> {
-    type Error: Error;
+    type Error: Error + Into<UpdateEvaluationError>;
 
     type Reader<'reader>: Reader<'reader, Error = Self::Error>
     where
@@ -43,7 +45,8 @@ pub trait UpdatableDataset<'a> {
 
 pub trait Reader<'a> {
     type Error: Error;
-    type TermIterator<'iter>: Iterator<Item = Result<EncodedTerm, Self::Error>> + 'iter
+    type InternalTerm;
+    type TermIterator<'iter>: Iterator<Item = Result<Self::InternalTerm, Self::Error>> + 'iter
     where
         Self: 'iter;
     type QuadIterator<'iter>: Iterator<Item = Result<EncodedQuad, Self::Error>> + 'iter
@@ -52,23 +55,31 @@ pub trait Reader<'a> {
 
     fn len(&self) -> Result<usize, Self::Error>;
     fn is_empty(&self) -> Result<bool, Self::Error>;
+
+    fn internalize_term(&self, term: Term) -> Result<Option<Self::InternalTerm>, Self::Error>;
+    fn externalize_term(&self, term: Self::InternalTerm) -> Result<Option<Term>, Self::Error>;
+
     fn contains(&self, quad: &EncodedQuad) -> Result<bool, Self::Error>;
     fn quads_for_pattern(
         &self,
-        subject: Option<&EncodedTerm>,
-        predicate: Option<&EncodedTerm>,
-        object: Option<&EncodedTerm>,
-        graph_name: Option<&EncodedTerm>,
+        subject: Option<&Self::InternalTerm>,
+        predicate: Option<&Self::InternalTerm>,
+        object: Option<&Self::InternalTerm>,
+        graph_name: Option<Option<&Self::InternalTerm>>,
     ) -> Self::QuadIterator<'a>;
     fn named_graphs(&self) -> Self::TermIterator<'a>;
-    fn contains_named_graph(&self, graph_name: &EncodedTerm) -> Result<bool, Self::Error>;
+    fn contains_named_graph(&self, graph_name: &Self::InternalTerm) -> Result<bool, Self::Error>;
     fn contains_str(&self, key: &StrHash) -> Result<bool, Self::Error>;
     /// Validate that all the storage invariants held in the data
     fn validate(&self) -> Result<(), Self::Error>;
+
+    type QueryableDataset: QueryableDataset<'a>;
+    fn into_queryable_dataset(self, using: &crate::sparql::QueryDataset) -> Self::QueryableDataset;
 }
 
 pub trait WriteOnlyTransaction<'a> {
-    type Error: Error;
+    type Error: Error + Into<UpdateEvaluationError>;
+
     fn insert(&mut self, quad: QuadRef<'_>);
     fn insert_named_graph(&mut self, graph_name: NamedOrBlankNodeRef<'_>);
     fn remove(&mut self, quad: QuadRef<'_>);
@@ -82,6 +93,7 @@ pub trait WriteOnlyTransaction<'a> {
     fn clear(&mut self) -> Result<(), Self::Error>;
     fn commit(self) -> Result<(), Self::Error>;
 }
+
 pub trait ReadWriteTransaction<'a>: WriteOnlyTransaction<'a> {
     type Reader<'reader>: Reader<'reader, Error = Self::Error>
     where
@@ -93,6 +105,7 @@ pub trait ReadWriteTransaction<'a>: WriteOnlyTransaction<'a> {
         graph_name: NamedOrBlankNodeRef<'_>,
     ) -> Result<(), Self::Error>;
 }
+
 pub trait BulkLoader<'a> {
     type Error: Error;
 

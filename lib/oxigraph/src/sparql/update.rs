@@ -11,7 +11,6 @@ use crate::sparql::http::Client;
 use crate::storage::updatable_dataset::{
     ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction,
 };
-use crate::storage::{Storage, StorageError, StorageReadableTransaction, StorageTransaction};
 use crate::store::{Store, Transaction};
 use oxiri::Iri;
 #[cfg(feature = "http-client")]
@@ -30,6 +29,7 @@ use spargebra::term::{GroundTriple, GroundTriplePattern, Triple, TriplePattern};
 use spargebra::{GraphUpdateOperation, Query};
 #[cfg(feature = "http-client")]
 use std::io::Read;
+use std::marker::PhantomData;
 #[cfg(feature = "http-client")]
 use std::time::Duration;
 
@@ -102,7 +102,10 @@ impl PreparedSparqlUpdate {
     /// prepared_update.on_store(&Store::new()?).execute()?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
-    pub fn on_store(self, store: &Store) -> BoundPreparedSparqlUpdate<'_, '_> {
+    pub fn on_store<S: UpdatableDataset<'static>>(
+        self,
+        store: &Store<S>,
+    ) -> BoundPreparedSparqlUpdate<'_, '_, S> {
         let transaction = if update_requires_read(&self.update) {
             store
                 .storage()
@@ -141,10 +144,10 @@ impl PreparedSparqlUpdate {
     /// prepared_update.on_transaction(&mut transaction).execute()?;
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
-    pub fn on_transaction<'a, 'b: 'a>(
+    pub fn on_transaction<'a, 'b: 'a, S: UpdatableDataset<'static>>(
         self,
-        transaction: &'a mut Transaction<'b>,
-    ) -> BoundPreparedSparqlUpdate<'a, 'b> {
+        transaction: &'a mut Transaction<'b, S::ReadWriteTransaction<'b>>,
+    ) -> BoundPreparedSparqlUpdate<'a, 'b, S> {
         BoundPreparedSparqlUpdate {
             evaluator: self.evaluator,
             update: self.update,
@@ -176,7 +179,7 @@ impl PreparedSparqlUpdate {
 /// # Ok::<_, Box<dyn std::error::Error>>(())
 /// ```
 #[must_use]
-pub struct BoundPreparedSparqlUpdate<'a, 'b> {
+pub struct BoundPreparedSparqlUpdate<'a, 'b, S: UpdatableDataset<'static>> {
     evaluator: QueryEvaluator,
     update: spargebra::Update,
     using_datasets: Vec<Option<QueryDataset>>,
@@ -184,13 +187,14 @@ pub struct BoundPreparedSparqlUpdate<'a, 'b> {
     http_timeout: Option<Duration>,
     #[cfg(feature = "http-client")]
     http_redirection_limit: usize,
-    transaction: Result<UpdateTransaction<'a, 'b>, StorageError>,
+    transaction: Result<UpdateTransaction<'a, 'b, S>, S::Error>,
 }
 
-impl BoundPreparedSparqlUpdate<'_, '_> {
+impl<'a, 'b, S: UpdatableDataset<'static>> BoundPreparedSparqlUpdate<'a, 'b, S> {
     /// Evaluate the update against the given store.
-    pub fn execute(self) -> Result<(), UpdateEvaluationError> {
-        match self.transaction? {
+    pub fn execute(self) -> Result<(), UpdateEvaluationError>
+    {
+        match self.transaction.map_err(Into::into)? {
             UpdateTransaction::OwnedReadable(mut transaction) => {
                 ReadableUpdateEvaluator {
                     transaction: &mut transaction,
@@ -198,9 +202,10 @@ impl BoundPreparedSparqlUpdate<'_, '_> {
                     query_evaluator: self.evaluator,
                     #[cfg(feature = "http-client")]
                     client: Client::new(self.http_timeout, self.http_redirection_limit),
+                    marker: PhantomData,
                 }
                 .eval_all(&self.update.operations, &self.using_datasets)?;
-                transaction.commit()?;
+                transaction.commit().map_err(Into::into)?;
                 Ok(())
             }
             UpdateTransaction::BorrowedReadable(transaction) => ReadableUpdateEvaluator {
@@ -209,6 +214,7 @@ impl BoundPreparedSparqlUpdate<'_, '_> {
                 query_evaluator: self.evaluator,
                 #[cfg(feature = "http-client")]
                 client: Client::new(self.http_timeout, self.http_redirection_limit),
+                marker: PhantomData,
             }
             .eval_all(&self.update.operations, &self.using_datasets),
             UpdateTransaction::Owned(mut transaction, storage) => {
@@ -221,28 +227,37 @@ impl BoundPreparedSparqlUpdate<'_, '_> {
                     client: Client::new(self.http_timeout, self.http_redirection_limit),
                 }
                 .eval_all(&self.update.operations, &self.using_datasets)?;
-                transaction.commit()?;
+                transaction.commit().map_err(Into::into)?;
                 Ok(())
             }
         }
     }
 }
 
-enum UpdateTransaction<'a, 'b> {
-    OwnedReadable(StorageReadableTransaction<'b>),
-    BorrowedReadable(&'a mut StorageReadableTransaction<'b>),
-    Owned(StorageTransaction<'b>, &'b Storage),
+enum UpdateTransaction<'a, 'b, S: UpdatableDataset<'static>> {
+    OwnedReadable(S::ReadWriteTransaction<'b>),
+    BorrowedReadable(&'a mut S::ReadWriteTransaction<'b>),
+    Owned(S::WriteOnlyTransaction<'b>, &'b S),
 }
 
-struct ReadableUpdateEvaluator<'a, 'b> {
-    transaction: &'a mut StorageReadableTransaction<'b>,
+struct ReadableUpdateEvaluator<'a, 'b, T: ReadWriteTransaction<'b>>
+where
+    for<'reader> <<T as ReadWriteTransaction<'b>>::Reader<'reader> as Reader<'reader>>::Error:
+        Into<UpdateEvaluationError>,
+{
+    transaction: &'a mut T,
     base_iri: Option<Iri<String>>,
     query_evaluator: QueryEvaluator,
     #[cfg(feature = "http-client")]
     client: Client,
+    marker: PhantomData<&'b ()>,
 }
 
-impl<'a, 'b: 'a> ReadableUpdateEvaluator<'a, 'b> {
+impl<'a, 'b: 'a, T: ReadWriteTransaction<'b>> ReadableUpdateEvaluator<'a, 'b, T>
+where
+    for<'reader> <<T as ReadWriteTransaction<'b>>::Reader<'reader> as Reader<'reader>>::Error:
+        Into<UpdateEvaluationError>,
+{
     fn eval_all(
         &mut self,
         updates: &[GraphUpdateOperation],
@@ -319,7 +334,7 @@ impl<'a, 'b: 'a> ReadableUpdateEvaluator<'a, 'b> {
         algebra: &GraphPattern,
     ) -> Result<(), UpdateEvaluationError> {
         let QueryResults::Solutions(solutions) = self.query_evaluator.clone().execute(
-            DatasetView::new(self.transaction.reader(), using),
+            self.transaction.reader().into_queryable_dataset(using),
             &Query::Select {
                 dataset: None,
                 pattern: algebra.clone(),
@@ -371,22 +386,26 @@ impl<'a, 'b: 'a> ReadableUpdateEvaluator<'a, 'b> {
         graph_name: &NamedNode,
         silent: bool,
     ) -> Result<(), UpdateEvaluationError> {
-        if self
-            .transaction
-            .reader()
-            .contains_named_graph(&graph_name.as_ref().into())?
+        let reader = self.transaction.reader();
+        if let Some(internal_graph_name) = reader
+            .internalize_term(graph_name.as_ref().into())
+            .map_err(Into::into)?
         {
-            if silent {
-                Ok(())
-            } else {
-                Err(UpdateEvaluationError::GraphAlreadyExists(
-                    graph_name.clone(),
-                ))
+            if reader
+                .contains_named_graph(&internal_graph_name)
+                .map_err(Into::into)?
+            {
+                if silent {
+                    return Ok(());
+                } else {
+                    return Err(UpdateEvaluationError::GraphAlreadyExists(
+                        graph_name.clone(),
+                    ));
+                }
             }
-        } else {
-            self.transaction.insert_named_graph(graph_name.into());
-            Ok(())
         }
+        self.transaction.insert_named_graph(graph_name.into());
+        Ok(())
     }
 
     fn eval_clear(
@@ -396,24 +415,40 @@ impl<'a, 'b: 'a> ReadableUpdateEvaluator<'a, 'b> {
     ) -> Result<(), UpdateEvaluationError> {
         match graph {
             GraphTarget::NamedNode(graph_name) => {
-                if self
-                    .transaction
-                    .reader()
-                    .contains_named_graph(&graph_name.as_ref().into())?
+                let reader = self.transaction.reader();
+                if let Some(internal_graph_name) = reader
+                    .internalize_term(graph_name.as_ref().into())
+                    .map_err(Into::into)?
                 {
-                    Ok(self.transaction.clear_graph(graph_name.into())?)
-                } else if silent {
+                    if reader
+                        .contains_named_graph(&internal_graph_name)
+                        .map_err(Into::into)?
+                    {
+                        return Ok(self
+                            .transaction
+                            .clear_graph(graph_name.into())
+                            .map_err(Into::into)?);
+                    }
+                }
+                if silent {
                     Ok(())
                 } else {
                     Err(UpdateEvaluationError::GraphDoesNotExist(graph_name.clone()))
                 }
             }
             GraphTarget::DefaultGraph => {
-                self.transaction.clear_graph(GraphNameRef::DefaultGraph)?;
+                self.transaction
+                    .clear_graph(GraphNameRef::DefaultGraph)
+                    .map_err(Into::into)?;
                 Ok(())
             }
-            GraphTarget::NamedGraphs => Ok(self.transaction.clear_all_named_graphs()?),
-            GraphTarget::AllGraphs => Ok(self.transaction.clear_all_graphs()?),
+            GraphTarget::NamedGraphs => Ok(self
+                .transaction
+                .clear_all_named_graphs()
+                .map_err(Into::into)?),
+            GraphTarget::AllGraphs => {
+                Ok(self.transaction.clear_all_graphs().map_err(Into::into)?)
+            }
         }
     }
 
@@ -424,24 +459,37 @@ impl<'a, 'b: 'a> ReadableUpdateEvaluator<'a, 'b> {
     ) -> Result<(), UpdateEvaluationError> {
         match graph {
             GraphTarget::NamedNode(graph_name) => {
-                if self
-                    .transaction
-                    .reader()
-                    .contains_named_graph(&graph_name.as_ref().into())?
+                let reader = self.transaction.reader();
+
+                if let Some(internal_graph_name) = reader
+                    .internalize_term(graph_name.as_ref().into())
+                    .map_err(Into::into)?
                 {
-                    self.transaction.remove_named_graph(graph_name.into())?;
-                    Ok(())
-                } else if silent {
+                    if reader
+                        .contains_named_graph(&internal_graph_name)
+                        .map_err(Into::into)?
+                    {
+                        self.transaction
+                            .remove_named_graph(graph_name.into())
+                            .map_err(Into::into)?;
+                        return Ok(());
+                    }
+                }
+                if silent {
                     Ok(())
                 } else {
                     Err(UpdateEvaluationError::GraphDoesNotExist(graph_name.clone()))
                 }
             }
-            GraphTarget::DefaultGraph => {
-                Ok(self.transaction.clear_graph(GraphNameRef::DefaultGraph)?)
-            }
-            GraphTarget::NamedGraphs => Ok(self.transaction.remove_all_named_graphs()?),
-            GraphTarget::AllGraphs => Ok(self.transaction.clear()?),
+            GraphTarget::DefaultGraph => Ok(self
+                .transaction
+                .clear_graph(GraphNameRef::DefaultGraph)
+                .map_err(Into::into)?),
+            GraphTarget::NamedGraphs => Ok(self
+                .transaction
+                .remove_all_named_graphs()
+                .map_err(Into::into)?),
+            GraphTarget::AllGraphs => Ok(self.transaction.clear().map_err(Into::into)?),
         }
     }
 }
@@ -467,16 +515,16 @@ fn update_requires_read(update: &spargebra::Update) -> bool {
     false
 }
 
-struct WriteOnlyUpdateEvaluator<'a, 'b> {
-    transaction: &'a mut StorageTransaction<'b>,
-    storage_for_initial_read: Option<&'b Storage>,
+struct WriteOnlyUpdateEvaluator<'a, 'b, S: UpdatableDataset<'static> + 'b> {
+    transaction: &'a mut S::WriteOnlyTransaction<'b>,
+    storage_for_initial_read: Option<&'b S>,
     base_iri: Option<Iri<String>>,
     query_evaluator: QueryEvaluator,
     #[cfg(feature = "http-client")]
     client: Client,
 }
 
-impl WriteOnlyUpdateEvaluator<'_, '_> {
+impl<'a, 'b, S: UpdatableDataset<'static> + 'b> WriteOnlyUpdateEvaluator<'a, 'b, S> {
     fn eval_all(
         &mut self,
         updates: &[GraphUpdateOperation],
@@ -559,7 +607,7 @@ impl WriteOnlyUpdateEvaluator<'_, '_> {
             ));
         };
         let QueryResults::Solutions(solutions) = self.query_evaluator.clone().execute(
-            DatasetView::new(storage.snapshot(), using),
+            storage.snapshot().into_queryable_dataset(using),
             &Query::Select {
                 dataset: None,
                 pattern: algebra.clone(),
@@ -621,18 +669,12 @@ impl WriteOnlyUpdateEvaluator<'_, '_> {
             GraphTarget::NamedNode(_) => Err(UpdateEvaluationError::Unexpected(
                 "Not possible to clear a named graph using a write-only transaction".into(),
             )),
-            GraphTarget::DefaultGraph => {
-                self.transaction.clear_default_graph()?;
-                Ok(())
-            }
-            GraphTarget::NamedGraphs => {
-                self.transaction.clear_all_named_graphs()?;
-                Ok(())
-            }
-            GraphTarget::AllGraphs => {
-                self.transaction.clear_all_graphs()?;
-                Ok(())
-            }
+            GraphTarget::DefaultGraph => self.transaction.clear_default_graph().map_err(Into::into),
+            GraphTarget::NamedGraphs => self
+                .transaction
+                .clear_all_named_graphs()
+                .map_err(Into::into),
+            GraphTarget::AllGraphs => self.transaction.clear_all_graphs().map_err(Into::into),
         }
     }
 
@@ -645,18 +687,12 @@ impl WriteOnlyUpdateEvaluator<'_, '_> {
             GraphTarget::NamedNode(_) => Err(UpdateEvaluationError::Unexpected(
                 "Not possible to drop a named graph using a write-only transaction".into(),
             )),
-            GraphTarget::DefaultGraph => {
-                self.transaction.clear_default_graph()?;
-                Ok(())
-            }
-            GraphTarget::NamedGraphs => {
-                self.transaction.remove_all_named_graphs()?;
-                Ok(())
-            }
-            GraphTarget::AllGraphs => {
-                self.transaction.clear()?;
-                Ok(())
-            }
+            GraphTarget::DefaultGraph => self.transaction.clear_default_graph().map_err(Into::into),
+            GraphTarget::NamedGraphs => self
+                .transaction
+                .remove_all_named_graphs()
+                .map_err(Into::into),
+            GraphTarget::AllGraphs => self.transaction.clear().map_err(Into::into),
         }
     }
 }

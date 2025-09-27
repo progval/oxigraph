@@ -73,13 +73,13 @@ impl From<CorruptionError> for io::Error {
 
 /// An error raised while loading a file into a [`Store`](crate::store::Store).
 #[derive(Debug, thiserror::Error)]
-pub enum LoaderError {
+pub enum LoaderError<SE = StorageError> {
     /// An error raised while reading the file.
     #[error(transparent)]
     Parsing(#[from] RdfParseError),
     /// An error raised during the insertion in the store.
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Storage(SE),
     /// The base IRI is invalid.
     #[error("Invalid base IRI '{iri}': {error}")]
     InvalidBaseIri {
@@ -89,6 +89,13 @@ pub enum LoaderError {
         #[source]
         error: IriParseError,
     },
+}
+
+impl From<StorageError> for LoaderError {
+    #[inline]
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
 }
 
 impl From<LoaderError> for io::Error {
@@ -106,16 +113,23 @@ impl From<LoaderError> for io::Error {
 
 /// An error raised while writing a file from a [`Store`](crate::store::Store).
 #[derive(Debug, thiserror::Error)]
-pub enum SerializerError {
+pub enum SerializerError<SE = StorageError> {
     /// An error raised while writing the content.
     #[error(transparent)]
     Io(#[from] io::Error),
     /// An error raised during the lookup in the store.
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Storage(SE),
     /// A format compatible with [RDF dataset](https://www.w3.org/TR/rdf11-concepts/#dfn-rdf-dataset) is required.
     #[error("A RDF format supporting datasets was expected, {0} found")]
     DatasetFormatExpected(RdfFormat),
+}
+
+impl From<StorageError> for SerializerError {
+    #[inline]
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
 }
 
 impl From<SerializerError> for io::Error {

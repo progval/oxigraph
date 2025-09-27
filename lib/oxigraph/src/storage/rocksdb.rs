@@ -1,11 +1,14 @@
 use super::updatable_dataset::{
     BulkLoader, ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction,
 };
+use super::{StorageReader, StorageReaderKind};
 #[cfg(feature = "rdf-12")]
 use crate::model::vocab::rdf;
 #[cfg(feature = "rdf-12")]
 use crate::model::{BlankNode, GraphName, Term, Triple};
 use crate::model::{GraphNameRef, NamedOrBlankNodeRef, Quad, QuadRef, TermRef};
+use crate::sparql::QueryDataset;
+use crate::sparql::dataset::DatasetView;
 use crate::storage::binary_encoder::{
     QuadEncoding, TYPE_STAR_TRIPLE, WRITTEN_TERM_MAX_SIZE, decode_term, encode_term,
     encode_term_pair, encode_term_quad, encode_term_triple, write_gosp_quad, write_gpos_quad,
@@ -403,6 +406,7 @@ pub struct RocksDbStorageReader<'a> {
 
 impl<'a> Reader<'a> for RocksDbStorageReader<'a> {
     type Error = StorageError;
+    type InternalTerm = EncodedTerm;
     type QuadIterator<'iter>
         = RocksDbChainedDecodingQuadIterator<'iter>
     where
@@ -421,6 +425,16 @@ impl<'a> Reader<'a> for RocksDbStorageReader<'a> {
             && self.reader.is_empty(&self.storage.dspo_cf)?)
     }
 
+    fn internalize_term(&self, term: Term) -> Result<Option<EncodedTerm>, StorageError> {
+        Ok(Some(term.as_ref().into()))
+    }
+
+    fn externalize_term(&self, term: EncodedTerm) -> Result<Option<Term>, StorageError> {
+        Err(StorageError::Other(
+            "RocksDbStorageReader::externalize_term not not implemented. Use a DatasetView instead.".into(),
+        ))
+    }
+
     fn contains(&self, quad: &EncodedQuad) -> Result<bool, StorageError> {
         let mut buffer = Vec::with_capacity(4 * WRITTEN_TERM_MAX_SIZE);
         if quad.graph_name.is_default_graph() {
@@ -437,7 +451,7 @@ impl<'a> Reader<'a> for RocksDbStorageReader<'a> {
         subject: Option<&EncodedTerm>,
         predicate: Option<&EncodedTerm>,
         object: Option<&EncodedTerm>,
-        graph_name: Option<&EncodedTerm>,
+        graph_name: Option<Option<&EncodedTerm>>,
     ) -> RocksDbChainedDecodingQuadIterator<'a> {
         match subject {
             Some(subject) => match predicate {
@@ -622,6 +636,17 @@ impl<'a> Reader<'a> for RocksDbStorageReader<'a> {
         }
         Ok(())
     }
+
+    type QueryableDataset = DatasetView<'a, StorageReader<'a>>;
+
+    fn into_queryable_dataset(self, using: &QueryDataset) -> Self::QueryableDataset {
+        DatasetView::new(
+            StorageReader {
+                kind: StorageReaderKind::RocksDb(self),
+            },
+            using,
+        )
+    }
 }
 
 impl<'a> RocksDbStorageReader<'a> {
@@ -698,23 +723,24 @@ impl<'a> RocksDbStorageReader<'a> {
         )
     }
 
-    fn quads_for_graph(&self, graph_name: &EncodedTerm) -> RocksDbChainedDecodingQuadIterator<'a> {
-        RocksDbChainedDecodingQuadIterator::new(if graph_name.is_default_graph() {
-            self.dspo_quads(&Vec::default())
-        } else {
-            self.gspo_quads(&encode_term(graph_name))
+    fn quads_for_graph(
+        &self,
+        graph_name: Option<&EncodedTerm>,
+    ) -> RocksDbChainedDecodingQuadIterator<'a> {
+        RocksDbChainedDecodingQuadIterator::new(match graph_name {
+            None => self.dspo_quads(&Vec::default()),
+            Some(graph_name) => self.gspo_quads(&encode_term(graph_name)),
         })
     }
 
     fn quads_for_subject_graph(
         &self,
         subject: &EncodedTerm,
-        graph_name: &EncodedTerm,
+        graph_name: Option<&EncodedTerm>,
     ) -> RocksDbChainedDecodingQuadIterator<'a> {
-        RocksDbChainedDecodingQuadIterator::new(if graph_name.is_default_graph() {
-            self.dspo_quads(&encode_term(subject))
-        } else {
-            self.gspo_quads(&encode_term_pair(graph_name, subject))
+        RocksDbChainedDecodingQuadIterator::new(match graph_name {
+            None => self.dspo_quads(&encode_term(subject)),
+            Some(graph_name) => self.gspo_quads(&encode_term_pair(graph_name, subject)),
         })
     }
 
@@ -722,12 +748,13 @@ impl<'a> RocksDbStorageReader<'a> {
         &self,
         subject: &EncodedTerm,
         predicate: &EncodedTerm,
-        graph_name: &EncodedTerm,
+        graph_name: Option<&EncodedTerm>,
     ) -> RocksDbChainedDecodingQuadIterator<'a> {
-        RocksDbChainedDecodingQuadIterator::new(if graph_name.is_default_graph() {
-            self.dspo_quads(&encode_term_pair(subject, predicate))
-        } else {
-            self.gspo_quads(&encode_term_triple(graph_name, subject, predicate))
+        RocksDbChainedDecodingQuadIterator::new(match graph_name {
+            None => self.dspo_quads(&encode_term_pair(subject, predicate)),
+            Some(graph_name) => {
+                self.gspo_quads(&encode_term_triple(graph_name, subject, predicate))
+            }
         })
     }
 
@@ -736,12 +763,13 @@ impl<'a> RocksDbStorageReader<'a> {
         subject: &EncodedTerm,
         predicate: &EncodedTerm,
         object: &EncodedTerm,
-        graph_name: &EncodedTerm,
+        graph_name: Option<&EncodedTerm>,
     ) -> RocksDbChainedDecodingQuadIterator<'a> {
-        RocksDbChainedDecodingQuadIterator::new(if graph_name.is_default_graph() {
-            self.dspo_quads(&encode_term_triple(subject, predicate, object))
-        } else {
-            self.gspo_quads(&encode_term_quad(graph_name, subject, predicate, object))
+        RocksDbChainedDecodingQuadIterator::new(match graph_name {
+            None => self.dspo_quads(&encode_term_triple(subject, predicate, object)),
+            Some(graph_name) => {
+                self.gspo_quads(&encode_term_quad(graph_name, subject, predicate, object))
+            }
         })
     }
 
@@ -749,24 +777,22 @@ impl<'a> RocksDbStorageReader<'a> {
         &self,
         subject: &EncodedTerm,
         object: &EncodedTerm,
-        graph_name: &EncodedTerm,
+        graph_name: Option<&EncodedTerm>,
     ) -> RocksDbChainedDecodingQuadIterator<'a> {
-        RocksDbChainedDecodingQuadIterator::new(if graph_name.is_default_graph() {
-            self.dosp_quads(&encode_term_pair(object, subject))
-        } else {
-            self.gosp_quads(&encode_term_triple(graph_name, object, subject))
+        RocksDbChainedDecodingQuadIterator::new(match graph_name {
+            None => self.dosp_quads(&encode_term_pair(object, subject)),
+            Some(graph_name) => self.gosp_quads(&encode_term_triple(graph_name, object, subject)),
         })
     }
 
     fn quads_for_predicate_graph(
         &self,
         predicate: &EncodedTerm,
-        graph_name: &EncodedTerm,
+        graph_name: Option<&EncodedTerm>,
     ) -> RocksDbChainedDecodingQuadIterator<'a> {
-        RocksDbChainedDecodingQuadIterator::new(if graph_name.is_default_graph() {
-            self.dpos_quads(&encode_term(predicate))
-        } else {
-            self.gpos_quads(&encode_term_pair(graph_name, predicate))
+        RocksDbChainedDecodingQuadIterator::new(match graph_name {
+            None => self.dpos_quads(&encode_term(predicate)),
+            Some(graph_name) => self.gpos_quads(&encode_term_pair(graph_name, predicate)),
         })
     }
 
@@ -774,24 +800,22 @@ impl<'a> RocksDbStorageReader<'a> {
         &self,
         predicate: &EncodedTerm,
         object: &EncodedTerm,
-        graph_name: &EncodedTerm,
+        graph_name: Option<&EncodedTerm>,
     ) -> RocksDbChainedDecodingQuadIterator<'a> {
-        RocksDbChainedDecodingQuadIterator::new(if graph_name.is_default_graph() {
-            self.dpos_quads(&encode_term_pair(predicate, object))
-        } else {
-            self.gpos_quads(&encode_term_triple(graph_name, predicate, object))
+        RocksDbChainedDecodingQuadIterator::new(match graph_name {
+            None => self.dpos_quads(&encode_term_pair(predicate, object)),
+            Some(graph_name) => self.gpos_quads(&encode_term_triple(graph_name, predicate, object)),
         })
     }
 
     fn quads_for_object_graph(
         &self,
         object: &EncodedTerm,
-        graph_name: &EncodedTerm,
+        graph_name: Option<&EncodedTerm>,
     ) -> RocksDbChainedDecodingQuadIterator<'a> {
-        RocksDbChainedDecodingQuadIterator::new(if graph_name.is_default_graph() {
-            self.dosp_quads(&encode_term(object))
-        } else {
-            self.gosp_quads(&encode_term_pair(graph_name, object))
+        RocksDbChainedDecodingQuadIterator::new(match graph_name {
+            None => self.dosp_quads(&encode_term(object)),
+            Some(graph_name) => self.gosp_quads(&encode_term_pair(graph_name, object)),
         })
     }
 
@@ -1220,7 +1244,10 @@ impl RocksDbStorageReadableTransaction<'_> {
         }
     }
 
-    fn clear_encoded_graph(&mut self, graph_name: &EncodedTerm) -> Result<(), StorageError> {
+    fn clear_encoded_graph(
+        &mut self,
+        graph_name: Option<&EncodedTerm>,
+    ) -> Result<(), StorageError> {
         loop {
             let quads = self
                 .reader()
@@ -1237,7 +1264,7 @@ impl RocksDbStorageReadableTransaction<'_> {
     }
 
     fn remove_encoded_named_graph(&mut self, graph_name: &EncodedTerm) -> Result<(), StorageError> {
-        self.clear_encoded_graph(graph_name)?;
+        self.clear_encoded_graph(Some(graph_name))?;
         self.buffer.clear();
         write_term(&mut self.buffer, graph_name);
         self.transaction
@@ -1348,7 +1375,7 @@ impl WriteOnlyTransaction<'_> for RocksDbStorageReadableTransaction<'_> {
     }
 
     fn clear_graph(&mut self, graph_name: GraphNameRef<'_>) -> Result<(), StorageError> {
-        self.clear_encoded_graph(&graph_name.into())
+        self.clear_encoded_graph(Some(&graph_name.into()))
     }
 
     fn clear_all_named_graphs(&mut self) -> Result<(), StorageError> {
@@ -1359,7 +1386,7 @@ impl WriteOnlyTransaction<'_> for RocksDbStorageReadableTransaction<'_> {
                 .take(BATCH_SIZE)
                 .collect::<Result<Vec<_>, _>>()?;
             for graph_name in &graph_names {
-                self.clear_encoded_graph(graph_name)?;
+                self.clear_encoded_graph(Some(graph_name))?;
             }
             if graph_names.len() < BATCH_SIZE {
                 return Ok(());

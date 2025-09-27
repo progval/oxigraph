@@ -40,19 +40,21 @@ use crate::sparql::{
 use crate::storage::map_thread_result;
 use crate::storage::numeric_encoder::{Decoder, EncodedQuad, EncodedTerm};
 use crate::storage::updatable_dataset::{
-    BulkLoader as _, ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction,
+    BulkLoader as BulkLoaderTrait, ReadWriteTransaction, Reader, UpdatableDataset,
+    WriteOnlyTransaction,
 };
 pub use crate::storage::{CorruptionError, LoaderError, SerializerError, StorageError};
 use crate::storage::{
-    DEFAULT_BULK_LOAD_BATCH_SIZE, DecodingGraphIterator, DecodingQuadIterator, Storage,
-    StorageBulkLoader, StorageReadableTransaction, StorageReader,
+    DEFAULT_BULK_LOAD_BATCH_SIZE, Storage, StorageReadableTransaction, StorageReader,
 };
+use spareval::QueryableDataset;
 #[cfg(not(target_family = "wasm"))]
 use std::cmp::max;
 use std::fmt;
 #[cfg(not(target_family = "wasm"))]
 use std::fs::File;
 use std::io::{Read, Write};
+use std::marker::PhantomData;
 use std::mem::swap;
 #[cfg(not(target_family = "wasm"))]
 use std::num::NonZero;
@@ -102,11 +104,11 @@ use std::thread::available_parallelism;
 /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
 /// ```
 #[derive(Clone)]
-pub struct Store {
-    storage: Storage,
+pub struct Store<S: UpdatableDataset<'static> = Storage> {
+    storage: S,
 }
 
-impl Store {
+impl Store<Storage> {
     /// New in-memory [`Store`] without RocksDB.
     pub fn new() -> Result<Self, StorageError> {
         Ok(Self {
@@ -135,7 +137,44 @@ impl Store {
             storage: Storage::open_read_only(path.as_ref())?,
         })
     }
+}
 
+// non-dynamically-dispatched versions of Store<Storage>
+// (except we can't implement them because MemoryStorage and RocksDbStorage are private structs
+// impl Store<MemoryStorage> {
+// New in-memory [`Store`] without RocksDB.
+// pub fn new() -> Result<Self, StorageError> {
+// Ok(Self {
+// storage: Storage::new()?,
+// })
+// }
+// }
+//
+// impl Store<RocksDbStorage> {
+// Opens a read-write [`Store`] and creates it if it does not exist yet.
+//
+// Only one read-write [`Store`] can exist at the same time.
+// If you want to have extra [`Store`] instance opened on the same data
+// use [`Store::open_read_only`].
+// #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+// pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+// Ok(Self {
+// storage: Storage::open(path.as_ref())?,
+// })
+// }
+//
+// Opens a read-only [`Store`] from disk.
+//
+// Opening as read-only while having an other process writing the database is undefined behavior.
+// #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+// pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+// Ok(Self {
+// storage: Storage::open_read_only(path.as_ref())?,
+// })
+// }
+// }
+
+impl<S: UpdatableDataset<'static>> Store<S> {
     /// Executes a [SPARQL 1.1 query](https://www.w3.org/TR/sparql11-query/).
     ///
     /// Usage example:
@@ -363,23 +402,56 @@ impl Store {
     /// assert_eq!(vec![quad], results);
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn quads_for_pattern(
-        &self,
+    pub fn quads_for_pattern<'a>(
+        &'a self,
         subject: Option<NamedOrBlankNodeRef<'_>>,
         predicate: Option<NamedNodeRef<'_>>,
         object: Option<TermRef<'_>>,
         graph_name: Option<GraphNameRef<'_>>,
-    ) -> QuadIter<'static> {
+    ) -> Result<
+        Option<QuadIter<'static, <S as UpdatableDataset<'static>>::Reader<'static>>>,
+        <<S as UpdatableDataset<'static>>::Reader<'a> as Reader<'a>>::Error,
+    > {
         let reader = self.storage.snapshot();
-        QuadIter {
+        let Some(subject) = subject
+            .map(|s| reader.internalize_term(s.into()))
+            .transpose()?
+        else {
+            // Subject is not known to the Reader, so it can't return any quad that contains it
+            return Ok(None);
+        };
+        let Some(predicate) = predicate
+            .map(|p| reader.internalize_term(p.into()))
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        let Some(object) = object
+            .map(|o| reader.internalize_term(o.into()))
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        let Some(graph_name) = graph_name
+            .map(|g| match g {
+                GraphNameRef::NamedNode(g) => reader.internalize_term(g.into()).map(Some),
+                GraphNameRef::BlankNode(g) => reader.internalize_term(g.into()).map(Some),
+                GraphNameRef::DefaultGraph => Ok(Some(None)),
+            })
+            .transpose()?
+        else {
+            // Subject is not known to the Reader, so it can't return any quad that contains it
+            return Ok(None);
+        };
+        Ok(Some(QuadIter {
             iter: reader.quads_for_pattern(
-                subject.map(EncodedTerm::from).as_ref(),
-                predicate.map(EncodedTerm::from).as_ref(),
-                object.map(EncodedTerm::from).as_ref(),
-                graph_name.map(EncodedTerm::from).as_ref(),
+                subject.as_ref(),
+                predicate.as_ref(),
+                object.as_ref(),
+                graph_name.map(|g| g.as_ref()),
             ),
             reader,
-        }
+        }))
     }
 
     /// Returns all the quads contained in the store.
@@ -401,8 +473,15 @@ impl Store {
     /// assert_eq!(vec![quad], results);
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn iter(&self) -> QuadIter<'static> {
-        self.quads_for_pattern(None, None, None, None)
+    pub fn iter<'a>(
+        &'a self,
+    ) -> Result<
+        QuadIter<'static, <S as UpdatableDataset<'static>>::Reader<'static>>,
+        <<S as UpdatableDataset<'static>>::Reader<'a> as Reader<'a>>::Error,
+    > {
+        // Can't fail to unwrap the Option<Iterator> because it is only none when one of the input
+        // term is unknown; but we gave no input term
+        Ok(self.quads_for_pattern(None, None, None, None)?.unwrap())
     }
 
     /// Checks if this store contains a given quad.
@@ -422,7 +501,7 @@ impl Store {
     /// assert!(store.contains(quad)?);
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn contains<'a>(&self, quad: impl Into<QuadRef<'a>>) -> Result<bool, StorageError> {
+    pub fn contains<'a>(&self, quad: impl Into<QuadRef<'a>>) -> Result<bool, S::Error> {
         let quad = EncodedQuad::from(quad.into());
         self.storage.snapshot().contains(&quad)
     }
@@ -443,7 +522,7 @@ impl Store {
     /// assert_eq!(2, store.len()?);
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn len(&self) -> Result<usize, StorageError> {
+    pub fn len(&self) -> Result<usize, S::Error> {
         self.storage.snapshot().len()
     }
 
@@ -462,7 +541,7 @@ impl Store {
     /// assert!(!store.is_empty()?);
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn is_empty(&self) -> Result<bool, StorageError> {
+    pub fn is_empty(&self) -> Result<bool, S::Error> {
         self.storage.snapshot().is_empty()
     }
 
@@ -502,9 +581,13 @@ impl Store {
     /// transaction.commit()?;
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn start_transaction(&self) -> Result<Transaction<'_>, StorageError> {
+    pub fn start_transaction(
+        &self,
+    ) -> Result<Transaction<'_, <S as UpdatableDataset<'static>>::ReadWriteTransaction<'_>>, S::Error>
+    {
         Ok(Transaction {
             inner: self.storage.start_readable_transaction()?,
+            marker: PhantomData,
         })
     }
 
@@ -566,6 +649,7 @@ impl Store {
             .for_update(update.try_into().map_err(Into::into)?)
             .on_store(self)
             .execute()
+            .map_err(Into::into)
     }
 
     /// Loads an RDF file under into the store.
@@ -600,11 +684,19 @@ impl Store {
     /// assert!(store.contains(QuadRef::new(ex, ex, ex, NamedNodeRef::new("http://example.com/g2")?))?);
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn load_from_reader(
-        &self,
+    pub fn load_from_reader<'a>(
+        &'a self,
         parser: impl Into<RdfParser>,
         reader: impl Read,
-    ) -> Result<(), LoaderError> {
+    ) -> Result<(), LoaderError>
+    where
+        LoaderError: From<
+            <<S as UpdatableDataset<'static>>::WriteOnlyTransaction<'a> as WriteOnlyTransaction<
+                'a,
+            >>::Error,
+        >,
+        LoaderError: From<<S as UpdatableDataset<'static>>::Error>,
+    {
         let mut transaction = self.storage.start_transaction()?;
         for quad in parser.into().rename_blank_nodes().for_reader(reader) {
             transaction.insert(quad?.as_ref());
@@ -645,11 +737,19 @@ impl Store {
     /// assert!(store.contains(QuadRef::new(ex, ex, ex, NamedNodeRef::new("http://example.com/g2")?))?);
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn load_from_slice(
-        &self,
+    pub fn load_from_slice<'a>(
+        &'a self,
         parser: impl Into<RdfParser>,
-        slice: &(impl AsRef<[u8]> + ?Sized),
-    ) -> Result<(), LoaderError> {
+        slice: &'a (impl AsRef<[u8]> + ?Sized),
+    ) -> Result<(), LoaderError>
+    where
+        LoaderError: From<
+            <<S as UpdatableDataset<'static>>::WriteOnlyTransaction<'a> as WriteOnlyTransaction<
+                'a,
+            >>::Error,
+        >,
+        LoaderError: From<<S as UpdatableDataset<'static>>::Error>,
+    {
         let mut transaction = self.storage.start_transaction()?;
         for quad in parser.into().rename_blank_nodes().for_slice(slice.as_ref()) {
             transaction.insert(quad.map_err(RdfParseError::Syntax)?.as_ref());
@@ -676,7 +776,7 @@ impl Store {
     /// assert!(store.contains(quad)?);
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn insert<'a>(&self, quad: impl Into<QuadRef<'a>>) -> Result<(), StorageError> {
+    pub fn insert<'a>(&self, quad: impl Into<QuadRef<'a>>) -> Result<(), S::Error> {
         let mut transaction = self.storage.start_transaction()?;
         transaction.insert(quad.into());
         transaction.commit()?;
@@ -688,10 +788,7 @@ impl Store {
     /// <div class="warning">
     ///
     /// This operation uses a memory heavy transaction internally, use the [`bulk_loader`](Store::bulk_loader) if you plan to add ten of millions of triples.</div>
-    pub fn extend(
-        &self,
-        quads: impl IntoIterator<Item = impl Into<Quad>>,
-    ) -> Result<(), StorageError> {
+    pub fn extend(&self, quads: impl IntoIterator<Item = impl Into<Quad>>) -> Result<(), S::Error> {
         let mut transaction = self.storage.start_transaction()?;
         for quad in quads {
             transaction.insert(quad.into().as_ref());
@@ -719,7 +816,7 @@ impl Store {
     /// assert!(!store.contains(quad)?);
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn remove<'a>(&self, quad: impl Into<QuadRef<'a>>) -> Result<(), StorageError> {
+    pub fn remove<'a>(&self, quad: impl Into<QuadRef<'a>>) -> Result<(), S::Error> {
         let mut transaction = self.storage.start_transaction()?;
         transaction.remove(quad.into());
         transaction.commit()?;
@@ -746,13 +843,16 @@ impl Store {
         &self,
         serializer: impl Into<RdfSerializer>,
         writer: W,
-    ) -> Result<W, SerializerError> {
+    ) -> Result<W, SerializerError>
+    where
+        SerializerError: From<<S as UpdatableDataset<'static>>::Error>,
+    {
         let serializer = serializer.into();
         if !serializer.format().supports_datasets() {
             return Err(SerializerError::DatasetFormatExpected(serializer.format()));
         }
         let mut serializer = serializer.for_writer(writer);
-        for quad in self {
+        for quad in self.iter()? {
             serializer.serialize_quad(&quad?)?;
         }
         Ok(serializer.finish()?)
@@ -781,10 +881,17 @@ impl Store {
         from_graph_name: impl Into<GraphNameRef<'a>>,
         serializer: impl Into<RdfSerializer>,
         writer: W,
-    ) -> Result<W, SerializerError> {
+    ) -> Result<W, SerializerError>
+    where
+        SerializerError: From<<S as UpdatableDataset<'static>>::Error>,
+    {
         let mut serializer = serializer.into().for_writer(writer);
-        for quad in self.quads_for_pattern(None, None, None, Some(from_graph_name.into())) {
-            serializer.serialize_triple(quad?.as_ref())?;
+        if let Some(quads) =
+            self.quads_for_pattern(None, None, None, Some(from_graph_name.into()))?
+        {
+            for quad in quads {
+                serializer.serialize_triple(quad?.as_ref())?;
+            }
         }
         Ok(serializer.finish()?)
     }
@@ -806,7 +913,9 @@ impl Store {
     /// );
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn named_graphs(&self) -> GraphNameIter<'static> {
+    pub fn named_graphs(
+        &self,
+    ) -> GraphNameIter<'static, <S as UpdatableDataset<'static>>::Reader<'static>> {
         let reader = self.storage.snapshot();
         GraphNameIter {
             iter: reader.named_graphs(),
@@ -830,9 +939,12 @@ impl Store {
     pub fn contains_named_graph<'a>(
         &self,
         graph_name: impl Into<NamedOrBlankNodeRef<'a>>,
-    ) -> Result<bool, StorageError> {
-        let graph_name = EncodedTerm::from(graph_name.into());
-        self.storage.snapshot().contains_named_graph(&graph_name)
+    ) -> Result<bool, S::Error> {
+        let reader = self.storage.snapshot();
+        match reader.internalize_term(graph_name.into().into())? {
+            Some(graph_name) => reader.contains_named_graph(&graph_name),
+            None => Ok(false),
+        }
     }
 
     /// Inserts a graph into this store.
@@ -857,7 +969,7 @@ impl Store {
     pub fn insert_named_graph<'a>(
         &self,
         graph_name: impl Into<NamedOrBlankNodeRef<'a>>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<(), S::Error> {
         let mut transaction = self.storage.start_transaction()?;
         transaction.insert_named_graph(graph_name.into());
         transaction.commit()?;
@@ -882,10 +994,7 @@ impl Store {
     /// assert_eq!(1, store.named_graphs().count());
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn clear_graph<'a>(
-        &self,
-        graph_name: impl Into<GraphNameRef<'a>>,
-    ) -> Result<(), StorageError> {
+    pub fn clear_graph<'a>(&self, graph_name: impl Into<GraphNameRef<'a>>) -> Result<(), S::Error> {
         let graph_name = graph_name.into();
         if graph_name.is_default_graph() {
             let mut transaction = self.storage.start_transaction()?;
@@ -921,7 +1030,7 @@ impl Store {
     pub fn remove_named_graph<'a>(
         &self,
         graph_name: impl Into<NamedOrBlankNodeRef<'a>>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<(), S::Error> {
         let mut transaction = self.storage.start_readable_transaction()?;
         transaction.remove_named_graph(graph_name.into())?;
         transaction.commit()?;
@@ -945,7 +1054,7 @@ impl Store {
     /// assert!(store.is_empty()?);
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn clear(&self) -> Result<(), StorageError> {
+    pub fn clear(&self) -> Result<(), S::Error> {
         let mut transaction = self.storage.start_transaction()?;
         transaction.clear()?;
         transaction.commit()
@@ -955,7 +1064,7 @@ impl Store {
     ///
     /// Flushes are automatically done using background threads but might lag a little bit.
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
-    pub fn flush(&self) -> Result<(), StorageError> {
+    pub fn flush(&self) -> Result<(), S::Error> {
         self.storage.flush()
     }
 
@@ -965,7 +1074,7 @@ impl Store {
     ///
     /// <div class="warning">Can take hours on huge databases.</div>
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
-    pub fn optimize(&self) -> Result<(), StorageError> {
+    pub fn optimize(&self) -> Result<(), S::Error> {
         self.storage.compact()
     }
 
@@ -988,7 +1097,7 @@ impl Store {
     ///
     /// If you want to move your data to another RDF storage system, you should have a look at the [`Store::dump_to_writer`] function instead.
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
-    pub fn backup(&self, target_directory: impl AsRef<Path>) -> Result<(), StorageError> {
+    pub fn backup(&self, target_directory: impl AsRef<Path>) -> Result<(), S::Error> {
         self.storage.backup(target_directory.as_ref())
     }
 
@@ -1014,42 +1123,40 @@ impl Store {
     /// assert!(store.contains(QuadRef::new(ex, ex, ex, ex))?);
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn bulk_loader(&self) -> Result<BulkLoader<'_>, StorageError> {
+    pub fn bulk_loader(
+        &self,
+    ) -> Result<BulkLoader<'_, <S as UpdatableDataset<'static>>::BulkLoader<'_>>, S::Error> {
         Ok(BulkLoader {
             storage: self.storage.bulk_loader()?,
             num_threads: None,
             max_memory_size: None,
             on_parse_error: None,
+            marker: PhantomData,
         })
     }
 
     /// Validate that all the store invariants held in the data
     #[doc(hidden)]
-    pub fn validate(&self) -> Result<(), StorageError> {
+    pub fn validate(&self) -> Result<(), S::Error> {
         self.storage.snapshot().validate()
     }
 
-    pub(super) fn storage(&self) -> &Storage {
+    pub(super) fn storage(&self) -> &S {
         &self.storage
     }
 }
 
 impl fmt::Display for Store {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for t in self {
-            writeln!(f, "{} .", t.map_err(|_| fmt::Error)?)?;
+        match self.iter() {
+            Ok(iter) => {
+                for t in iter {
+                    writeln!(f, "{} .", t.map_err(|_| fmt::Error)?)?;
+                }
+                Ok(())
+            }
+            Err(e) => writeln!(f, "<Cannot read Store: {e}"),
         }
-        Ok(())
-    }
-}
-
-impl IntoIterator for &Store {
-    type IntoIter = QuadIter<'static>;
-    type Item = Result<Quad, StorageError>;
-
-    #[inline]
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
     }
 }
 
@@ -1057,11 +1164,12 @@ impl IntoIterator for &Store {
 ///
 /// See [`Store::start_transaction`] for a more detailed description.
 #[must_use]
-pub struct Transaction<'a> {
-    inner: StorageReadableTransaction<'a>,
+pub struct Transaction<'a, T: ReadWriteTransaction<'a> = StorageReadableTransaction<'a>> {
+    inner: T,
+    marker: PhantomData<&'a ()>,
 }
 
-impl<'a> Transaction<'a> {
+impl<'a, T: ReadWriteTransaction<'a>> Transaction<'a, T> {
     /// Executes a [SPARQL 1.1 query](https://www.w3.org/TR/sparql11-query/).
     ///
     /// Usage example:
@@ -1184,32 +1292,70 @@ impl<'a> Transaction<'a> {
     /// transaction.commit()?;
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
-    pub fn quads_for_pattern(
-        &self,
-        subject: Option<NamedOrBlankNodeRef<'_>>,
-        predicate: Option<NamedNodeRef<'_>>,
-        object: Option<TermRef<'_>>,
-        graph_name: Option<GraphNameRef<'_>>,
-    ) -> QuadIter<'_> {
+    pub fn quads_for_pattern<'b>(
+        &'b self,
+        subject: Option<NamedOrBlankNodeRef<'b>>,
+        predicate: Option<NamedNodeRef<'b>>,
+        object: Option<TermRef<'b>>,
+        graph_name: Option<GraphNameRef<'b>>,
+    ) -> Result<
+        Option<QuadIter<'b, <T as ReadWriteTransaction<'a>>::Reader<'b>>>,
+        <T as WriteOnlyTransaction<'a>>::Error,
+    > {
         let reader = self.inner.reader();
-        QuadIter {
+        let Some(subject) = subject
+            .map(|s| reader.internalize_term(s.into()))
+            .transpose()?
+        else {
+            // Subject is not known to the Reader, so it can't return any quad that contains it
+            return Ok(None);
+        };
+        let Some(predicate) = predicate
+            .map(|p| reader.internalize_term(p.into()))
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        let Some(object) = object
+            .map(|o| reader.internalize_term(o.into()))
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        let Some(graph_name) = graph_name
+            .map(|g| match g {
+                GraphNameRef::NamedNode(g) => reader.internalize_term(g.into()).map(Some),
+                GraphNameRef::BlankNode(g) => reader.internalize_term(g.into()).map(Some),
+                GraphNameRef::DefaultGraph => Ok(Some(None)),
+            })
+            .transpose()?
+        else {
+            // Subject is not known to the Reader, so it can't return any quad that contains it
+            return Ok(None);
+        };
+        Ok(Some(QuadIter {
             iter: reader.quads_for_pattern(
-                subject.map(EncodedTerm::from).as_ref(),
-                predicate.map(EncodedTerm::from).as_ref(),
-                object.map(EncodedTerm::from).as_ref(),
-                graph_name.map(EncodedTerm::from).as_ref(),
+                subject.as_ref(),
+                predicate.as_ref(),
+                object.as_ref(),
+                graph_name.map(|g| g.as_ref()),
             ),
             reader,
-        }
+        }))
     }
 
     /// Returns all the quads contained in the store.
-    pub fn iter(&self) -> QuadIter<'_> {
+    pub fn iter<'b>(
+        &'b self,
+    ) -> Result<
+        Option<QuadIter<'b, <T as ReadWriteTransaction<'a>>::Reader<'b>>>,
+        <T as WriteOnlyTransaction<'a>>::Error,
+    > {
         self.quads_for_pattern(None, None, None, None)
     }
 
     /// Checks if this store contains a given quad.
-    pub fn contains<'b>(&self, quad: impl Into<QuadRef<'b>>) -> Result<bool, StorageError> {
+    pub fn contains<'b>(&self, quad: impl Into<QuadRef<'b>>) -> Result<bool, <T as WriteOnlyTransaction<'a>>::Error> {
         let quad = EncodedQuad::from(quad.into());
         self.inner.reader().contains(&quad)
     }
@@ -1217,12 +1363,12 @@ impl<'a> Transaction<'a> {
     /// Returns the number of quads in the store.
     ///
     /// <div class="warning">this function executes a full scan.</div>
-    pub fn len(&self) -> Result<usize, StorageError> {
+    pub fn len(&self) -> Result<usize, <T as WriteOnlyTransaction<'a>>::Error> {
         self.inner.reader().len()
     }
 
     /// Returns if the store is empty.
-    pub fn is_empty(&self) -> Result<bool, StorageError> {
+    pub fn is_empty(&self) -> Result<bool, <T as WriteOnlyTransaction<'a>>::Error> {
         self.inner.reader().is_empty()
     }
 
@@ -1268,7 +1414,7 @@ impl<'a> Transaction<'a> {
     ) -> Result<(), UpdateEvaluationError> {
         options
             .for_update(update.try_into().map_err(Into::into)?)
-            .on_transaction(self)
+            .on_transaction::<S>(self)
             .execute()
     }
 
@@ -1571,11 +1717,11 @@ impl<'a> Transaction<'a> {
         self.inner.commit()
     }
 
-    pub(super) fn inner(&self) -> &StorageReadableTransaction<'a> {
+    pub(super) fn inner(&self) -> &S::ReadWriteTransaction<'a> {
         &self.inner
     }
 
-    pub(super) fn inner_mut(&mut self) -> &mut StorageReadableTransaction<'a> {
+    pub(super) fn inner_mut(&mut self) -> &mut S::ReadWriteTransaction<'a> {
         &mut self.inner
     }
 }
@@ -1592,13 +1738,13 @@ impl<'a> IntoIterator for &'a Transaction<'_> {
 
 /// An iterator returning the quads contained in a [`Store`].
 #[must_use]
-pub struct QuadIter<'a> {
-    iter: DecodingQuadIterator<'a>,
-    reader: StorageReader<'a>,
+pub struct QuadIter<'a, R: Reader<'a> + 'a = StorageReader<'a>> {
+    iter: R::QuadIterator<'a>,
+    reader: R,
 }
 
-impl Iterator for QuadIter<'_> {
-    type Item = Result<Quad, StorageError>;
+impl<'a, R: Reader<'a>> Iterator for QuadIter<'a, R> {
+    type Item = Result<Quad, R::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         Some(match self.iter.next()? {
@@ -1610,20 +1756,31 @@ impl Iterator for QuadIter<'_> {
 
 /// An iterator returning the graph names contained in a [`Store`].
 #[must_use]
-pub struct GraphNameIter<'a> {
-    iter: DecodingGraphIterator<'a>,
-    reader: StorageReader<'a>,
+pub struct GraphNameIter<'a, R: Reader<'a> + 'a = StorageReader<'a>> {
+    iter: R::TermIterator<'a>,
+    reader: R,
 }
 
-impl Iterator for GraphNameIter<'_> {
+impl<'a, R: Reader<'a>> Iterator for GraphNameIter<'a, R> {
     type Item = Result<NamedOrBlankNode, StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        Some(
-            self.iter
-                .next()?
-                .and_then(|graph_name| self.reader.decode_named_or_blank_node(&graph_name)),
-        )
+        Some(self.iter.next()?.and_then(|graph_name| {
+            // FIXME: dedup with Decoder::decode_named_or_blank_node()
+            match self.reader.externalize_term(&graph_name)? {
+                Term::NamedNode(named_node) => Ok(named_node.into()),
+                Term::BlankNode(blank_node) => Ok(blank_node.into()),
+                Term::Literal(_) => Err(CorruptionError::msg(
+                    "A literal has been found instead of a named or blank node",
+                )
+                .into()),
+                #[cfg(feature = "rdf-12")]
+                Term::Triple(_) => Err(CorruptionError::msg(
+                    "A triple has been found instead of a named or blank node",
+                )
+                .into()),
+            }
+        }))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1660,14 +1817,15 @@ impl Iterator for GraphNameIter<'_> {
 /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
 /// ```
 #[must_use]
-pub struct BulkLoader<'a> {
-    storage: StorageBulkLoader<'a>,
+pub struct BulkLoader<'a, B: BulkLoaderTrait<'a>> {
+    storage: B,
     num_threads: Option<usize>,
     max_memory_size: Option<usize>,
     on_parse_error: Option<Arc<dyn Fn(RdfParseError) -> Result<(), RdfParseError> + Send + Sync>>,
+    marker: PhantomData<&'a ()>,
 }
 
-impl BulkLoader<'_> {
+impl<'a, B: BulkLoaderTrait<'a>> BulkLoader<'a, B> {
     /// Sets the maximal number of background threads to be used by the bulk loader.
     ///
     /// The default value is the number of threads on the machine.
