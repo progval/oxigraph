@@ -1,5 +1,5 @@
 #![allow(clippy::print_stderr, clippy::cast_precision_loss, clippy::use_debug)]
-use crate::cli::{Args, Command};
+use crate::cli::{Args, Command, DatabaseFormat};
 use crate::service_description::{EndpointKind, generate_service_description};
 use anyhow::{Context, bail, ensure};
 use clap::Parser;
@@ -14,7 +14,7 @@ use oxhttp::model::uri::PathAndQuery;
 use oxhttp::model::{Body, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use oxigraph::io::{JsonLdProfileSet, LoadedDocument, RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::{
-    GraphName, GraphNameRef, IriParseError, NamedNode, NamedNodeRef, NamedOrBlankNode,
+    GraphName, GraphNameRef, IriParseError, NamedNode, NamedNodeRef, NamedOrBlankNode, Quad,
 };
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
 use oxigraph::sparql::{CancellationToken, QueryResults, SparqlEvaluator};
@@ -54,50 +54,95 @@ const YASGUI_JS: &str = include_str!("../templates/yasgui/yasgui.min.js");
 const YASGUI_CSS: &str = include_str!("../templates/yasgui/yasgui.min.css");
 const LOGO: &str = include_str!("../logo.svg");
 
+#[derive(Clone)]
+enum Database {
+    Store(Store),
+}
+
+impl From<Store> for Database {
+    fn from(store: Store) -> Self {
+        Self::Store(store)
+    }
+}
+
+impl Database {
+    fn open(format: DatabaseFormat, location: &Path) -> anyhow::Result<Self> {
+        match format {
+            DatabaseFormat::Autodetect | DatabaseFormat::Rocksdb => {
+                Ok(Store::open(location)?.into())
+            }
+        }
+    }
+
+    fn open_read_only(format: DatabaseFormat, location: &Path) -> anyhow::Result<Self> {
+        match format {
+            DatabaseFormat::Autodetect | DatabaseFormat::Rocksdb => {
+                Ok(Store::open_read_only(location)?.into())
+            }
+        }
+    }
+
+    #[expect(clippy::unnecessary_wraps)] // we are going to add support for other bulk loaders later
+    fn bulk_loader(&self) -> anyhow::Result<BulkLoader<'_>> {
+        match self {
+            Self::Store(store) => Ok(store.bulk_loader()),
+        }
+    }
+}
+
 pub fn main() -> anyhow::Result<()> {
     let matches = Args::parse();
     match matches.command {
         Command::Serve {
+            database_format,
             location,
             bind,
             cors,
             union_default_graph,
             timeout_s,
-        } => serve(
-            if let Some(location) = location {
-                Store::open(location)
-            } else {
-                Store::new()
-            }?,
-            &bind,
-            false,
-            cors,
-            union_default_graph,
-            timeout_s,
-        ),
+        } => match database_format {
+            DatabaseFormat::Autodetect | DatabaseFormat::Rocksdb => serve(
+                if let Some(location) = location {
+                    Store::open(location)
+                } else {
+                    Store::new()
+                }?
+                .into(),
+                &bind,
+                false,
+                cors,
+                union_default_graph,
+                timeout_s,
+            ),
+        },
         Command::ServeReadOnly {
+            database_format,
             location,
             bind,
             cors,
             union_default_graph,
             timeout_s,
         } => serve(
-            Store::open_read_only(location)?,
+            Database::open_read_only(database_format, &location)?,
             &bind,
             true,
             cors,
             union_default_graph,
             timeout_s,
         ),
+
         Command::Backup {
+            database_format,
             location,
             destination,
         } => {
-            let store = Store::open_read_only(location)?;
-            store.backup(destination)?;
+            match Database::open_read_only(database_format, &location)? {
+                Database::Store(store) => store.backup(destination)?,
+            }
             Ok(())
         }
         Command::Load {
+            database_format,
             location,
             file,
             non_atomic,
@@ -106,7 +151,7 @@ pub fn main() -> anyhow::Result<()> {
             base,
             graph,
         } => {
-            let store = Store::open(&location)?;
+            let database = Database::open(database_format, &location)?;
             let format = if let Some(format) = format {
                 Some(rdf_format_from_name(&format)?)
             } else {
@@ -124,7 +169,7 @@ pub fn main() -> anyhow::Result<()> {
             if file.is_empty() {
                 // We read from stdin
                 let start = Instant::now();
-                let mut loader = store.bulk_loader().on_progress(move |size| {
+                let mut loader = database.bulk_loader()?.on_progress(move |size| {
                     let elapsed = start.elapsed();
                     eprintln!(
                         "{size} triples loaded in {}s ({} t/s)",
@@ -151,84 +196,96 @@ pub fn main() -> anyhow::Result<()> {
                 )?;
                 loader.commit()?;
             } else {
+
                 ThreadPoolBuilder::new()
                     .num_threads(max(1, available_parallelism()?.get() / 2))
                     .thread_name(|i| format!("Oxigraph bulk loader thread {i}"))
                     .build()?
-                    .scope(|s| {
+                    .scope(|s| -> anyhow::Result<()> {
+                        let (result_sender, result_receiver) = std::sync::mpsc::channel();
                         for file in file {
-                            let store = store.clone();
+                            let result_sender = result_sender.clone();
+                            let database = database.clone();
                             let graph = graph.clone();
                             let base = base.clone();
                             s.spawn(move |_| {
-                                let f = file.clone();
-                                let start = Instant::now();
-                                let mut loader = store.bulk_loader().on_progress(move |size| {
-                                    let elapsed = start.elapsed();
-                                    eprintln!(
-                                        "{} triples loaded in {}s ({} t/s) from {}",
-                                        size,
-                                        elapsed.as_secs(),
-                                        ((size as f64) / elapsed.as_secs_f64()).round(),
-                                        f.display()
-                                    )
-                                });
-                                if lenient {
+                                let result = (|| {
                                     let f = file.clone();
-                                    loader = loader.on_parse_error(move |e| {
-                                        eprintln!("Parsing error on file {}: {}", f.display(), e);
-                                        Ok(())
-                                    })
-                                }
-                                if let Err(error) = {
-                                    if file.extension().is_some_and(|e| e == OsStr::new("gz")) {
-                                        let fp = match File::open(&file) {
-                                            Ok(fp) => fp,
-                                            Err(error) => {
-                                                eprintln!(
-                                                    "Error while opening file {}: {}",
-                                                    file.display(),
-                                                    error
-                                                );
-                                                return;
-                                            }
-                                        };
-                                        bulk_load_read(
-                                            &mut loader,
-                                            MultiGzDecoder::new(fp),
-                                            format.unwrap_or_else(|| {
-                                                rdf_format_from_path(&file.with_extension(""))
-                                                    .unwrap()
-                                            }),
-                                            base.as_deref(),
-                                            graph,
-                                            lenient,
-                                        )
-                                    } else {
-                                        bulk_load_file(
-                                            &mut loader,
-                                            &file,
-                                            format.unwrap_or_else(|| {
-                                                rdf_format_from_path(&file).unwrap()
-                                            }),
-                                            base.as_deref(),
-                                            graph,
-                                            lenient,
-                                        )
+                                    let start = Instant::now();
+                                    let mut loader =
+                                        database.bulk_loader()?.on_progress(move |size| {
+                                            let elapsed = start.elapsed();
+                                            eprintln!(
+                                                "{} triples loaded in {}s ({} t/s) from {}",
+                                                size,
+                                                elapsed.as_secs(),
+                                                ((size as f64) / elapsed.as_secs_f64()).round(),
+                                                f.display()
+                                            )
+                                        });
+                                    if lenient {
+                                        let f = file.clone();
+                                        loader = loader.on_parse_error(move |e| {
+                                            eprintln!("Parsing error on file {}: {}", f.display(), e);
+                                            Ok(())
+                                        })
                                     }
-                                } {
-                                    eprintln!(
-                                        "Error while loading file {}: {}",
-                                        file.display(),
-                                        error
-                                    )
-                                    // TODO: hard fail
-                                } else if let Err(e) = loader.commit() {
-                                    eprintln!("Failed to save triples: {e}")
-                                }
+                                    if let Err(error) = {
+                                        if file.extension().is_some_and(|e| e == OsStr::new("gz")) {
+                                            let fp = match File::open(&file) {
+                                                Ok(fp) => fp,
+                                                Err(error) => {
+                                                    bail!(
+                                                        "Error while opening file {}: {}",
+                                                        file.display(),
+                                                        error
+                                                    );
+                                                }
+                                            };
+                                            bulk_load_read(
+                                                &mut loader,
+                                                MultiGzDecoder::new(fp),
+                                                format.unwrap_or_else(|| {
+                                                    rdf_format_from_path(&file.with_extension(""))
+                                                        .unwrap()
+                                                }),
+                                                base.as_deref(),
+                                                graph,
+                                                lenient,
+                                            )
+                                        } else {
+                                            bulk_load_file(
+                                                &mut loader,
+                                                &file,
+                                                format.unwrap_or_else(|| {
+                                                    rdf_format_from_path(&file).unwrap()
+                                                }),
+                                                base.as_deref(),
+                                                graph,
+                                                lenient,
+                                            )
+                                        }
+                                    } {
+                                        bail!(
+                                            "Error while loading file {}: {}",
+                                            file.display(),
+                                            error
+                                        );
+                                    } else if let Err(e) = loader.commit() {
+                                        bail!("Failed to save triples: {e}");
+                                    }
+
+                                    Ok(())
+                                })();
+                                #[expect(clippy::expect_used)] // spawned closures can't return Result
+                                result_sender.send(result).expect("Result receiver unexpectedly closed");
                             })
                         }
-                    });
+                        while let Ok(result) = result_receiver.recv() {
+                            result?;
+                        }
+                        Ok(())
+                    })?;
             }
             eprintln!(
                 "If you plan to run a read-heavy workload, consider running `oxigraph optimize -l {}` before",
@@ -237,12 +294,13 @@ pub fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Dump {
+            database_format,
             location,
             file,
             format,
             graph,
         } => {
-            let store = Store::open_read_only(location)?;
+            let database = Database::open_read_only(database_format, &location)?;
             let format = if let Some(format) = format {
                 rdf_format_from_name(&format)?
             } else if let Some(file) = &file {
@@ -263,17 +321,18 @@ pub fn main() -> anyhow::Result<()> {
             };
             if let Some(file) = file {
                 close_file_writer(dump(
-                    &store,
+                    &database,
                     BufWriter::new(File::create(file)?),
                     format,
                     graph,
                 )?)?;
             } else {
-                dump(&store, stdout().lock(), format, graph)?.flush()?;
+                dump(&database, stdout().lock(), format, graph)?.flush()?;
             }
             Ok(())
         }
         Command::Query {
+            database_format,
             location,
             query,
             query_file,
@@ -285,6 +344,7 @@ pub fn main() -> anyhow::Result<()> {
             stats,
             union_default_graph,
         } => {
+            let database = Database::open_read_only(database_format, &location)?;
             let query = if let Some(query) = query {
                 query
             } else if let Some(query_file) = query_file {
@@ -294,7 +354,6 @@ pub fn main() -> anyhow::Result<()> {
             } else {
                 io::read_to_string(stdin().lock())?
             };
-            let store = Store::open_read_only(location)?;
             let mut evaluator = default_sparql_evaluator();
             if let Some(base) = query_base {
                 evaluator = evaluator.with_base_iri(&base)?;
@@ -303,11 +362,16 @@ pub fn main() -> anyhow::Result<()> {
             if union_default_graph {
                 prepared.dataset_mut().set_default_graph_as_union();
             }
-            let mut prepared = prepared.on_store(&store);
-            if stats {
-                prepared = prepared.compute_statistics();
-            }
-            let (results, explanation) = prepared.explain();
+
+            let (results, explanation) = match database {
+                Database::Store(store) => {
+                    let mut prepared = prepared.on_store(&store);
+                    if stats {
+                        prepared = prepared.compute_statistics();
+                    }
+                    prepared.explain()
+                }
+            };
             let print_result = (|| {
                 match results? {
                     QueryResults::Solutions(solutions) => {
@@ -432,6 +496,7 @@ pub fn main() -> anyhow::Result<()> {
             print_result
         }
         Command::Update {
+            database_format,
             location,
             update,
             update_file,
@@ -446,20 +511,26 @@ pub fn main() -> anyhow::Result<()> {
             } else {
                 io::read_to_string(stdin().lock())?
             };
-            let store = Store::open(location)?;
+            let database = Database::open(database_format, &location)?;
             let mut evaluator = default_sparql_evaluator();
             if let Some(base) = update_base {
                 evaluator = evaluator.with_base_iri(&base)?;
             }
-            evaluator
-                .parse_update(&update)?
-                .on_store(&store)
-                .execute()?;
+            match database {
+                Database::Store(store) => evaluator
+                    .parse_update(&update)?
+                    .on_store(&store)
+                    .execute()?,
+            }
             Ok(())
         }
-        Command::Optimize { location } => {
-            let store = Store::open(location)?;
-            store.optimize()?;
+        Command::Optimize {
+            database_format,
+            location,
+        } => {
+            match Database::open(database_format, &location)? {
+                Database::Store(store) => store.optimize()?,
+            }
             Ok(())
         }
         Command::Convert {
@@ -614,7 +685,7 @@ fn bulk_load_file(
 }
 
 fn dump<W: Write>(
-    store: &Store,
+    database: &Database,
     writer: W,
     format: RdfFormat,
     from_graph_name: Option<GraphNameRef<'_>>,
@@ -623,11 +694,13 @@ fn dump<W: Write>(
         format.supports_datasets() || from_graph_name.is_some(),
         "The --graph option is required when writing a format not supporting datasets like NTriples, Turtle or RDF/XML. Use --graph \"default\" to dump only the default graph."
     );
-    Ok(if let Some(from_graph_name) = from_graph_name {
-        store.dump_graph_to_writer(from_graph_name, format, writer)
-    } else {
-        store.dump_to_writer(format, writer)
-    }?)
+    match database {
+        Database::Store(store) => Ok(if let Some(from_graph_name) = from_graph_name {
+            store.dump_graph_to_writer(from_graph_name, format, writer)
+        } else {
+            store.dump_to_writer(format, writer)
+        }?),
+    }
 }
 
 fn do_convert<R: Read, W: Write>(
@@ -735,7 +808,7 @@ fn rdf_format_from_name(name: &str) -> anyhow::Result<RdfFormat> {
 }
 
 fn serve(
-    store: Store,
+    database: Database,
     bind: &str,
     read_only: bool,
     cors: bool,
@@ -747,7 +820,7 @@ fn serve(
         Server::new(cors_middleware(move |request| {
             handle_request(
                 request,
-                store.clone(),
+                database.clone(),
                 read_only,
                 union_default_graph,
                 timeout,
@@ -758,7 +831,7 @@ fn serve(
         Server::new(move |request| {
             handle_request(
                 request,
-                store.clone(),
+                database.clone(),
                 read_only,
                 union_default_graph,
                 timeout,
@@ -816,7 +889,7 @@ type HttpError = (StatusCode, String);
 
 fn handle_request(
     request: &mut Request<Body>,
-    store: Store,
+    database: Database,
     read_only: bool,
     union_default_graph: bool,
     timeout: Option<Duration>,
@@ -866,7 +939,7 @@ fn handle_request(
                     .map_err(internal_server_error)
             } else {
                 configure_and_evaluate_sparql_query(
-                    &store,
+                    &database,
                     &[url_query(request)],
                     None,
                     request,
@@ -881,7 +954,7 @@ fn handle_request(
             if content_type == "application/sparql-query" {
                 let query = limited_string_body(request)?;
                 configure_and_evaluate_sparql_query(
-                    &store,
+                    &database,
                     &[url_query(request)],
                     Some(query),
                     request,
@@ -891,7 +964,7 @@ fn handle_request(
             } else if content_type == "application/x-www-form-urlencoded" {
                 let buffer = limited_body(request)?;
                 configure_and_evaluate_sparql_query(
-                    &store,
+                    &database,
                     &[url_query(request), &buffer],
                     None,
                     request,
@@ -923,7 +996,7 @@ fn handle_request(
             if content_type == "application/sparql-update" {
                 let update = limited_string_body(request)?;
                 configure_and_evaluate_sparql_update(
-                    &store,
+                    &database,
                     &[url_query(request)],
                     Some(update),
                     request,
@@ -932,7 +1005,7 @@ fn handle_request(
             } else if content_type == "application/x-www-form-urlencoded" {
                 let buffer = limited_body(request)?;
                 configure_and_evaluate_sparql_update(
-                    &store,
+                    &database,
                     &[url_query(request), &buffer],
                     None,
                     request,
@@ -944,53 +1017,74 @@ fn handle_request(
         }
         (path, "GET") if path.starts_with("/store") => {
             if let Some(target) = store_target(request)? {
-                assert_that_graph_exists(&store, &target)?;
+                fn build_response<E>(
+                    format: RdfFormat,
+                    quads: impl Iterator<Item = Result<Quad, E>> + 'static,
+                ) -> Result<Response<Body>, (StatusCode, String)>
+                where
+                    io::Error: From<E>,
+                {
+                    ReadForWrite::build_response(
+                        move |w| Ok((RdfSerializer::from_format(format).for_writer(w), quads)),
+                        |(mut serializer, mut quads)| {
+                            Ok(if let Some(q) = quads.next() {
+                                serializer.serialize_triple(&q?.into())?;
+                                Some((serializer, quads))
+                            } else {
+                                serializer.finish()?;
+                                None
+                            })
+                        },
+                        format.media_type(),
+                    )
+                }
+
+                assert_that_graph_exists(&database, &target)?;
                 let format = rdf_content_negotiation(request)?;
 
-                let quads = store.quads_for_pattern(
-                    None,
-                    None,
-                    None,
-                    Some(GraphName::from(target).as_ref()),
-                );
-                ReadForWrite::build_response(
-                    move |w| Ok((RdfSerializer::from_format(format).for_writer(w), quads)),
-                    |(mut serializer, mut quads)| {
-                        Ok(if let Some(q) = quads.next() {
-                            serializer.serialize_triple(&q?.into())?;
-                            Some((serializer, quads))
-                        } else {
-                            serializer.finish()?;
-                            None
-                        })
-                    },
-                    format.media_type(),
-                )
+                match database {
+                    Database::Store(store) => {
+                        let quads = store.quads_for_pattern(
+                            None,
+                            None,
+                            None,
+                            Some(GraphName::from(target).as_ref()),
+                        );
+                        build_response(format, quads)
+                    }
+                }
             } else {
+                fn build_response<E>(
+                    format: RdfFormat,
+                    quads: impl Iterator<Item = Result<Quad, E>> + 'static,
+                ) -> Result<Response<Body>, (StatusCode, String)>
+                where
+                    io::Error: From<E>,
+                {
+                    ReadForWrite::build_response(
+                        move |w| Ok((RdfSerializer::from_format(format).for_writer(w), quads)),
+                        |(mut serializer, mut quads)| {
+                            Ok(if let Some(q) = quads.next() {
+                                serializer.serialize_quad(&q?)?;
+                                Some((serializer, quads))
+                            } else {
+                                serializer.finish()?;
+                                None
+                            })
+                        },
+                        format.media_type(),
+                    )
+                }
+
                 let format = rdf_content_negotiation(request)?;
                 if !format.supports_datasets() {
                     return Err(bad_request(format!(
                         "It is not possible to serialize the full RDF dataset using {format} that does not support named graphs"
                     )));
                 }
-                ReadForWrite::build_response(
-                    move |w| {
-                        Ok((
-                            RdfSerializer::from_format(format).for_writer(w),
-                            store.iter(),
-                        ))
-                    },
-                    |(mut serializer, mut quads)| {
-                        Ok(if let Some(q) = quads.next() {
-                            serializer.serialize_quad(&q?)?;
-                            Some((serializer, quads))
-                        } else {
-                            serializer.finish()?;
-                            None
-                        })
-                    },
-                    format.media_type(),
-                )
+                match database {
+                    Database::Store(store) => build_response(format, store.iter()),
+                }
             }
         }
         (path, "PUT") if path.starts_with("/store") => {
@@ -999,83 +1093,91 @@ fn handle_request(
             }
             let content_type =
                 content_type(request).ok_or_else(|| bad_request("No Content-Type given"))?;
-            if let Some(target) = store_target(request)? {
-                let format = RdfFormat::from_media_type(&content_type)
-                    .ok_or_else(|| unsupported_media_type(&content_type))?;
-                let new = !match &target {
-                    NamedGraphName::NamedNode(target) => {
-                        if store
-                            .contains_named_graph(target)
-                            .map_err(internal_server_error)?
-                        {
-                            store.clear_graph(target).map_err(internal_server_error)?;
-                            true
-                        } else {
-                            store
-                                .insert_named_graph(target)
-                                .map_err(internal_server_error)?;
-                            false
-                        }
-                    }
-                    NamedGraphName::DefaultGraph => {
-                        store
-                            .clear_graph(GraphNameRef::DefaultGraph)
-                            .map_err(internal_server_error)?;
-                        true
-                    }
-                };
-                web_load_graph(&store, request, format, &GraphName::from(target))?;
-                Response::builder()
-                    .status(if new {
-                        StatusCode::CREATED
+            match &database {
+                Database::Store(store) => {
+                    if let Some(target) = store_target(request)? {
+                        let format = RdfFormat::from_media_type(&content_type)
+                            .ok_or_else(|| unsupported_media_type(&content_type))?;
+                        let new = !match &target {
+                            NamedGraphName::NamedNode(target) => {
+                                if store
+                                    .contains_named_graph(target)
+                                    .map_err(internal_server_error)?
+                                {
+                                    store.clear_graph(target).map_err(internal_server_error)?;
+                                    true
+                                } else {
+                                    store
+                                        .insert_named_graph(target)
+                                        .map_err(internal_server_error)?;
+                                    false
+                                }
+                            }
+                            NamedGraphName::DefaultGraph => {
+                                store
+                                    .clear_graph(GraphNameRef::DefaultGraph)
+                                    .map_err(internal_server_error)?;
+                                true
+                            }
+                        };
+                        web_load_graph(&database, request, format, &GraphName::from(target))?;
+                        Response::builder()
+                            .status(if new {
+                                StatusCode::CREATED
+                            } else {
+                                StatusCode::NO_CONTENT
+                            })
+                            .body(Body::empty())
+                            .map_err(internal_server_error)
                     } else {
-                        StatusCode::NO_CONTENT
-                    })
-                    .body(Body::empty())
-                    .map_err(internal_server_error)
-            } else {
-                let format = RdfFormat::from_media_type(&content_type)
-                    .ok_or_else(|| unsupported_media_type(&content_type))?;
-                store.clear().map_err(internal_server_error)?;
-                web_load_dataset(&store, request, format)?;
-                Response::builder()
-                    .status(StatusCode::NO_CONTENT)
-                    .body(Body::empty())
-                    .map_err(internal_server_error)
+                        let format = RdfFormat::from_media_type(&content_type)
+                            .ok_or_else(|| unsupported_media_type(&content_type))?;
+                        store.clear().map_err(internal_server_error)?;
+                        web_load_dataset(&database, request, format)?;
+                        Response::builder()
+                            .status(StatusCode::NO_CONTENT)
+                            .body(Body::empty())
+                            .map_err(internal_server_error)
+                    }
+                }
             }
         }
         (path, "DELETE") if path.starts_with("/store") => {
             if read_only {
                 return Err(the_server_is_read_only());
             }
-            if let Some(target) = store_target(request)? {
-                match target {
-                    NamedGraphName::DefaultGraph => store
-                        .clear_graph(GraphNameRef::DefaultGraph)
-                        .map_err(internal_server_error)?,
-                    NamedGraphName::NamedNode(target) => {
-                        if store
-                            .contains_named_graph(&target)
-                            .map_err(internal_server_error)?
-                        {
-                            store
-                                .remove_named_graph(&target)
-                                .map_err(internal_server_error)?;
-                        } else {
-                            return Err((
-                                StatusCode::NOT_FOUND,
-                                format!("The graph {target} does not exists"),
-                            ));
+            match database {
+                Database::Store(store) => {
+                    if let Some(target) = store_target(request)? {
+                        match target {
+                            NamedGraphName::DefaultGraph => store
+                                .clear_graph(GraphNameRef::DefaultGraph)
+                                .map_err(internal_server_error)?,
+                            NamedGraphName::NamedNode(target) => {
+                                if store
+                                    .contains_named_graph(&target)
+                                    .map_err(internal_server_error)?
+                                {
+                                    store
+                                        .remove_named_graph(&target)
+                                        .map_err(internal_server_error)?;
+                                } else {
+                                    return Err((
+                                        StatusCode::NOT_FOUND,
+                                        format!("The graph {target} does not exists"),
+                                    ));
+                                }
+                            }
                         }
+                    } else {
+                        store.clear().map_err(internal_server_error)?;
                     }
+                    Response::builder()
+                        .status(StatusCode::NO_CONTENT)
+                        .body(Body::empty())
+                        .map_err(internal_server_error)
                 }
-            } else {
-                store.clear().map_err(internal_server_error)?;
             }
-            Response::builder()
-                .status(StatusCode::NO_CONTENT)
-                .body(Body::empty())
-                .map_err(internal_server_error)
         }
         (path, "POST") if path.starts_with("/store") => {
             if read_only {
@@ -1086,8 +1188,8 @@ fn handle_request(
             if let Some(target) = store_target(request)? {
                 let format = RdfFormat::from_media_type(&content_type)
                     .ok_or_else(|| unsupported_media_type(&content_type))?;
-                let new = assert_that_graph_exists(&store, &target).is_ok();
-                web_load_graph(&store, request, format, &GraphName::from(target))?;
+                let new = assert_that_graph_exists(&database, &target).is_ok();
+                web_load_graph(&database, request, format, &GraphName::from(target))?;
                 Response::builder()
                     .status(if new {
                         StatusCode::CREATED
@@ -1100,12 +1202,12 @@ fn handle_request(
                 let format = RdfFormat::from_media_type(&content_type)
                     .ok_or_else(|| unsupported_media_type(&content_type))?;
                 if format.supports_datasets() {
-                    web_load_dataset(&store, request, format)?;
+                    web_load_dataset(&database, request, format)?;
                     Response::builder().status(StatusCode::NO_CONTENT)
                 } else {
                     let graph =
                         resolve_with_base(request, &format!("/store/{:x}", random::<u128>()))?;
-                    web_load_graph(&store, request, format, &graph.clone().into())?;
+                    web_load_graph(&database, request, format, &graph.clone().into())?;
                     Response::builder()
                         .status(StatusCode::CREATED)
                         .header(LOCATION, graph.into_string())
@@ -1116,7 +1218,7 @@ fn handle_request(
         }
         (path, "HEAD") if path.starts_with("/store") => {
             if let Some(target) = store_target(request)? {
-                assert_that_graph_exists(&store, &target)?;
+                assert_that_graph_exists(&database, &target)?;
             }
             Response::builder()
                 .body(Body::empty())
@@ -1208,7 +1310,7 @@ fn limited_body(request: &mut Request<Body>) -> Result<Vec<u8>, HttpError> {
 }
 
 fn configure_and_evaluate_sparql_query(
-    store: &Store,
+    database: &Database,
     encoded: &[&[u8]],
     mut query: Option<String>,
     request: &Request<Body>,
@@ -1239,7 +1341,7 @@ fn configure_and_evaluate_sparql_query(
     }
     let query = query.ok_or_else(|| bad_request("You should set the 'query' parameter"))?;
     evaluate_sparql_query(
-        store,
+        database,
         &query,
         use_default_graph_as_union,
         default_graph_uris,
@@ -1250,7 +1352,7 @@ fn configure_and_evaluate_sparql_query(
 }
 
 fn evaluate_sparql_query(
-    store: &Store,
+    database: &Database,
     query: &str,
     use_default_graph_as_union: bool,
     default_graph_uris: Vec<String>,
@@ -1300,10 +1402,12 @@ fn evaluate_sparql_query(
         );
     }
 
-    let results = prepared
-        .on_store(store)
-        .execute()
-        .map_err(internal_server_error)?;
+    let results = match database {
+        Database::Store(store) => prepared
+            .on_store(store)
+            .execute()
+            .map_err(internal_server_error)?,
+    };
     match results {
         QueryResults::Solutions(solutions) => {
             let format = query_results_content_negotiation(request)?;
@@ -1367,7 +1471,7 @@ fn default_sparql_evaluator() -> SparqlEvaluator {
 }
 
 fn configure_and_evaluate_sparql_update(
-    store: &Store,
+    database: &Database,
     encoded: &[&[u8]],
     mut update: Option<String>,
     request: &Request<Body>,
@@ -1397,7 +1501,7 @@ fn configure_and_evaluate_sparql_update(
     }
     let update = update.ok_or_else(|| bad_request("You should set the 'update' parameter"))?;
     evaluate_sparql_update(
-        store,
+        database,
         &update,
         use_default_graph_as_union,
         default_graph_uris,
@@ -1407,7 +1511,7 @@ fn configure_and_evaluate_sparql_update(
 }
 
 fn evaluate_sparql_update(
-    store: &Store,
+    database: &Database,
     update: &str,
     use_default_graph_as_union: bool,
     default_graph_uris: Vec<String>,
@@ -1455,10 +1559,12 @@ fn evaluate_sparql_update(
             using.set_available_named_graphs(named_graph_uris.clone());
         }
     }
-    prepared
-        .on_store(store)
-        .execute()
-        .map_err(internal_server_error)?;
+    match database {
+        Database::Store(store) => prepared
+            .on_store(store)
+            .execute()
+            .map_err(internal_server_error)?,
+    };
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
@@ -1489,12 +1595,14 @@ fn store_target(request: &Request<Body>) -> Result<Option<NamedGraphName>, HttpE
     }
 }
 
-fn assert_that_graph_exists(store: &Store, target: &NamedGraphName) -> Result<(), HttpError> {
+fn assert_that_graph_exists(database: &Database, target: &NamedGraphName) -> Result<(), HttpError> {
     if match target {
         NamedGraphName::DefaultGraph => true,
-        NamedGraphName::NamedNode(target) => store
-            .contains_named_graph(target)
-            .map_err(internal_server_error)?,
+        NamedGraphName::NamedNode(target) => match database {
+            Database::Store(store) => store
+                .contains_named_graph(target)
+                .map_err(internal_server_error)?,
+        },
     } {
         Ok(())
     } else {
@@ -1633,7 +1741,7 @@ fn content_type(request: &Request<Body>) -> Option<String> {
 }
 
 fn web_load_graph(
-    store: &Store,
+    database: &Database,
     request: &mut Request<Body>,
     format: RdfFormat,
     to_graph_name: &GraphName,
@@ -1653,20 +1761,22 @@ fn web_load_graph(
         parser = parser.with_base_iri(base_iri).map_err(bad_request)?;
     }
     if url_query_parameter(request, "no_transaction").is_some() {
-        let mut loader = web_bulk_loader(store, request);
+        let mut loader = web_bulk_loader(database, request);
         loader
             .load_from_reader(parser, request.body_mut())
             .map_err(loader_to_http_error)?;
         loader.commit().map_err(internal_server_error)
     } else {
-        store
-            .load_from_reader(parser, request.body_mut())
-            .map_err(loader_to_http_error)
+        match database {
+            Database::Store(store) => store
+                .load_from_reader(parser, request.body_mut())
+                .map_err(loader_to_http_error),
+        }
     }
 }
 
 fn web_load_dataset(
-    store: &Store,
+    database: &Database,
     request: &mut Request<Body>,
     format: RdfFormat,
 ) -> Result<(), HttpError> {
@@ -1675,36 +1785,42 @@ fn web_load_dataset(
         parser = parser.lenient();
     }
     if url_query_parameter(request, "no_transaction").is_some() {
-        let mut loader = web_bulk_loader(store, request);
+        let mut loader = web_bulk_loader(database, request);
         loader
             .load_from_reader(parser, request.body_mut())
             .map_err(loader_to_http_error)?;
         loader.commit().map_err(internal_server_error)
     } else {
-        store
-            .load_from_reader(parser, request.body_mut())
-            .map_err(loader_to_http_error)
+        match database {
+            Database::Store(store) => store
+                .load_from_reader(parser, request.body_mut())
+                .map_err(loader_to_http_error),
+        }
     }
 }
 
-fn web_bulk_loader<'a>(store: &'a Store, request: &Request<Body>) -> BulkLoader<'a> {
+fn web_bulk_loader<'a>(database: &'a Database, request: &Request<Body>) -> BulkLoader<'a> {
     let start = Instant::now();
-    let mut loader = store.bulk_loader().on_progress(move |size| {
-        let elapsed = start.elapsed();
-        eprintln!(
-            "{} triples loaded in {}s ({} t/s)",
-            size,
-            elapsed.as_secs(),
-            ((size as f64) / elapsed.as_secs_f64()).round()
-        )
-    });
-    if url_query_parameter(request, "lenient").is_some() {
-        loader = loader.on_parse_error(move |e| {
-            eprintln!("Parsing error: {e}");
-            Ok(())
-        })
+    match database {
+        Database::Store(store) => {
+            let mut loader = store.bulk_loader().on_progress(move |size| {
+                let elapsed = start.elapsed();
+                eprintln!(
+                    "{} triples loaded in {}s ({} t/s)",
+                    size,
+                    elapsed.as_secs(),
+                    ((size as f64) / elapsed.as_secs_f64()).round()
+                )
+            });
+            if url_query_parameter(request, "lenient").is_some() {
+                loader = loader.on_parse_error(move |e| {
+                    eprintln!("Parsing error: {e}");
+                    Ok(())
+                })
+            }
+            loader
+        }
     }
-    loader
 }
 
 fn error(status: StatusCode, message: impl fmt::Display) -> Response<Body> {
@@ -3111,7 +3227,7 @@ mod tests {
         fn exec(&self, request: Request<impl Into<Body>>) -> Response<Body> {
             handle_request(
                 &mut request.map(Into::into),
-                self.store.clone(),
+                self.store.clone().into(),
                 false,
                 false,
                 None,
@@ -3122,7 +3238,7 @@ mod tests {
         fn exec_read_only(&self, request: Request<impl Into<Body>>) -> Response<Body> {
             handle_request(
                 &mut request.map(Into::into),
-                self.store.clone(),
+                self.store.clone().into(),
                 true,
                 false,
                 None,

@@ -1,6 +1,6 @@
 include!("src/cli.rs");
 
-use clap::{CommandFactory, ValueEnum};
+use clap::CommandFactory;
 use clap_complete::Shell;
 use clap_mangen::Man;
 use std::env::var_os;
