@@ -401,7 +401,7 @@ impl<'a, 'b: 'a> ReadableUpdateEvaluator<'a, 'b> {
                     .reader()
                     .contains_named_graph(&graph_name.as_ref().into())?
                 {
-                    Ok(self.transaction.clear_graph(graph_name.into())?)
+                    Ok(self.transaction.clear_graph(graph_name)?)
                 } else if silent {
                     Ok(())
                 } else {

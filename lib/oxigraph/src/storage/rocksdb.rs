@@ -19,7 +19,7 @@ use crate::storage::rocksdb_wrapper::{
 };
 use crate::storage::{DEFAULT_BULK_LOAD_BATCH_SIZE, map_thread_result};
 use crate::updatable_dataset::{
-    BulkLoader, ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction,
+    BulkLoader, ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction, 
 };
 use rustc_hash::{FxBuildHasher, FxHashSet};
 #[cfg(feature = "rdf-12")]
@@ -412,7 +412,9 @@ impl RocksDbStorageReader<'_> {
 impl<'a> Reader<'a> for RocksDbStorageReader<'a> {
     type Error = StorageError;
     type InternalTerm = EncodedTerm;
+    type InternalTermRef<'b> = &'b EncodedTerm;
     type InternalQuad = EncodedQuad;
+    type InternalQuadRef<'b> = &'b EncodedQuad;
 
     type QuadIterator<'iter>
         = RocksDbChainedDecodingQuadIterator<'iter>
@@ -432,13 +434,17 @@ impl<'a> Reader<'a> for RocksDbStorageReader<'a> {
             && self.reader.is_empty(&self.storage.dspo_cf)?)
     }
 
-    fn contains(&self, quad: &EncodedQuad) -> Result<bool, StorageError> {
+    fn contains<'b>(
+        &'b self,
+        quad: impl Into<&'b Self::InternalQuad>,
+    ) -> Result<bool, Self::Error> {
+        let quad = quad.into();
         let mut buffer = Vec::with_capacity(4 * WRITTEN_TERM_MAX_SIZE);
         if quad.graph_name.is_default_graph() {
-            write_spo_quad(&mut buffer, quad);
+            write_spo_quad(&mut buffer, &quad);
             Ok(self.reader.contains_key(&self.storage.dspo_cf, &buffer)?)
         } else {
-            write_gspo_quad(&mut buffer, quad);
+            write_gspo_quad(&mut buffer, &quad);
             Ok(self.reader.contains_key(&self.storage.gspo_cf, &buffer)?)
         }
     }
@@ -451,7 +457,8 @@ impl<'a> Reader<'a> for RocksDbStorageReader<'a> {
         graph_name: Option<Option<&'b Self::InternalTerm>>,
     ) -> RocksDbChainedDecodingQuadIterator<'a> {
         let default_graph_name = GraphNameRef::DefaultGraph.into();
-        let graph_name: Option<&Self::InternalTerm> = graph_name.map(|g| g.unwrap_or(&default_graph_name));
+        let graph_name: Option<&Self::InternalTerm> =
+            graph_name.map(|g| g.unwrap_or(&default_graph_name));
 
         match subject {
             Some(subject) => match predicate {
@@ -1096,7 +1103,11 @@ impl WriteOnlyTransaction<'_> for RocksDbStorageTransaction<'_> {
         Ok(())
     }
 
-    fn clear_graph(&mut self, graph_name: GraphNameRef<'_>) -> Result<(), StorageError> {
+    fn clear_graph<'b>(
+        &mut self,
+        graph_name: impl Into<GraphNameRef<'b>>,
+    ) -> Result<(), StorageError> {
+        let graph_name = graph_name.into();
         if graph_name == GraphNameRef::DefaultGraph {
             self.clear_default_graph()
         } else {
@@ -1356,8 +1367,11 @@ impl WriteOnlyTransaction<'_> for RocksDbStorageReadableTransaction<'_> {
         self.remove_encoded(&quad.into())
     }
 
-    fn clear_graph(&mut self, graph_name: GraphNameRef<'_>) -> Result<(), StorageError> {
-        self.clear_encoded_graph(&graph_name.into())
+    fn clear_graph<'b>(
+        &mut self,
+        graph_name: impl Into<GraphNameRef<'b>>,
+    ) -> Result<(), StorageError> {
+        self.clear_encoded_graph(&graph_name.into().into())
     }
 
     fn clear_all_named_graphs(&mut self) -> Result<(), StorageError> {

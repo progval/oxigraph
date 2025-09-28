@@ -44,7 +44,9 @@ pub trait UpdatableDataset<'a> {
 pub trait Reader<'a> {
     type Error: Error;
     type InternalTerm;
+    type InternalTermRef<'b>;
     type InternalQuad: Into<InternalQuad<Self::InternalTerm>>;
+    type InternalQuadRef<'b>;
     type TermIterator<'iter>: Iterator<Item = Result<Self::InternalTerm, Self::Error>> + 'iter
     where
         Self: 'iter;
@@ -61,7 +63,10 @@ pub trait Reader<'a> {
     fn is_empty(&self) -> Result<bool, Self::Error>;
 
     /// Checks if this store contains a given quad.
-    fn contains(&self, quad: &Self::InternalQuad) -> Result<bool, Self::Error>;
+    fn contains<'b>(
+        &'b self,
+        quad: impl Into<Self::InternalQuadRef<'b>>,
+    ) -> Result<bool, Self::Error>;
 
     /// Retrieves quads with a filter on each quad component.
     ///
@@ -78,7 +83,7 @@ pub trait Reader<'a> {
     /// // Copy all triples about ex:a to triples about ex:b
     /// let mut transaction = store.start_transaction()?;
     /// let triples = transaction
-    ///     .quads_for_pattern(Some(a.into()), None, None, None)
+    ///     .quads_for_pattern(Some(&a.into()), None, None, None)
     ///     .collect::<Result<Vec<_>, _>>()?;
     /// for triple in triples {
     ///     transaction.insert(QuadRef::new(
@@ -200,7 +205,10 @@ pub trait WriteOnlyTransaction<'a> {
     /// assert_eq!(1, store.named_graphs().count());
     /// # Result::<_,oxigraph::store::StorageError>::Ok(())
     /// ```
-    fn clear_graph(&mut self, graph_name: GraphNameRef<'_>) -> Result<(), Self::Error>;
+    fn clear_graph<'b>(
+        &mut self,
+        graph_name: impl Into<GraphNameRef<'b>>,
+    ) -> Result<(), Self::Error>;
 
     fn clear_all_graphs(&mut self) -> Result<(), Self::Error>;
 

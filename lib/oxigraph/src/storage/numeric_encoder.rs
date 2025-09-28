@@ -652,7 +652,6 @@ impl From<&Term> for EncodedTerm {
     }
 }
 
-
 impl From<TermRef<'_>> for EncodedTerm {
     fn from(term: TermRef<'_>) -> Self {
         match term {
@@ -733,6 +732,12 @@ impl EncodedQuad {
             object,
             graph_name,
         }
+    }
+}
+
+impl AsRef<EncodedQuad> for EncodedQuad {
+    fn as_ref(&self) -> &Self {
+        self
     }
 }
 

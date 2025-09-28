@@ -877,10 +877,14 @@ impl GraphNameIter {
     fn __next__(&mut self) -> PyResult<Option<PyNamedOrBlankNode>> {
         self.inner
             .next()
-            .map(|q| match NamedOrBlankNode::try_from(q.map_err(map_storage_error)?) {
-                Ok(node) => Ok(node.into()),
-                Err(e) => Err(PyRuntimeError::new_err(format!("GraphNameIter contains a non-node: {e}"))),
-            })
+            .map(
+                |q| match NamedOrBlankNode::try_from(q.map_err(map_storage_error)?) {
+                    Ok(node) => Ok(node.into()),
+                    Err(e) => Err(PyRuntimeError::new_err(format!(
+                        "GraphNameIter contains a non-node: {e}"
+                    ))),
+                },
+            )
             .transpose()
     }
 }

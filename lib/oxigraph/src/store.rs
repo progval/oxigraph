@@ -47,7 +47,7 @@ use crate::storage::{
 };
 use crate::updatable_dataset::{
     BulkLoader as BulkLoaderTrait, ReadWriteTransaction, Reader, UpdatableDataset,
-    WriteOnlyTransaction,
+    WriteOnlyTransaction
 };
 #[cfg(not(target_family = "wasm"))]
 use std::cmp::max;
@@ -385,7 +385,7 @@ impl Store {
                 subject.map(EncodedTerm::from).as_ref(),
                 predicate.map(EncodedTerm::from).as_ref(),
                 object.map(EncodedTerm::from).as_ref(),
-                graph_name.map(EncodedTerm::from).as_ref().map(Some)
+                graph_name.map(EncodedTerm::from).as_ref().map(Some),
             ),
             reader,
         }
@@ -1197,7 +1197,9 @@ impl<'a> Transaction<'a> {
 impl<'a> Reader<'a> for Transaction<'a> {
     type Error = StorageError;
     type InternalTerm = Term;
+    type InternalTermRef<'b> = TermRef<'b>;
     type InternalQuad = Quad;
+    type InternalQuadRef<'b> = QuadRef<'b>;
     type TermIterator<'iter>
         = GraphNameIter<'iter>
     where
@@ -1227,8 +1229,11 @@ impl<'a> Reader<'a> for Transaction<'a> {
         }
     }
 
-    fn contains(&self, quad: &Quad) -> Result<bool, StorageError> {
-        let quad = EncodedQuad::from(quad.as_ref());
+    fn contains<'b>(
+        &'b self,
+        quad: impl Into<QuadRef<'b>>
+    ) -> Result<bool, Self::Error> {
+        let quad = EncodedQuad::from(quad.into());
         self.inner.reader().contains(&quad)
     }
 
@@ -1485,7 +1490,10 @@ impl WriteOnlyTransaction<'_> for Transaction<'_> {
         self.inner.remove(quad.into())
     }
 
-    fn clear_graph(&mut self, graph_name: GraphNameRef<'_>) -> Result<(), StorageError> {
+    fn clear_graph<'b>(
+        &mut self,
+        graph_name: impl Into<GraphNameRef<'b>>,
+    ) -> Result<(), StorageError> {
         self.inner.clear_graph(graph_name.into())
     }
 

@@ -196,7 +196,9 @@ impl StorageReader<'_> {
 impl<'a> Reader<'a> for StorageReader<'a> {
     type Error = StorageError;
     type InternalTerm = EncodedTerm;
+    type InternalTermRef<'b> = &'b EncodedTerm;
     type InternalQuad = EncodedQuad;
+    type InternalQuadRef<'b> = &'b EncodedQuad;
 
     type QuadIterator<'iter>
         = DecodingQuadIterator<'iter>
@@ -223,7 +225,7 @@ impl<'a> Reader<'a> for StorageReader<'a> {
         }
     }
 
-    fn contains(&self, quad: &EncodedQuad) -> Result<bool, StorageError> {
+    fn contains<'b>(&'b self, quad: impl Into<&'b EncodedQuad>) -> Result<bool, Self::Error> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.contains(quad),
@@ -392,7 +394,10 @@ impl WriteOnlyTransaction<'_> for StorageTransaction<'_> {
         }
     }
 
-    fn clear_graph(&mut self, graph_name: GraphNameRef<'_>) -> Result<(), StorageError> {
+    fn clear_graph<'b>(
+        &mut self,
+        graph_name: impl Into<GraphNameRef<'b>>,
+    ) -> Result<(), StorageError> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageTransactionKind::RocksDb(transaction) => transaction.clear_graph(graph_name),
@@ -519,7 +524,10 @@ impl WriteOnlyTransaction<'_> for StorageReadableTransaction<'_> {
         }
     }
 
-    fn clear_graph(&mut self, graph_name: GraphNameRef<'_>) -> Result<(), StorageError> {
+    fn clear_graph<'b>(
+        &mut self,
+        graph_name: impl Into<GraphNameRef<'b>>,
+    ) -> Result<(), StorageError> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReadableTransactionKind::RocksDb(transaction) => {

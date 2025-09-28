@@ -5,7 +5,7 @@ use crate::storage::numeric_encoder::{
     Decoder, EncodedQuad, EncodedTerm, StrHash, StrHashHasher, StrLookup, insert_term,
 };
 use crate::updatable_dataset::{
-    BulkLoader, ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction,
+    BulkLoader, ReadWriteTransaction, Reader, UpdatableDataset, WriteOnlyTransaction
 };
 use dashmap::iter::Iter;
 use dashmap::mapref::entry::Entry;
@@ -141,7 +141,9 @@ impl MemoryStorageReader<'_> {
 impl<'a> Reader<'a> for MemoryStorageReader<'a> {
     type Error = StorageError;
     type InternalTerm = EncodedTerm;
+    type InternalTermRef<'b> = &'b EncodedTerm;
     type InternalQuad = EncodedQuad;
+    type InternalQuadRef<'b> = &'b EncodedQuad;
 
     type QuadIterator<'iter>
         = QuadIterator<'iter>
@@ -171,12 +173,12 @@ impl<'a> Reader<'a> for MemoryStorageReader<'a> {
             .any(|e| self.is_node_in_range(&e)))
     }
 
-    fn contains(&self, quad: &EncodedQuad) -> Result<bool, StorageError> {
+    fn contains<'b>(&'b self, quad: impl Into<&'b EncodedQuad>) -> Result<bool, Self::Error> {
         Ok(self
             .storage
             .content
             .quad_set
-            .get(quad)
+            .get(quad.into())
             .is_some_and(|node| self.is_node_in_range(&node)))
     }
 
@@ -188,7 +190,8 @@ impl<'a> Reader<'a> for MemoryStorageReader<'a> {
         graph_name: Option<Option<&Self::InternalTerm>>,
     ) -> QuadIterator<'a> {
         let default_graph_name = GraphNameRef::DefaultGraph.into();
-        let graph_name: Option<&Self::InternalTerm> = graph_name.map(|g| g.unwrap_or(&default_graph_name));
+        let graph_name: Option<&Self::InternalTerm> =
+            graph_name.map(|g| g.unwrap_or(&default_graph_name));
 
         fn get_start_and_count(
             map: &DashMap<EncodedTerm, (Weak<QuadListNode>, u64), BuildHasherDefault<FxHasher>>,
@@ -617,8 +620,11 @@ impl WriteOnlyTransaction<'_> for MemoryStorageTransaction<'_> {
         self.remove_encoded(&quad.into())
     }
 
-    fn clear_graph(&mut self, graph_name: GraphNameRef<'_>) -> Result<(), StorageError> {
-        self.clear_encoded_graph(&graph_name.into());
+    fn clear_graph<'b>(
+        &mut self,
+        graph_name: impl Into<GraphNameRef<'b>>,
+    ) -> Result<(), StorageError> {
+        self.clear_encoded_graph(&graph_name.into().into());
         Ok(())
     }
 
