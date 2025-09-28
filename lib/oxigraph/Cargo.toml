@@ -14,9 +14,8 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["rocksdb", "succinct"]
+default = ["rocksdb"]
 rocksdb = ["oxrocksdb-sys"]
-succinct = ["anyhow", "bytemuck", "clap", "deko", "dsi-progress-logger", "dsi-bitstream", "deko", "epserde", "lender", "log", "itertools", "mmap-rs", "rayon", "rdst", "serde", "serde/derive", "serde_json", "sux", "tempfile", "thread_local", "webgraph", "webgraph-algo", "webgraph-cli", "zstd"]
 js = ["getrandom/wasm_js", "oxsdatatypes/js", "js-sys"]
 http-client = ["oxhttp"]
 http-client-native-tls = ["http-client", "oxhttp/native-tls"]
@@ -27,47 +26,45 @@ rocksdb-debug = []
 rdf-12 = ["oxrdfio/rdf-12", "spareval/sparql-12"]
 
 [dependencies]
+anyhow.workspace = true
+bytemuck = { workspace = true, features = ["derive", "min_const_generics"] }
+clap.workspace = true
 dashmap.workspace = true
+deko.workspace = true
+dsi-progress-logger.workspace = true
+dsi-bitstream.workspace = true
+epserde.workspace = true
+lender.workspace = true
+log.workspace = true
+itertools.workspace = true
+mmap-rs.workspace = true
 oxiri.workspace = true
 oxrdf = { workspace = true, features = ["oxsdatatypes"] }
 oxrdfio.workspace = true
 oxsdatatypes.workspace = true
 rand.workspace = true
+rayon.workspace = true
+rdst.workspace = true
 rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 siphasher.workspace = true
 sparesults.workspace = true
 spargebra = { workspace = true, features = ["sep-0002", "sep-0006"] }
 spareval = { workspace = true, features = ["sep-0002", "sep-0006", "calendar-ext"] }
+sux.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
+thread_local.workspace = true
+webgraph.workspace = true
+webgraph-algo.workspace = true
+webgraph-cli.workspace = true
+zstd.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 libc.workspace = true
 oxhttp = { workspace = true, optional = true }
 oxrocksdb-sys = { workspace = true, optional = true }
-
-# succinct storage
-anyhow = { workspace = true, optional = true }
-bytemuck = { workspace = true, features = ["derive", "min_const_generics"], optional = true }
-clap = { workspace = true, optional = true }
-deko = { workspace = true, optional = true }
-dsi-progress-logger = { workspace = true, optional = true }
-dsi-bitstream = { workspace = true, optional = true }
-epserde = { workspace = true, optional = true }
-lender = { workspace = true, optional = true }
-log = { workspace = true, optional = true }
-itertools = { workspace = true, optional = true }
-mmap-rs = { workspace = true, optional = true }
-rayon = { workspace = true, optional = true }
-rdst = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
-sux = { workspace = true, optional = true }
-tempfile = { workspace = true, optional = true }
-thread_local = { workspace = true, optional = true }
-webgraph = { workspace = true, optional = true }
-webgraph-algo = { workspace = true, optional = true }
-webgraph-cli = { workspace = true, optional = true }
-zstd = { workspace = true, optional = true }
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 getrandom.workspace = true
