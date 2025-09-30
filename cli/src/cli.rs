@@ -21,7 +21,7 @@ pub enum Command {
     /// Start Oxigraph HTTP server in read-write mode
     Serve {
         /// The format of the database at the given --location
-        #[arg(long)]
+        #[arg(long, default_value = "autodetect")]
         database_format: DatabaseFormat,
         /// Directory in which the data should be persisted
         ///
@@ -53,7 +53,7 @@ pub enum Command {
     /// Opening as read-only while having another process writing the database is undefined behavior.
     ServeReadOnly {
         /// The format of the database at the given location
-        #[arg(long)]
+        #[arg(long, default_value = "autodetect")]
         database_format: DatabaseFormat,
         /// Directory in which Oxigraph data are persisted
         #[arg(short, long, value_hint = ValueHint::DirPath)]
@@ -90,7 +90,7 @@ pub enum Command {
     /// If you want to move your data to another RDF storage system, you should use the dump operation instead.
     Backup {
         /// The format of the database at the given location
-        #[arg(long)]
+        #[arg(long, default_value = "autodetect")]
         database_format: DatabaseFormat,
         /// Directory in which Oxigraph data are persisted
         #[arg(short, long, value_hint = ValueHint::DirPath)]
@@ -106,7 +106,7 @@ pub enum Command {
     /// Files are loaded atomically, either the file is fully loaded into the store or not at all.
     Load {
         /// The format of the database at the given location
-        #[arg(long)]
+        #[arg(long, default_value = "autodetect")]
         database_format: DatabaseFormat,
         /// Directory in which Oxigraph data are persisted
         #[arg(short, long, value_hint = ValueHint::DirPath)]
@@ -151,7 +151,7 @@ pub enum Command {
     /// Dump the store content into a file
     Dump {
         /// The format of the database at the given location
-        #[arg(long)]
+        #[arg(long, default_value = "autodetect")]
         database_format: DatabaseFormat,
         /// Directory in which Oxigraph data are persisted
         #[arg(short, long, value_hint = ValueHint::DirPath)]
@@ -181,7 +181,7 @@ pub enum Command {
     /// Execute a SPARQL query against the store
     Query {
         /// The format of the database at the given location
-        #[arg(long)]
+        #[arg(long, default_value = "autodetect")]
         database_format: DatabaseFormat,
         /// Directory in which Oxigraph data are persisted
         #[arg(short, long, value_hint = ValueHint::DirPath)]
@@ -236,7 +236,7 @@ pub enum Command {
     /// Execute a SPARQL update against the store
     Update {
         /// The format of the database at the given location
-        #[arg(long)]
+        #[arg(long, default_value = "autodetect")]
         database_format: DatabaseFormat,
         /// Directory in which Oxigraph data are persisted
         #[arg(short, long, value_hint = ValueHint::DirPath)]
@@ -261,7 +261,7 @@ pub enum Command {
     /// It is likely to not be useful in most of the cases except if you provide a read-only SPARQL endpoint under heavy load.
     Optimize {
         /// The format of the database at the given location
-        #[arg(long)]
+        #[arg(long, default_value = "autodetect")]
         database_format: DatabaseFormat,
         /// Directory in which Oxigraph data are persisted
         #[arg(short, long, value_hint = ValueHint::DirPath)]
