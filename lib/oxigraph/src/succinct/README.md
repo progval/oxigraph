@@ -40,7 +40,7 @@ Using these two constructs, we can map term strings to their id and vice versa v
 
 This stores `wikidata-20240320-truthy-BETA` terms in:
 
-* 17GiB for the compressed terms
+* 20GiB for the compressed terms
 * 137MiB for the Elias-Fano indexes
 * 7.5GiB for the VFunc
 

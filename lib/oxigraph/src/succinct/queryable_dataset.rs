@@ -1,6 +1,6 @@
 use super::quads_store::{QuadOrder, QuadStore};
 use super::terms_mphf::{DefaultDeserializedTermMphf, TermHasher, TermMphf};
-use super::terms_store::TermStore;
+use super::terms_store::{TermStore, deserialize_term, serialize_graph_name, serialize_term};
 use anyhow::{Context, Result, anyhow, ensure};
 use oxrdf::{GraphName, Term};
 use spareval::{InternalQuad, QueryableDataset};
@@ -173,31 +173,41 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
                                         return Ok(None);
                                     }
                                 }
-                                Ok(Some(inner.to_internal_quad(quad)))
+                                Ok(Some(notself.to_internal_quad(quad)))
                             }
                         })()
                         .transpose()
                     })
                 },
             ),
-            _ => todo!("internal_quads_for_pattern pattern"),
+            (None, None, None, Some(graph_name)) => {
+                map_iterator::<'a, _, _, _, _>(self.0.spog_quads.iter_all_quads(), move |iter| {
+                    let notself = notself.clone();
+                    iter.filter_map(move |quad| -> Option<Result<_>> {
+                        ({
+                            || -> Result<Option<_>> {
+                                let quad = QuadOrder::Spog.mapper()(quad?);
+                                if quad[3] != graph_name {
+                                    return Ok(None);
+                                }
+                                Ok(Some(notself.to_internal_quad(quad)))
+                            }
+                        })()
+                        .transpose()
+                    })
+                })
+            }
+            pattern => todo!("internal_quads_for_pattern pattern: {pattern:?}"),
         }
     }
 
     /// Builds an internal term from the [`Term`] struct
     fn internalize_term(&self, term: Term) -> Result<Self::InternalTerm, Self::Error> {
         if let Ok(id) = self.0.terms_mphf.hash_term(&term) {
-            if let Some(expected_term_str) = self.0.terms.get(id)? {
-                let term_str_matches = match &term {
-                    // TODO: dedup with TermHasher
-                    Term::NamedNode(n) => expected_term_str == n.as_str(),
-                    Term::BlankNode(n) => expected_term_str == n.as_str(),
-                    Term::Literal(l) => expected_term_str == l.to_string(),
-                    #[cfg(feature = "rdf-12")]
-                    Term::Triple(_) => todo!("Term::Triple"),
-                };
+            if let Some(expected_term_bytes) = self.0.terms.get(id)? {
+                let term_bytes_matches = *expected_term_bytes == *serialize_term(&term)?;
 
-                if term_str_matches {
+                if term_bytes_matches {
                     // not a hash collision
                     return Ok(id);
                 }
@@ -215,9 +225,13 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
 
     /// Builds a [`Term`] from an internal term
     fn externalize_term(&self, term: Self::InternalTerm) -> Result<Term, Self::Error> {
-        if let Some(s) = self.0.terms.get(term)? {
-            Ok(s.parse()
-                .with_context(|| format!("Could not parse stored term {s:?}"))?)
+        if let Some(bytes) = self.0.terms.get(term)? {
+            Ok(deserialize_term(&bytes).with_context(|| {
+                format!(
+                    "Could not parse stored term {:?}",
+                    String::from_utf8_lossy(&bytes)
+                )
+            })?)
         } else {
             Err(anyhow!("Unknown term: {term}"))?
         }
@@ -242,13 +256,10 @@ impl SuccinctDatasetView {
     fn internalize_graph_name(&self, graph_name: &GraphName) -> Result<Option<usize>> {
         if let Ok(id) = self.0.terms_mphf.hash_graphname(graph_name) {
             if let Some(expected_graph_name_bytes) = self.0.terms.get(id)? {
-                let graph_name_str_matches = match graph_name {
-                    // TODO: dedup with TermHasher
-                    GraphName::NamedNode(n) => expected_graph_name_str == n.as_str(),
-                    GraphName::BlankNode(n) => expected_graph_name_str == n.as_str(),
-                    GraphName::DefaultGraph => expected_graph_name_str == "".to_owned(),
-                };
-                if graph_name_str_matches {
+                let graph_name_bytes_matches =
+                    *expected_graph_name_bytes == *serialize_graph_name(&graph_name)?;
+
+                if graph_name_bytes_matches {
                     // not a hash collision
                     return Ok(Some(id));
                 }

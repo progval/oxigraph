@@ -1,6 +1,6 @@
 use super::sort::ExternalDeduplicatingStringSorter;
-use crate::model::{GraphName, NamedOrBlankNode, Quad, Term, Triple};
-use anyhow::{Context, Result, anyhow, ensure};
+use crate::model::{GraphName, Quad, Term};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use dsi_progress_logger::{ProgressLog, concurrent_progress_logger, progress_logger};
 use epserde::deser::mem_case::{Flags, MemCase};
 use epserde::deser::{Deserialize as EpDeserialize, DeserializeInner as EpDeserializeInner};
@@ -65,29 +65,54 @@ pub(super) fn read_length_prefixed_string<R: Read>(
     Ok(Some(string.into()))
 }
 
+pub fn serialize_term(term: &Term) -> Result<Vec<u8>> {
+    serde_json::to_vec(term).with_context(|| format!("Could not serialize term {term:?}"))
+}
+
+pub fn deserialize_term(bytes: &[u8]) -> Result<Term> {
+    serde_json::from_slice(bytes).with_context(|| {
+        format!(
+            "Could not deserialize term '{}'",
+            String::from_utf8_lossy(bytes)
+        )
+    })
+}
+
+pub fn serialize_graph_name(graph_name: &GraphName) -> Result<Vec<u8>> {
+    if graph_name == &GraphName::DefaultGraph {
+        // The empty string is very handy in datasets that have most of their quads
+        // in the default graph, because it comes first in the sorted list of terms,
+        // which means that the DefaultGraph gets hashed to id 0.
+        // And because sorted quad files have to write the graph at the beginning
+        // of each frame, the shorter the graph id is, the better.
+        // And because we use gamma coding
+        // (https://docs.rs/dsi-bitstream/latest/dsi_bitstream/codes/index.html),
+        // 0 is encoded as a single bit whereas any other value takes at least four bits.
+        return Ok(Vec::new());
+    } else {
+        serde_json::to_vec(graph_name)
+            .with_context(|| format!("Could not serialize graph name {graph_name:?}"))
+    }
+}
+
+pub fn deserialize_graph_name(bytes: &[u8]) -> Result<GraphName> {
+    if bytes.is_empty() {
+        Ok(GraphName::DefaultGraph)
+    } else {
+        serde_json::from_slice(bytes).with_context(|| {
+            format!(
+                "Could not deserialize graph name '{}'",
+                String::from_utf8_lossy(bytes)
+            )
+        })
+    }
+}
+
 fn deduplicate_terms(
     quads: impl ParallelIterator<Item = Result<Quad>>,
 ) -> Result<ExternalDeduplicatingStringSorter> {
     fn push_term(sorter: &mut ExternalDeduplicatingStringSorter, term: Term) -> Result<()> {
-        match term {
-            Term::NamedNode(n) => sorter.push_str(n.as_str().to_owned()),
-            Term::BlankNode(n) => sorter.push_str(n.as_str().to_owned()),
-            Term::Literal(l) => sorter.push_str(l.to_string()), // XXX is that injective?
-            #[cfg(feature = "rdf-12")]
-            Term::Triple(t) => {
-                let Triple {
-                    subject,
-                    predicate,
-                    object,
-                } = *t;
-                sorter.push_str(match subject {
-                    NamedOrBlankNode::NamedNode(n) => n.as_str().to_owned(),
-                    NamedOrBlankNode::BlankNode(n) => n.as_str().to_owned(),
-                })?;
-                sorter.push_str(predicate.as_str().to_owned())?;
-                push_term(sorter, object)
-            }
-        }
+        sorter.push_boxed_bytes(serialize_term(&term)?.into_boxed_slice())
     }
 
     let unique_sorted_terms = quads
@@ -105,23 +130,15 @@ fn deduplicate_terms(
                     object,
                     graph_name,
                 } = quad?;
-                thread_sorter
-                    .push_str(match subject {
-                        NamedOrBlankNode::NamedNode(n) => n.as_str().to_owned(),
-                        NamedOrBlankNode::BlankNode(n) => n.as_str().to_owned(),
-                    })
-                    .context("Could not push subject")?;
-                thread_sorter
-                    .push_str(predicate.as_str().to_owned())
+                push_term(&mut thread_sorter, subject.into()).context("Could not push subject")?;
+                push_term(&mut thread_sorter, predicate.into())
                     .context("Could not push predicate")?;
-                thread_sorter
-                    .push_str(match graph_name {
-                        GraphName::NamedNode(n) => n.as_str().to_owned(),
-                        GraphName::BlankNode(n) => n.as_str().to_owned(),
-                        GraphName::DefaultGraph => "".to_owned(), // XXX I guess?
-                    })
-                    .context("Could not push graph name")?;
                 push_term(&mut thread_sorter, object).context("Could not push term")?;
+
+                // TODO: deduplicate and store graph names separately
+                thread_sorter
+                    .push_boxed_bytes(serialize_graph_name(&graph_name)?.into_boxed_slice())
+                    .context("Could not push graph name")?;
 
                 Ok(thread_sorter)
             },
@@ -433,7 +450,7 @@ impl TermStore {
         self.config.num_terms
     }
 
-    pub fn get(&self, id: usize) -> Result<Option<String>> {
+    pub fn get(&self, id: usize) -> Result<Option<Box<[u8]>>> {
         if id >= self.len() {
             return Ok(None);
         }
@@ -502,10 +519,7 @@ impl TermStore {
             );
         }
 
-        Ok(Some(
-            String::from_utf8(last_term.expect("Loop didn't run").into())
-                .with_context(|| format!("Term {id} is not valid UTF-8"))?,
-        ))
+        Ok(Some(last_term.expect("Loop didn't run").into()))
     }
 }
 

@@ -56,10 +56,6 @@ impl ExternalDeduplicatingStringSorter {
         })
     }
 
-    pub fn push_str(&mut self, s: String) -> Result<()> {
-        self.push_boxed_bytes(s.into_bytes().into())
-    }
-
     pub fn push_boxed_bytes(&mut self, bytes: Box<[u8]>) -> Result<()> {
         let bytes_len = size_of::<usize>() + bytes.len();
 

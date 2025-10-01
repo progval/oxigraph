@@ -1,5 +1,6 @@
 use super::terms_store::{TermsFile, list_terms_files, read_length_prefixed_string};
 use crate::model::{GraphName, NamedNode, NamedOrBlankNode, Term};
+use crate::succinct::terms_store::{serialize_graph_name, serialize_term};
 use anyhow::{Context, Result, anyhow, ensure};
 use bytemuck::TransparentWrapper;
 use dsi_progress_logger::{ProgressLog, progress_logger};
@@ -62,46 +63,21 @@ pub trait TermHasher {
     /// Returns the number of known terms
     fn len(&self) -> usize;
 
-    fn hash_string(&self, s: impl AsRef<str>) -> Result<usize>;
+    fn hash_bytes(&self, s: impl AsRef<[u8]>) -> Result<usize>;
 
     fn hash_namedorblanknode(&self, term: &NamedOrBlankNode) -> Result<usize> {
-        match term {
-            NamedOrBlankNode::NamedNode(n) => self.hash_string(n.as_str()),
-            NamedOrBlankNode::BlankNode(n) => self.hash_string(n.as_str()),
-        }
+        self.hash_bytes(serialize_term(&term.clone().into())?)
     }
     fn hash_namednode(&self, term: &NamedNode) -> Result<usize> {
-        self.hash_string(term.as_str())
+        self.hash_bytes(serialize_term(&term.clone().into())?)
     }
 
     fn hash_term(&self, term: &Term) -> Result<usize> {
-        match term {
-            Term::NamedNode(n) => self.hash_string(n.as_str()),
-            Term::BlankNode(n) => self.hash_string(n.as_str()),
-            Term::Literal(l) => self.hash_string(l.to_string()), // XXX is that injective?
-            #[cfg(feature = "rdf-12")]
-            Term::Triple(_) => todo!("Term::Triple"),
-        }
+        self.hash_bytes(serialize_term(term)?)
     }
 
     fn hash_graphname(&self, graph_name: &GraphName) -> Result<usize> {
-        match graph_name {
-            GraphName::NamedNode(n) => self.hash_string(n.as_str()),
-            GraphName::BlankNode(n) => self.hash_string(n.as_str()),
-            GraphName::DefaultGraph => {
-                // XXX this doesn't conflict with any valid term, right?
-                //
-                // The empty string is very handy in datasets that have most of their quads
-                // in the default graph, because it comes first in the sorted list of terms,
-                // which means that the DefaultGraph gets hashed to id 0.
-                // And because sorted quad files have to write the graph at the beginning
-                // of each frame, the shorter the graph id is, the better.
-                // And because we use gamma coding
-                // (https://docs.rs/dsi-bitstream/latest/dsi_bitstream/codes/index.html),
-                // 0 is encoded as a single bit whereas any other value takes at least four bits.
-                self.hash_string("".to_owned())
-            }
-        }
+        self.hash_bytes(serialize_graph_name(graph_name)?)
     }
 }
 
@@ -118,9 +94,9 @@ impl<D: BitFieldSlice<usize>> TermHasher for TermMphf<D> {
         self.vfunc.len()
     }
 
-    fn hash_string(&self, s: impl AsRef<str>) -> Result<usize> {
+    fn hash_bytes(&self, s: impl AsRef<[u8]>) -> Result<usize> {
         // TODO check in the list of terms store that it is not a collision
-        let hash = self.vfunc.get(RawTerm::wrap_ref(s.as_ref().as_bytes()));
+        let hash = self.vfunc.get(RawTerm::wrap_ref(s.as_ref()));
         ensure!(
             hash < self.vfunc.len(),
             "hash={hash} for vfunc of length={}",
