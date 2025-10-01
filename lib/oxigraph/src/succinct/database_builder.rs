@@ -14,6 +14,7 @@ pub struct DatabaseBuilder {
     location: PathBuf,
     approx_num_quads: Option<usize>,
     approx_quads_per_file: Option<usize>,
+    rebuild: bool,
     rdf_format_from_path: fn(&Path) -> Result<RdfFormat>,
     quad_orders: Vec<QuadOrder>,
 }
@@ -39,6 +40,7 @@ impl DatabaseBuilder {
             parse_quad_args: None,
             approx_num_quads: None,
             approx_quads_per_file: None,
+            rebuild: false,
             rdf_format_from_path: default_rdf_format_from_path,
             quad_orders: vec![QuadOrder::Opsg, QuadOrder::Spog],
         }
@@ -63,6 +65,11 @@ impl DatabaseBuilder {
             approx_quads_per_file,
             ..self
         }
+    }
+
+    /// Whether to regenerate files that already exist
+    pub fn with_rebuild(self, rebuild: bool) -> Self {
+        Self { rebuild, ..self }
     }
 
     pub fn with_parse_quad_args(self, parse_quad_args: Option<ParseQuadsArgs>) -> Self {
@@ -125,6 +132,10 @@ impl DatabaseBuilder {
     }
 
     pub fn extract_terms(&self) -> Result<()> {
+        if !self.rebuild && self.terms_path().join("config.json").exists() {
+            log::info!("Skipping terms extraction, already done.");
+            return Ok(());
+        }
         let parse_quad_args = self
             .parse_quad_args
             .as_ref()
@@ -163,9 +174,13 @@ impl DatabaseBuilder {
     }
 
     pub fn build_terms_mphf(&self) -> Result<()> {
+        let mphf_path = self.location.join("terms_mphf");
+        if !self.rebuild && mphf_path.exists() {
+            log::info!("Skipping MPHF construction, already done.");
+            return Ok(());
+        }
         let mphf = terms_mphf::build_terms_mphf(&self.terms_path())
             .context("Could not build terms MPHF")?;
-        let mphf_path = self.location.join("terms_mphf");
         mphf.serialize(&mphf_path)
             .with_context(|| format!("Could not write terms MPHF to {}", mphf_path.display()))
     }
@@ -199,6 +214,12 @@ impl DatabaseBuilder {
             .context("parse_quad_args not set")?;
         let quads_path = self.location.join(format!("quads-{order}"));
         let mphf_path = self.location.join("terms_mphf");
+
+        if !self.rebuild && quads_path.join("config.json").exists() {
+            log::info!("Skipping quads extraction, already done.");
+            return Ok(());
+        }
+
         let terms_mphf = terms_mphf::TermMphf::load(&mphf_path)
             .with_context(|| format!("Could not mmap terms MPHF from {}", mphf_path.display()))?;
         if !self.location.exists() {
@@ -238,6 +259,11 @@ impl DatabaseBuilder {
     pub fn recompress_quad_store(&self, from_order: QuadOrder, to_order: QuadOrder) -> Result<()> {
         let quads_from_path = self.location.join(format!("quads-{from_order}"));
         let quads_to_path = self.location.join(format!("quads-{to_order}"));
+
+        if !self.rebuild && quads_to_path.join("config.json").exists() {
+            log::info!("Skipping {to_order} quads extraction, already done.");
+            return Ok(());
+        }
 
         let config_path = quads_from_path.join("config.json");
         let config_file = File::open(&config_path)
