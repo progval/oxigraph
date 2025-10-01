@@ -5,14 +5,14 @@ use anyhow::{Context, Result, anyhow, ensure};
 use oxrdf::{GraphName, Term};
 use spareval::{InternalQuad, QueryableDataset};
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0:#}")]
 pub struct SuccinctDatasetError(#[from] anyhow::Error);
 
 #[derive(Clone)]
-pub struct SuccinctDatasetView<'a>(pub &'a SuccinctDatasetViewInner);
+pub struct SuccinctDatasetView(pub Arc<SuccinctDatasetViewInner>);
 
 pub struct SuccinctDatasetViewInner {
     terms_mphf: DefaultDeserializedTermMphf,
@@ -27,7 +27,7 @@ pub struct SuccinctDatasetViewInner {
     _dataset: InternalizedDatasetSpec,
 }
 
-impl SuccinctDatasetViewInner {
+impl SuccinctDatasetView {
     pub fn new(path: &Path, mmap_mphf: bool) -> Result<Self> {
         let spog_quads_path = path.join(format!("quads-spog"));
         let spog_quads =
@@ -50,7 +50,7 @@ impl SuccinctDatasetViewInner {
                 format!("Could not load terms MPHF from {}", mphf_path.display())
             })?
         };
-        let mut view = Self {
+        let view = Self(Arc::new(SuccinctDatasetViewInner {
             terms_mphf,
             terms,
             spog_quads,
@@ -61,11 +61,14 @@ impl SuccinctDatasetViewInner {
                 _default: None,
                 _named: None,
             },
-        };
+        }));
 
-        view.default_graph_name = view.internalize_graph_name(&GraphName::DefaultGraph)?;
+        let default_graph_name = view.internalize_graph_name(&GraphName::DefaultGraph)?;
 
-        Ok(view)
+        Ok(Self(Arc::new(SuccinctDatasetViewInner {
+            default_graph_name,
+            ..Arc::into_inner(view.0).context("Arc leaked before SuccinctDatasetView creation")?
+        })))
     }
 }
 
@@ -73,11 +76,11 @@ fn map_iterator<
     'a,
     T,
     U: 'a,
-    IterT: Iterator<Item = Result<T>>,
+    IterT: Iterator<Item = Result<T>> + 'a,
     IterU: Iterator<Item = Result<U>> + 'a,
 >(
     iter: Result<Option<IterT>>,
-    mut f: impl FnMut(IterT) -> IterU,
+    mut f: impl FnMut(IterT) -> IterU + 'a,
 ) -> Box<dyn Iterator<Item = Result<U, SuccinctDatasetError>> + 'a> {
     match iter {
         Ok(Some(iter)) => Box::new(f(iter).map(|item| item.map_err(SuccinctDatasetError))),
@@ -86,7 +89,7 @@ fn map_iterator<
     }
 }
 
-impl<'a> QueryableDataset<'a> for SuccinctDatasetView<'a> {
+impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
     type InternalTerm = usize;
 
     type Error = SuccinctDatasetError;
@@ -101,7 +104,6 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView<'a> {
         object: Option<&Self::InternalTerm>,
         graph_name: Option<Option<&Self::InternalTerm>>,
     ) -> impl Iterator<Item = Result<InternalQuad<Self::InternalTerm>, Self::Error>> + use<'a> {
-        let inner = self.0;
         let graph_name: Option<usize> = graph_name.map(|gn| match gn {
             None => {
                 let Ok(gn) = self.0.terms_mphf.hash_graphname(&GraphName::DefaultGraph) else {
@@ -118,12 +120,14 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView<'a> {
         let subject: Option<usize> = subject.copied();
         let predicate: Option<usize> = predicate.copied();
         let object: Option<usize> = object.copied();
+        let notself = self.clone();
         match (subject, predicate, object, graph_name) {
-            (Some(subject), Some(predicate), _, _) => map_iterator(
-                inner
+            (Some(subject), Some(predicate), _, _) => map_iterator::<'a, _, _, _, _>(
+                self.0
                     .spog_quads
                     .iter_quads_by_first_two_terms(subject, predicate),
                 move |iter| {
+                    let notself = notself.clone();
                     iter.filter_map(move |quad| -> Option<Result<_>> {
                         ({
                             || -> Result<Option<_>> {
@@ -140,7 +144,7 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView<'a> {
                                         return Ok(None);
                                     }
                                 }
-                                Ok(Some(inner.to_internal_quad(quad)))
+                                Ok(Some(notself.to_internal_quad(quad)))
                             }
                         })()
                         .transpose()
@@ -148,10 +152,11 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView<'a> {
                 },
             ),
             (_, Some(predicate), Some(object), _) => map_iterator(
-                inner
+                self.0
                     .opsg_quads
                     .iter_quads_by_first_two_terms(object, predicate),
                 move |iter| {
+                    let notself = notself.clone();
                     iter.filter_map(move |quad| -> Option<Result<_>> {
                         ({
                             || -> Result<Option<_>> {
@@ -219,14 +224,14 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView<'a> {
     }
 }
 
-impl SuccinctDatasetViewInner {
+impl SuccinctDatasetView {
     fn to_internal_quad(&self, quad: [usize; 4]) -> InternalQuad<usize> {
         let [subject, predicate, object, graph_name] = quad;
         InternalQuad {
             subject,
             predicate,
             object,
-            graph_name: if Some(graph_name) == self.default_graph_name {
+            graph_name: if Some(graph_name) == self.0.default_graph_name {
                 None
             } else {
                 Some(graph_name)
@@ -235,8 +240,8 @@ impl SuccinctDatasetViewInner {
     }
 
     fn internalize_graph_name(&self, graph_name: &GraphName) -> Result<Option<usize>> {
-        if let Ok(id) = self.terms_mphf.hash_graphname(graph_name) {
-            if let Some(expected_graph_name_str) = self.terms.get(id)? {
+        if let Ok(id) = self.0.terms_mphf.hash_graphname(graph_name) {
+            if let Some(expected_graph_name_bytes) = self.0.terms.get(id)? {
                 let graph_name_str_matches = match graph_name {
                     // TODO: dedup with TermHasher
                     GraphName::NamedNode(n) => expected_graph_name_str == n.as_str(),

@@ -269,7 +269,7 @@ pub fn par_iter_quads(
             let de_order_quad = order.mapper();
             Ok(SortedArraysFile::mmap(&path)
                 .with_context(|| format!("Could not mmap array file {}", path.display()))?
-                .into_iter()
+                .owned_iter()
                 .with_context(|| format!("Could not read array file {}", path.display()))?
                 .map(move |quad| Ok(de_order_quad(quad?))))
         })
@@ -623,7 +623,7 @@ impl QuadStore {
     pub fn iter_quads_by_first_term(
         &self,
         term: usize,
-    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<'_>>> {
+    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<>>> {
         self.get_partition(term)?.iter_quads_by_first_term(term)
     }
 
@@ -631,7 +631,7 @@ impl QuadStore {
         &self,
         term1: usize,
         term2: usize,
-    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<'_>>> {
+    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<>>> {
         self.get_partition(term1)?
             .iter_quads_by_first_two_terms(term1, term2)
     }
@@ -698,7 +698,7 @@ impl QuadPartition {
     pub fn iter_quads_by_first_term(
         &self,
         term: usize,
-    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>>>> {
+    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<>>> {
         // get the positition of the first frame that contains a quad with the term.
         // If the first term is not in any quad, then this is the frame of a quad it
         // would come right after
@@ -707,7 +707,7 @@ impl QuadPartition {
         let mut took_error = false;
         Ok(Some(
             self.quads
-                .iter_from_position(from_bit_position)?
+                .owned_iter_from_position(from_bit_position)?
                 .skip_while(move |quad| {
                     if let Ok(quad) = quad {
                         // skip quads until we find one that matches
@@ -740,7 +740,7 @@ impl QuadPartition {
         &self,
         term1: usize,
         term2: usize,
-    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>>>> {
+    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<>>> {
         let relative_term1 = term1
             .checked_sub(self.first_first_term)
             .context("term1 is before the start of the partition")?;
@@ -833,7 +833,7 @@ impl QuadPartition {
         let mut took_error = false;
         Ok(Some(
             self.quads
-                .iter_from_position(maybe_from_bit_position)?
+                .owned_iter_from_position(maybe_from_bit_position)?
                 .skip_while(move |quad| {
                     if let Ok(quad) = quad {
                         // skip quads until we find one that matches

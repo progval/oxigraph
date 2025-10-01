@@ -11,11 +11,12 @@ use rustc_hash::FxHashSet;
 use std::fs::File;
 use std::io::{BufWriter, Cursor, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use sux::bits::BitFieldVec;
 use sux::traits::BitFieldSlice;
 use sux::traits::bit_field_slice::BitFieldSliceCore;
 use tempfile::TempDir;
-use webgraph::utils::MmapHelper;
+use webgraph::utils::{ArcMmapHelper, MmapHelper};
 
 /// Sorts and deduplicates strings and spills to disk to save memory
 ///
@@ -489,7 +490,7 @@ impl<const N: usize> ExternalArraySorter<N> {
     fn iter_written_quads(files: &[PathBuf]) -> Result<impl Iterator<Item = Result<[usize; N]>>> {
         Ok(files
             .iter()
-            .map(|path| SortedArraysFile::mmap(path)?.into_iter())
+            .map(|path| SortedArraysFile::mmap(path)?.owned_iter())
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .kmerge_by(|left, right| match (left, right) {
@@ -502,7 +503,7 @@ impl<const N: usize> ExternalArraySorter<N> {
 }
 
 pub struct SortedArraysFile<const N: usize> {
-    data: MmapHelper<u64>,
+    data: Arc<MmapHelper<u64>>,
 }
 
 impl<const N: usize> SortedArraysFile<N> {
@@ -614,8 +615,10 @@ impl<const N: usize> SortedArraysFile<N> {
 
     pub fn mmap(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let data = MmapHelper::mmap(path, MmapFlags::SEQUENTIAL)
-            .with_context(|| format!("Could not mmap array file {}", path.display()))?;
+        let data = Arc::new(
+            MmapHelper::mmap(path, MmapFlags::SEQUENTIAL)
+                .with_context(|| format!("Could not mmap array file {}", path.display()))?,
+        );
 
         Ok(Self { data })
     }
@@ -631,15 +634,15 @@ impl<const N: usize> SortedArraysFile<N> {
         &self,
         from_bit_position: usize,
     ) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + '_> {
-        Self::_iter_with_positions(&self.data, from_bit_position)
+        Self::_iter_with_positions(&*self.data, from_bit_position)
     }
 
-    /// Same as [`Self::iter_with_positions`] but consumes self
-    pub fn into_iter_with_positions(
-        self,
+    /// Same as [`Self::iter_with_positions`] but increments an internal [`Arc`] to return `'static`
+    pub fn owned_iter_with_positions(
+        &self,
         from_bit_position: usize,
-    ) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + 'static> {
-        Self::_iter_with_positions(self.data, from_bit_position)
+    ) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + 'static + use<N>> {
+        Self::_iter_with_positions(ArcMmapHelper(Arc::clone(&self.data)), from_bit_position)
     }
 
     fn _iter_with_positions<'a>(
@@ -739,13 +742,13 @@ impl<const N: usize> SortedArraysFile<N> {
         }))
     }
 
-    /// Same as [`Self::iter_with_positions`] but consumes self
-    pub fn into_iter_from_position(
-        self,
+    /// Same as [`Self::iter_from_position`] but increments an internal [`Arc`] to return `'static`
+    pub fn owned_iter_from_position(
+        &self,
         from_bit_position: usize,
-    ) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'static> {
+    ) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'static + use<N>> {
         Ok(self
-            .into_iter_with_positions(from_bit_position)?
+            .owned_iter_with_positions(from_bit_position)?
             .map(|item| {
                 let (_bit_pos, quad) = item?;
                 Ok(quad)
@@ -757,9 +760,11 @@ impl<const N: usize> SortedArraysFile<N> {
         self.iter_from_position(0)
     }
 
-    /// Same as [`Self::iter`] but consumes self
-    pub fn into_iter(self) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'static> {
-        self.into_iter_from_position(0)
+    /// Same as [`Self::iter`] but increments an internal [`Arc`] to return `'static`
+    pub fn owned_iter(
+        &self,
+    ) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'static + use<N>> {
+        self.owned_iter_from_position(0)
     }
 }
 
