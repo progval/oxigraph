@@ -481,22 +481,44 @@ impl TermStore {
         // Compute the offset of the term within the frame
         let offset_in_frame = id % self.config.terms_per_frame;
 
-        // Decompress the frame
-        let mut decompressed_frame = Vec::with_capacity(
-            usize::try_from(zstd::zstd_safe::BLOCKSIZE_MAX)
-                .context("decompressed zstd frame size overflows usize")?,
-        );
-        zstd::zstd_safe::decompress(
-            &mut decompressed_frame,
+        const ERR_BUFFER_SIZE_TOO_SMALL: zstd::zstd_safe::ErrorCode =
+            zstd::zstd_safe::ErrorCode::MAX - 69; // not documented...
+        let frame_compressed_size = match zstd::zstd_safe::find_frame_compressed_size(
             &partition.compressed_frames[frame_position..],
-        )
-        .map_err(|errno| {
-            anyhow!(
-                "Could not decompressed frame at offset {frame_position} of {}: {}",
+        ) {
+            Ok(frame_size) => frame_size,
+            Err(errno) => bail!(
+                "Could not get compressed size of frame at offset {frame_position} of {}: Error {errno} ({})",
                 partition.path.display(),
                 zstd::zstd_safe::get_error_name(errno)
-            )
-        })?;
+            ),
+        };
+
+        // heuristic, as zstd_safe::find_decompressed_size is 'experimental'
+        let frame_decompressed_size = frame_compressed_size.saturating_mul(2);
+        let mut decompressed_frame = Vec::with_capacity(frame_decompressed_size);
+        loop {
+            match zstd::zstd_safe::decompress(
+                &mut decompressed_frame,
+                &partition.compressed_frames
+                    [frame_position..frame_position + frame_compressed_size],
+            ) {
+                Ok(_) => break,
+                Err(ERR_BUFFER_SIZE_TOO_SMALL) => {
+                    decompressed_frame = Vec::with_capacity(
+                        decompressed_frame
+                            .capacity()
+                            .checked_mul(2)
+                            .context("frame capacity overflowed usize")?,
+                    );
+                }
+                Err(errno) => bail!(
+                    "Could not decompressed frame at offset {frame_position} of {}: Error {errno} ({})",
+                    partition.path.display(),
+                    zstd::zstd_safe::get_error_name(errno)
+                ),
+            }
+        }
         let mut frame_reader = Cursor::new(decompressed_frame);
 
         // Skip all terms before the one we are looking for, then read the right one
