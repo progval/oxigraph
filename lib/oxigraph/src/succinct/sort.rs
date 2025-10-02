@@ -556,22 +556,24 @@ impl<const N: usize> SortedArraysFile<N> {
             let mut must_zigzag = false;
             for (&previous_cell, &cell) in previous_item.iter().zip(item.iter()) {
                 if must_zigzag {
-                    let diff = i64::try_from(cell).context("value overflows i64")?
-                        - i64::try_from(previous_cell).context("value overflows i64")?;
+                    let diff = i64::try_from(cell).context("current term overflows i64")?
+                        - i64::try_from(previous_cell).context("previous term overflows i64")?;
                     let zigzag = diff.to_nat();
                     writer
                         .write_gamma(zigzag)
                         .context("Could not write gamma")?;
                 } else {
                     let diff = u64::try_from(cell)
-                        .context("value overflows u64")?
-                        .checked_sub(u64::try_from(previous_cell).context("value overflows u64")?)
+                        .context("current term overflows u64")?
+                        .checked_sub(
+                            u64::try_from(previous_cell).context("previous term overflows u64")?,
+                        )
                         .context(
                             "write_sorted_array_file got non-sorted quads after the initial check",
                         )?;
                     writer.write_gamma(diff).context("Could not write gamma")?;
 
-                    if cell > previous_cell {
+                    if diff > 0 {
                         // this term is a strict increase, so terms after it in the quad are
                         // not guaranteed to be >= the corresponding term in the previous quad,
                         // so we must zigzag-encode them all for the rest of this term.
@@ -657,6 +659,15 @@ impl<const N: usize> SortedArraysFile<N> {
         reader
             .set_bit_pos(u64::try_from(from_bit_position).context("bit position overflowed u64")?)
             .with_context(|| format!("Could not seek to bit position {from_bit_position}"))?;
+        if from_bit_position != 0 {
+            ensure!(
+                reader.read_bits(1).context("Could not read frame bit")? == 1,
+                "_iter_with_positions started from {from_bit_position} which is not the start of a frame."
+            )
+        }
+        reader
+            .set_bit_pos(u64::try_from(from_bit_position).context("bit position overflowed u64")?)
+            .with_context(|| format!("Could not seek to bit position {from_bit_position}"))?;
 
         Ok(std::iter::repeat(()).map_while(move |()| {
             (|| {
@@ -682,7 +693,7 @@ impl<const N: usize> SortedArraysFile<N> {
                         *cell = u64::try_from(previous_cell)
                             .context("previous value overflows u64")?
                             .checked_add_signed(diff)
-                            .context("value overflows u64")?
+                            .context("new value (old + relative delta) overflows u64")?
                             .try_into()
                             .context("value overflows usize")?;
                     } else {
@@ -690,7 +701,7 @@ impl<const N: usize> SortedArraysFile<N> {
                         *cell = u64::try_from(previous_cell)
                             .context("previous value overflows u64")?
                             .checked_add(diff)
-                            .context("value overflows u64")?
+                            .context("new value (old + absolute delta) overflows u64")?
                             .try_into()
                             .context("value overflows usize")?;
 

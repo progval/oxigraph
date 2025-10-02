@@ -687,14 +687,22 @@ impl QuadPartition {
                 first_two_terms_index_path.display()
             )
         })?;
-        Ok(Self {
+        let res = Self {
             _path: path,
             first_first_term,
             quads,
             frame_index,
             first_term_index,
             first_two_terms_index,
-        })
+        };
+        if let Some(first_quad) = res.iter_all_quads().context("Could not iter quads")?.next() {
+            let first_quad = first_quad?;
+            ensure!(
+                first_quad[0] >= first_first_term,
+                "Expected partition to start at {first_first_term} but first quad is {first_quad:?}"
+            );
+        }
+        Ok(res)
     }
 
     pub fn iter_quads_by_first_term(
