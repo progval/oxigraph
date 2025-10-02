@@ -122,6 +122,32 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
         let object: Option<usize> = object.copied();
         let notself = self.clone();
         match (subject, predicate, object, graph_name) {
+            (Some(subject), None, _, _) => map_iterator::<'a, _, _, _, _>(
+                self.0.spog_quads.iter_quads_by_first_term(subject),
+                move |iter| {
+                    let notself = notself.clone();
+                    iter.filter_map(move |quad| -> Option<Result<_>> {
+                        ({
+                            || -> Result<Option<_>> {
+                                let quad = QuadOrder::Spog.mapper()(quad?);
+                                ensure!(quad[0] == subject, "subject did not match");
+                                if let Some(object) = object {
+                                    if quad[2] != object {
+                                        return Ok(None);
+                                    }
+                                }
+                                if let Some(graph_name) = graph_name {
+                                    if quad[3] != graph_name {
+                                        return Ok(None);
+                                    }
+                                }
+                                Ok(Some(notself.to_internal_quad(quad)))
+                            }
+                        })()
+                        .transpose()
+                    })
+                },
+            ),
             (Some(subject), Some(predicate), _, _) => map_iterator::<'a, _, _, _, _>(
                 self.0
                     .spog_quads
@@ -139,6 +165,32 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
                                         return Ok(None);
                                     }
                                 }
+                                if let Some(graph_name) = graph_name {
+                                    if quad[3] != graph_name {
+                                        return Ok(None);
+                                    }
+                                }
+                                Ok(Some(notself.to_internal_quad(quad)))
+                            }
+                        })()
+                        .transpose()
+                    })
+                },
+            ),
+            (_, None, Some(object), _) => map_iterator(
+                self.0.opsg_quads.iter_quads_by_first_term(object),
+                move |iter| {
+                    let notself = notself.clone();
+                    iter.filter_map(move |quad| -> Option<Result<_>> {
+                        ({
+                            || -> Result<Option<_>> {
+                                let quad = QuadOrder::Opsg.mapper()(quad?);
+                                if let Some(subject) = subject {
+                                    if quad[0] != subject {
+                                        return Ok(None);
+                                    }
+                                }
+                                ensure!(quad[2] == object, "subject did not match");
                                 if let Some(graph_name) = graph_name {
                                     if quad[3] != graph_name {
                                         return Ok(None);
