@@ -14,6 +14,7 @@ pub enum DatabaseFormat {
     #[default]
     Autodetect,
     Rocksdb,
+    Succinct,
 }
 
 #[derive(Subcommand)]

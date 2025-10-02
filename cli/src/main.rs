@@ -19,6 +19,7 @@ use oxigraph::model::{
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
 use oxigraph::sparql::{CancellationToken, QueryResults, SparqlEvaluator};
 use oxigraph::store::{BulkLoader, LoaderError, Store};
+use oxigraph::succinct::store::SuccinctStore;
 use oxigraph_cli::utils::{format_from_path, rdf_format_from_name, rdf_format_from_path};
 use oxiri::Iri;
 use rand::random;
@@ -58,6 +59,7 @@ const LOGO: &str = include_str!("../logo.svg");
 #[derive(Clone)]
 enum Database {
     Store(Store),
+    Succinct(SuccinctStore),
 }
 
 impl From<Store> for Database {
@@ -66,20 +68,46 @@ impl From<Store> for Database {
     }
 }
 
+impl From<SuccinctStore> for Database {
+    fn from(store: SuccinctStore) -> Self {
+        Self::Succinct(store)
+    }
+}
+
 impl Database {
     fn open(format: DatabaseFormat, location: &Path) -> anyhow::Result<Self> {
         match format {
-            DatabaseFormat::Autodetect | DatabaseFormat::Rocksdb => {
-                Ok(Store::open(location)?.into())
+            DatabaseFormat::Autodetect => {
+                if fs::exists(location.join("terms"))? {
+                    bail!("Succinct backend can only be opened read-only");
+                } else {
+                    Ok(Store::open(location)
+                        .context("Could not open database with RocksDB backend")?
+                        .into())
+                }
+            }
+            DatabaseFormat::Rocksdb => Ok(Store::open(location)?.into()),
+            DatabaseFormat::Succinct => {
+                bail!("Succinct backend can only be opened read-only");
             }
         }
     }
 
     fn open_read_only(format: DatabaseFormat, location: &Path) -> anyhow::Result<Self> {
         match format {
-            DatabaseFormat::Autodetect | DatabaseFormat::Rocksdb => {
-                Ok(Store::open_read_only(location)?.into())
+            DatabaseFormat::Autodetect => {
+                if fs::exists(location.join("terms"))? {
+                    Ok(SuccinctStore::open_read_only(location)
+                        .context("Could not open database with Succinct backend")?
+                        .into())
+                } else {
+                    Ok(Store::open_read_only(location)
+                        .context("Could not open database with RocksDB backend")?
+                        .into())
+                }
             }
+            DatabaseFormat::Rocksdb => Ok(Store::open_read_only(location)?.into()),
+            DatabaseFormat::Succinct => Ok(SuccinctStore::open_read_only(location)?.into()),
         }
     }
 
@@ -87,6 +115,7 @@ impl Database {
     fn bulk_loader(&self) -> anyhow::Result<BulkLoader<'_>> {
         match self {
             Self::Store(store) => Ok(store.bulk_loader()),
+            Self::Succinct(_) => bail!("Backend is read-only"),
         }
     }
 }
@@ -101,21 +130,13 @@ pub fn main() -> anyhow::Result<()> {
             cors,
             union_default_graph,
             timeout_s,
-        } => match database_format {
-            DatabaseFormat::Autodetect | DatabaseFormat::Rocksdb => serve(
-                if let Some(location) = location {
-                    Store::open(location)
-                } else {
-                    Store::new()
-                }?
-                .into(),
-                &bind,
-                false,
-                cors,
-                union_default_graph,
-                timeout_s,
-            ),
-        },
+        } => {
+            let database = match location {
+                Some(location) => Database::open(database_format, &location)?,
+                None => Database::Store(Store::new()?), // MemoryStorage
+            };
+            serve(database, &bind, false, cors, union_default_graph, timeout_s)
+        }
         Command::ServeReadOnly {
             database_format,
             location,
@@ -139,6 +160,7 @@ pub fn main() -> anyhow::Result<()> {
         } => {
             match Database::open_read_only(database_format, &location)? {
                 Database::Store(store) => store.backup(destination)?,
+                Database::Succinct(_) => bail!("Succinct backend does not support backups"),
             }
             Ok(())
         }
@@ -197,7 +219,6 @@ pub fn main() -> anyhow::Result<()> {
                 )?;
                 loader.commit()?;
             } else {
-
                 ThreadPoolBuilder::new()
                     .num_threads(max(1, available_parallelism()?.get() / 2))
                     .thread_name(|i| format!("Oxigraph bulk loader thread {i}"))
@@ -227,7 +248,11 @@ pub fn main() -> anyhow::Result<()> {
                                     if lenient {
                                         let f = file.clone();
                                         loader = loader.on_parse_error(move |e| {
-                                            eprintln!("Parsing error on file {}: {}", f.display(), e);
+                                            eprintln!(
+                                                "Parsing error on file {}: {}",
+                                                f.display(),
+                                                e
+                                            );
                                             Ok(())
                                         })
                                     }
@@ -278,8 +303,11 @@ pub fn main() -> anyhow::Result<()> {
 
                                     Ok(())
                                 })();
-                                #[expect(clippy::expect_used)] // spawned closures can't return Result
-                                result_sender.send(result).expect("Result receiver unexpectedly closed");
+                                #[expect(clippy::expect_used)]
+                                // spawned closures can't return Result
+                                result_sender
+                                    .send(result)
+                                    .expect("Result receiver unexpectedly closed");
                             })
                         }
                         while let Ok(result) = result_receiver.recv() {
@@ -367,6 +395,14 @@ pub fn main() -> anyhow::Result<()> {
             let (results, explanation) = match database {
                 Database::Store(store) => {
                     let mut prepared = prepared.on_store(&store);
+                    if stats {
+                        prepared = prepared.compute_statistics();
+                    }
+                    prepared.explain()
+                }
+                Database::Succinct(store) => {
+                    let dataset = store.with_query_dataset(prepared.dataset())?;
+                    let mut prepared = prepared.clone().on_queryable_dataset(dataset);
                     if stats {
                         prepared = prepared.compute_statistics();
                     }
@@ -522,6 +558,7 @@ pub fn main() -> anyhow::Result<()> {
                     .parse_update(&update)?
                     .on_store(&store)
                     .execute()?,
+                Database::Succinct(_) => bail!("Succinct backend does not support backups"),
             }
             Ok(())
         }
@@ -531,6 +568,7 @@ pub fn main() -> anyhow::Result<()> {
         } => {
             match Database::open(database_format, &location)? {
                 Database::Store(store) => store.optimize()?,
+                Database::Succinct(_) => bail!("Succinct backend does not support backups"),
             }
             Ok(())
         }
@@ -701,6 +739,7 @@ fn dump<W: Write>(
         } else {
             store.dump_to_writer(format, writer)
         }?),
+        Database::Succinct(_) => bail!("Succinct backend does not support dumping"),
     }
 }
 
@@ -1018,6 +1057,19 @@ fn handle_request(
                         );
                         build_response(format, quads)
                     }
+                    Database::Succinct(store) => {
+                        let store = store.clone();
+                        let quads = store
+                            .quads_for_pattern(
+                                None,
+                                None,
+                                None,
+                                Some(GraphName::from(target).as_ref()),
+                            )
+                            .map_err(internal_server_error)?
+                            .map(|item| item.map_err(io::Error::other));
+                        build_response(format, quads)
+                    }
                 }
             } else {
                 fn build_response<E>(
@@ -1050,6 +1102,14 @@ fn handle_request(
                 }
                 match database {
                     Database::Store(store) => build_response(format, store.iter()),
+                    Database::Succinct(store) => {
+                        let store = store.clone();
+                        let quads = store
+                            .quads_for_pattern(None, None, None, None)
+                            .map_err(internal_server_error)?
+                            .map(|item| item.map_err(io::Error::other));
+                        build_response(format, quads)
+                    }
                 }
             }
         }
@@ -1106,6 +1166,7 @@ fn handle_request(
                             .map_err(internal_server_error)
                     }
                 }
+                Database::Succinct(_) => Err(the_server_is_read_only()),
             }
         }
         (path, "DELETE") if path.starts_with("/store") => {
@@ -1143,6 +1204,7 @@ fn handle_request(
                         .body(Body::empty())
                         .map_err(internal_server_error)
                 }
+                Database::Succinct(_) => Err(the_server_is_read_only()),
             }
         }
         (path, "POST") if path.starts_with("/store") => {
@@ -1373,6 +1435,16 @@ fn evaluate_sparql_query(
             .on_store(store)
             .execute()
             .map_err(internal_server_error)?,
+        Database::Succinct(store) => {
+            let store = store.clone();
+            let dataset = store
+                .with_query_dataset(prepared.dataset())
+                .map_err(internal_server_error)?;
+            prepared
+                .on_queryable_dataset(dataset)
+                .execute()
+                .map_err(internal_server_error)?
+        }
     };
     match results {
         QueryResults::Solutions(solutions) => {
@@ -1530,6 +1602,7 @@ fn evaluate_sparql_update(
             .on_store(store)
             .execute()
             .map_err(internal_server_error)?,
+        Database::Succinct(_) => return Err(the_server_is_read_only()),
     };
     Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -1566,6 +1639,9 @@ fn assert_that_graph_exists(database: &Database, target: &NamedGraphName) -> Res
         NamedGraphName::DefaultGraph => true,
         NamedGraphName::NamedNode(target) => match database {
             Database::Store(store) => store
+                .contains_named_graph(target)
+                .map_err(internal_server_error)?,
+            Database::Succinct(store) => store
                 .contains_named_graph(target)
                 .map_err(internal_server_error)?,
         },
@@ -1727,7 +1803,7 @@ fn web_load_graph(
         parser = parser.with_base_iri(base_iri).map_err(bad_request)?;
     }
     if url_query_parameter(request, "no_transaction").is_some() {
-        let mut loader = web_bulk_loader(database, request);
+        let mut loader = web_bulk_loader(database, request)?;
         loader
             .load_from_reader(parser, request.body_mut())
             .map_err(loader_to_http_error)?;
@@ -1737,6 +1813,7 @@ fn web_load_graph(
             Database::Store(store) => store
                 .load_from_reader(parser, request.body_mut())
                 .map_err(loader_to_http_error),
+            Database::Succinct(_) => Err(the_server_is_read_only()),
         }
     }
 }
@@ -1751,7 +1828,7 @@ fn web_load_dataset(
         parser = parser.lenient();
     }
     if url_query_parameter(request, "no_transaction").is_some() {
-        let mut loader = web_bulk_loader(database, request);
+        let mut loader = web_bulk_loader(database, request)?;
         loader
             .load_from_reader(parser, request.body_mut())
             .map_err(loader_to_http_error)?;
@@ -1761,11 +1838,15 @@ fn web_load_dataset(
             Database::Store(store) => store
                 .load_from_reader(parser, request.body_mut())
                 .map_err(loader_to_http_error),
+            Database::Succinct(_) => Err(the_server_is_read_only()),
         }
     }
 }
 
-fn web_bulk_loader<'a>(database: &'a Database, request: &Request<Body>) -> BulkLoader<'a> {
+fn web_bulk_loader<'a>(
+    database: &'a Database,
+    request: &Request<Body>,
+) -> Result<BulkLoader<'a>, HttpError> {
     let start = Instant::now();
     match database {
         Database::Store(store) => {
@@ -1784,8 +1865,9 @@ fn web_bulk_loader<'a>(database: &'a Database, request: &Request<Body>) -> BulkL
                     Ok(())
                 })
             }
-            loader
+            Ok(loader)
         }
+        Database::Succinct(_) => Err(the_server_is_read_only()),
     }
 }
 
