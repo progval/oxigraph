@@ -625,6 +625,17 @@ impl QuadStore {
         Ok(&self.partitions[term / num_terms_per_partition])
     }
 
+    pub fn iter_all_quads(
+        &self,
+    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<>>> {
+        let parts = self
+            .partitions
+            .iter()
+            .map(|partition| partition.iter_all_quads())
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(parts.into_iter().flatten()))
+    }
+
     pub fn iter_quads_by_first_term(
         &self,
         term: usize,
@@ -706,6 +717,10 @@ impl QuadPartition {
             );
         }
         Ok(res)
+    }
+
+    pub fn iter_all_quads(&self) -> Result<impl Iterator<Item = Result<[usize; 4]>> + use<>> {
+        Ok(self.quads.owned_iter()?)
     }
 
     pub fn iter_quads_by_first_term(

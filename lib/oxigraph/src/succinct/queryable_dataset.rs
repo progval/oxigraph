@@ -232,6 +232,15 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
                     })
                 },
             ),
+            (None, None, None, None) => {
+                map_iterator(self.0.spog_quads.iter_all_quads(), move |iter| {
+                    let notself = notself.clone();
+                    iter.map(move |quad| -> Result<_> {
+                        let quad = QuadOrder::Spog.mapper()(quad?);
+                        Ok(notself.to_internal_quad(quad))
+                    })
+                })
+            }
             (None, None, None, Some(graph_name)) => {
                 map_iterator::<'a, _, _, _, _>(self.0.spog_quads.iter_all_quads(), move |iter| {
                     let notself = notself.clone();
