@@ -328,10 +328,15 @@ pub(super) fn list_terms_files(
 pub fn index_terms(dir: &Path) -> Result<()> {
     let (config, terms_files) = list_terms_files(dir)?;
     let mut pl = concurrent_progress_logger!(
-        item_name = "term",
+        item_name = "frame",
         display_memory = true,
         local_speed = true,
-        expected_updates = Some(config.num_terms),
+        expected_updates = Some(
+            terms_files
+                .iter()
+                .map(|tf| tf.num_terms.div_ceil(config.terms_per_frame))
+                .sum()
+        ),
     );
     pl.start("Indexing terms...");
 
@@ -365,6 +370,7 @@ pub fn index_terms(dir: &Path) -> Result<()> {
                             )
                         })?;
                 efb.push(offset);
+                pl.light_update();
 
                 offset += frame_compressed_size;
             }

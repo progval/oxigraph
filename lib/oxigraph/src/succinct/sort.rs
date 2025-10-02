@@ -620,7 +620,10 @@ impl<const N: usize> SortedArraysFile<N> {
     }
 
     pub fn file_len(&self) -> usize {
-        self.data.len()
+        self.data
+            .len()
+            .checked_mul(size_of::<u64>())
+            .expect("File length (in bytes) overflowed usize")
     }
 
     /// Same as [`Self::iter`] but instead of quads, yields:
@@ -647,7 +650,7 @@ impl<const N: usize> SortedArraysFile<N> {
     ) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + 'a> {
         let mut reader = BufBitReader::<LE, _>::new(MemWordReader::<u64, _>::new(data));
 
-        let mut first_quad = true;
+        let mut first_quad = from_bit_position == 0;
         let mut actual_previous_item = [0usize; N];
         let mut previous_item = [0usize; N];
 
@@ -662,7 +665,8 @@ impl<const N: usize> SortedArraysFile<N> {
                 let new_frame = reader.read_bits(1).context("Could not read frame bit")? == 1;
                 let bit_pos = if new_frame {
                     previous_item = [0; N];
-                    Some(reader.bit_pos().context("Could not get bit position")?)
+                    // -1 because we want to start at the bit we just read
+                    Some(reader.bit_pos().context("Could not get bit position")? - 1)
                 } else {
                     None
                 };

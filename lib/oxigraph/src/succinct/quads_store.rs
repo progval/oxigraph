@@ -13,10 +13,10 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use sux::bits::BitFieldVec;
-use sux::dict::elias_fano::{EfSeq, EliasFanoBuilder};
+use sux::dict::elias_fano::{EfSeq, EfSeqDict, EliasFanoBuilder};
 use sux::func::{VBuilder, VFunc};
-use sux::traits::IndexedSeq;
 use sux::traits::bit_field_slice::BitFieldSlice;
+use sux::traits::{IndexedDict, IndexedSeq};
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
 pub enum QuadOrder {
@@ -342,7 +342,7 @@ pub fn index_frames(dir: &Path) -> Result<()> {
                     Ok(())
                 })
                 .with_context(|| format!("Could not read frame offsets from {}", path.display()))?;
-            let ef = efb.build_with_seq();
+            let ef = efb.build_with_seq_and_dict();
 
             let index_file_path = path.with_extension("frames.ef");
             let mut index_file = File::create(&index_file_path)
@@ -395,6 +395,7 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
                 num_terms_in_partition,
                 file_len_bits,
             );
+            efb.push(0); // first term is always in the first frame if present
 
             SortedArraysFile::<4>::mmap(&path)
             .with_context(|| format!("Could not mmap array file {}", path.display()))?
@@ -446,6 +447,7 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
             })
             .with_context(|| format!("Could not read frame offsets from {}", path.display()))?;
             let ef = efb.build_with_seq();
+            ensure!(ef.len() == num_terms_in_partition, "Expected {num_terms_in_partition} terms in partition {partition_id}, wrote {} in Elias-Fano index", ef.len());
 
             let index_file_path = path.with_extension("1term.ef");
             let mut index_file = File::create(&index_file_path)
@@ -642,7 +644,7 @@ struct QuadPartition {
     first_first_term: usize,
     quads: SortedArraysFile<4>,
     /// frame_id -> bit_position
-    frame_index: MemCase<<EfSeq as EpDeserializeInner>::DeserType<'static>>,
+    frame_index: MemCase<<EfSeqDict as EpDeserializeInner>::DeserType<'static>>,
     /// term -> bit_position
     first_term_index: MemCase<<EfSeq as EpDeserializeInner>::DeserType<'static>>,
     /// TermsPair -> frame_id (may have false positives)
@@ -658,7 +660,7 @@ impl QuadPartition {
 
         let frame_index_path = path.with_extension("frames.ef");
         let frame_index =
-            EfSeq::mmap(&frame_index_path, Flags::RANDOM_ACCESS).with_context(|| {
+            EfSeqDict::mmap(&frame_index_path, Flags::RANDOM_ACCESS).with_context(|| {
                 format!(
                     "Could not epdeserialize frame index from {}",
                     frame_index_path.display()
@@ -749,25 +751,32 @@ impl QuadPartition {
             "term1 is after the end of the partition"
         );
 
-        let maybe_first_frame_id = self
-            .first_two_terms_index
-            .get(TermsPair(relative_term1, term2));
+        // get the offset of the id of the first frame matching (term1, term2, _, _) from the first
+        // frame matching (term1, _, _, _) if any, or nonsense if no quad matches (term1, term2, _, _)
+        let relative_frame_id = self.first_two_terms_index.get(TermsPair(term1, term2));
+
+        // get the id of the first frame matching (term1, _, _, _)
+        let position_of_first_frame_with_first_term = self.first_term_index.get(relative_term1);
+        let id_of_first_frame_with_first_term = self.frame_index.index_of(position_of_first_frame_with_first_term)
+            .with_context(|| format!("First frame matching ({term1}, _, _, _) has position {position_of_first_frame_with_first_term}, but the frame index does not know any frame at that position"))?;
+
+        // add them together
+        let Some(maybe_first_frame_id) =
+            relative_frame_id.checked_add(id_of_first_frame_with_first_term)
+        else {
+            return Ok(None);
+        };
+
         if maybe_first_frame_id > self.frame_index.len() {
             // frame does not exist, so the `first_two_terms_index` returned a false positive
             return Ok(None);
         }
         let maybe_from_bit_position = self.frame_index.get(maybe_first_frame_id);
 
-        // Quick checks based only on the first term.
-        // They are redundant with the next checks (based on the first two terms) but
-        // are faster because they do a read in the frame index (small EF)
-        // instead of a read in the first-term index (larger EF) + a read in the quad file
-        if self.first_term_index.get(relative_term1) > maybe_from_bit_position {
-            // the first match of `(relative_term1, _, _, _)` has to be before (or equal to)
-            // the first match of `(relative_term1, term2, _, _)`'.
-            // If it is not, it means `first_two_terms_index` returned a false positive
-            return Ok(None);
-        }
+        // Quick check based only on the first term.
+        // It is redundant with the next checks (based on the first two terms) but
+        // is faster because it does a read in the frame index (small EF) right after the read we
+        // just did (so it's most likely already cached) instead of a random read in the quad file
         if relative_term1 + 1 < self.first_term_index.len() {
             if self.first_term_index.get(relative_term1 + 1) < maybe_from_bit_position {
                 // the first match of `(relative_term1+1, _, _, _)` has to be after (or equal to)
