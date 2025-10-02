@@ -27,8 +27,6 @@ To allow database construction to be parallel, terms and quads are sharded into 
 Zstd files are built so that each frame contains exactly the same number of terms (`terms_per_frame`, 16 by default).
 Sorting them means that similar terms are in the same zstd frame, so they compress well.
 
-TODO: use zstd dictionaires for even better compression
-
 Each term is then associated to an id, which is its position in the zstd-compressed files.
 
 We map each frame's id to its position in the zstd-compressed files using an Elias-Fano sequence.
@@ -40,7 +38,8 @@ Using these two constructs, we can map term strings to their id and vice versa v
 
 This stores `wikidata-20240320-truthy-BETA` terms in:
 
-* 20GiB for the compressed terms
+* 1MiB for the zstd dictionary
+* 17GiB for the compressed terms (or 20GiB without a zstd dictionary)
 * 137MiB for the Elias-Fano indexes
 * 7.5GiB for the VFunc
 

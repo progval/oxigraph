@@ -11,9 +11,14 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use sux::dict::elias_fano::{EfSeqDict, EliasFanoBuilder};
 use sux::traits::{IndexedDict, IndexedSeq};
+
+// Increasing either these values doesn't give noticeably better compression on wikidata-20240320-truthy-BETA.
+pub const DEFAULT_ZSTD_TRAINING_SAMPLES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
+pub const DEFAULT_ZSTD_DICTIONARY_SIZE: NonZeroUsize = NonZeroUsize::new(1_000_000).unwrap();
 
 pub(super) fn write_length_prefixed_string(
     writer: &mut impl Write,
@@ -163,6 +168,7 @@ pub struct TermStoreConfiguration {
     pub terms_per_frame: usize,
     pub frames_per_file: usize,
     pub num_terms: usize,
+    pub zstd_dictionary_filename: Option<String>,
 }
 
 pub fn write_unique_terms(
@@ -174,6 +180,7 @@ pub fn write_unique_terms(
         terms_per_frame: 16,
         frames_per_file: 1024 * 1024,
         num_terms: 0,
+        zstd_dictionary_filename: None,
     };
     let compression_level = 1; // we are going to read it very often and in small chunks
 
@@ -324,6 +331,329 @@ pub(super) fn list_terms_files(
             .collect::<Result<_>>()?,
     ))
 }
+fn decompress_frame(
+    compressed_frame: &[u8],
+    zstd_decompression_dictionary: Option<&zstd::zstd_safe::DDict<'static>>,
+) -> Result<Vec<u8>> {
+    let frame_compressed_size = compressed_frame.len();
+
+    // The doc claims we should reuse DCtx instead of creating it every time, but this doesn't seem
+    // to be true outside the streaming API.
+    let mut decompression_context = zstd::zstd_safe::DCtx::create();
+
+    // heuristic, as zstd_safe::find_decompressed_size is 'experimental'
+    let frame_decompressed_size = frame_compressed_size.saturating_mul(2);
+    let mut decompressed_frame = Vec::with_capacity(frame_decompressed_size);
+
+    const ERR_BUFFER_SIZE_TOO_SMALL: zstd::zstd_safe::ErrorCode =
+        zstd::zstd_safe::ErrorCode::MAX - 69; // not documented...
+    loop {
+        let res = match zstd_decompression_dictionary {
+            Some(zstd_decompression_dictionary) => decompression_context.decompress_using_ddict(
+                &mut decompressed_frame,
+                compressed_frame,
+                &zstd_decompression_dictionary,
+            ),
+            None => decompression_context.decompress(&mut decompressed_frame, compressed_frame),
+        };
+        match res {
+            Ok(_) => return Ok(decompressed_frame),
+            Err(ERR_BUFFER_SIZE_TOO_SMALL) => {
+                decompressed_frame = Vec::with_capacity(
+                    decompressed_frame
+                        .capacity()
+                        .checked_mul(2)
+                        .context("frame capacity overflowed usize")?,
+                );
+            }
+            Err(errno) => bail!(
+                "Could not decompress frame: Error {errno} ({})",
+                zstd::zstd_safe::get_error_name(errno)
+            ),
+        }
+    }
+}
+
+/// Reads all files in the store and writes a new zstd dictionary that can be used to compress it
+/// more efficiently, and returns its file name.
+///
+/// A sample of frames will be selected according to `inverse_sample_rate`. Larger values provide a
+/// better dictionay but use more memory, as all sampled frames need to fit in memory at the same
+/// time.
+///
+/// Call [`recompress_with_dictionary`] to use that dictionary.
+pub fn train_zstd_dictionary(
+    dir: &Path,
+    samples: NonZeroUsize,
+    max_dictionary_size: NonZeroUsize,
+) -> Result<String> {
+    let (config, terms_files) = list_terms_files(dir)?;
+    let total_num_frames = terms_files
+        .iter()
+        .map(|tf| tf.num_terms.div_ceil(config.terms_per_frame))
+        .sum();
+    let mut pl = concurrent_progress_logger!(
+        item_name = "frame",
+        display_memory = true,
+        local_speed = true,
+        expected_updates = Some(total_num_frames),
+    );
+    pl.start("Reading terms...");
+
+    let sample_rate = usize::from(samples) as f64 / total_num_frames as f64;
+
+    let (samples, sample_sizes): (Vec<_>, Vec<_>) = terms_files
+        .into_par_iter()
+        .map_with(pl.clone(), |pl, terms_file| {
+            let TermsFile {
+                first_term_id: _,
+                num_terms,
+                path,
+                compressed_frames,
+            } = terms_file;
+            let num_frames = num_terms.div_ceil(config.terms_per_frame);
+            let compressed_frames = compressed_frames.as_ref();
+
+            let mut offset = 0;
+            let mut samples = Vec::new();
+            let mut sample_sizes = Vec::new();
+
+            for frame_id in 0..num_frames {
+                ensure!(
+                    !compressed_frames[offset..].is_empty(),
+                    "Expected {num_frames} in {}, but there are only {frame_id}",
+                    path.display()
+                );
+                let frame_compressed_size =
+                    zstd::zstd_safe::find_frame_compressed_size(&compressed_frames[offset..])
+                        .map_err(|errno| {
+                            anyhow!(
+                                "Could not get compressed size of frame {frame_id} of {}: {}",
+                                path.display(),
+                                zstd::zstd_safe::get_error_name(errno)
+                            )
+                        })?;
+                pl.light_update();
+                if (rand::random::<u32>() as f64) < sample_rate * (u32::MAX as f64) {
+                    let decompressed_frame = decompress_frame(
+                        &compressed_frames[offset..offset + frame_compressed_size],
+                        None, // we don't support decompressing with a dict yet
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Could not decompress frame at offset {offset} of {}",
+                            path.display(),
+                        )
+                    })?;
+                    sample_sizes.push(decompressed_frame.len());
+                    samples.extend(decompressed_frame);
+                }
+                offset += frame_compressed_size;
+            }
+            ensure!(
+                compressed_frames[offset..].is_empty(),
+                "Expected {num_frames} in {}, but there are more ({} unread bytes)",
+                path.display(),
+                compressed_frames[offset..].len()
+            );
+
+            Ok((samples, sample_sizes))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .unzip();
+    pl.done();
+
+    log::info!("Finalizing training data...");
+    let samples: Vec<_> = samples.into_iter().flatten().collect();
+    let sample_sizes: Vec<_> = sample_sizes.into_iter().flatten().collect();
+    let sample_sizes_sum: usize = sample_sizes.iter().sum();
+
+    log::info!(
+        "Training dictionary with {} samples totalling {sample_sizes_sum} bytes...",
+        samples.len()
+    );
+    let dictionary =
+        zstd::dict::from_continuous(&samples, &sample_sizes, max_dictionary_size.into())
+            .context("Could not train dictionary")?;
+
+    let mut dict_file = tempfile::NamedTempFile::with_prefix_in("zstd_dict_", dir)
+        .with_context(|| format!("Could not create temporary file in {}", dir.display()))?;
+    dict_file.write_all(&dictionary).with_context(|| {
+        format!(
+            "Could not write dictionary to {}",
+            dict_file.path().display()
+        )
+    })?;
+    let (mut dict_file, dict_file_path) = dict_file
+        .keep()
+        .context("Could not persist dictionary file")?;
+    dict_file
+        .flush()
+        .with_context(|| format!("Could not flush dictionary to {}", dict_file_path.display()))?;
+    drop(dict_file);
+    Ok(dict_file_path
+        .file_name()
+        .expect("file has no name")
+        .to_str()
+        .context("Dictionary name is not valid UTF-8")?
+        .to_string())
+}
+
+/// Reads all files in the store and writes them again using a dictionary produced by
+/// [`train_zstd_dictionary`].
+pub fn recompress_with_dictionary(dir: &Path, dictionary_name: String) -> Result<()> {
+    let compression_level = 1; // we are going to read it very often and in small chunks
+    //
+    log::info!("Reading dictionary...");
+    let dictionary_path = dir.join(&dictionary_name);
+    let mut dictionary_file = File::open(&dictionary_path).with_context(|| {
+        format!(
+            "Could not open dictionary file {}",
+            dictionary_path.display()
+        )
+    })?;
+    let mut dictionary_bytes = Vec::new();
+    dictionary_file
+        .read_to_end(&mut dictionary_bytes)
+        .with_context(|| {
+            format!(
+                "Could not read dictionary from {}",
+                dictionary_path.display()
+            )
+        })?;
+    log::info!("Building compression dictionary...");
+    let compression_dictionary =
+        zstd::zstd_safe::CDict::create(&dictionary_bytes, compression_level);
+
+    let (mut config, terms_files) = list_terms_files(dir)?;
+    let mut pl = concurrent_progress_logger!(
+        item_name = "frame",
+        display_memory = true,
+        local_speed = true,
+        expected_updates = Some(
+            terms_files
+                .iter()
+                .map(|tf| tf.num_terms.div_ceil(config.terms_per_frame))
+                .sum()
+        ),
+    );
+    pl.start("Recompressing_terms...");
+
+    let recompressed_files = terms_files
+        .par_iter()
+        .map_with(pl.clone(), |pl, terms_file| {
+            let TermsFile {
+                first_term_id: _,
+                num_terms,
+                path,
+                compressed_frames,
+            } = terms_file;
+            let num_frames = num_terms.div_ceil(config.terms_per_frame);
+            let compressed_frames = compressed_frames.as_ref();
+
+            let mut offset = 0;
+            let mut compression_context = zstd::zstd_safe::CCtx::create();
+
+            let mut recompressed_file = tempfile::NamedTempFile::with_prefix_in(
+                path.file_name().expect("File has no name"),
+                path.parent().expect("File has no parent directory"),
+            )
+            .context("Could not create temporary directory")?;
+
+            for frame_id in 0..num_frames {
+                ensure!(
+                    !compressed_frames[offset..].is_empty(),
+                    "Expected {num_frames} in {}, but there are only {frame_id}",
+                    path.display()
+                );
+                let frame_compressed_size =
+                    zstd::zstd_safe::find_frame_compressed_size(&compressed_frames[offset..])
+                        .map_err(|errno| {
+                            anyhow!(
+                                "Could not get compressed size of frame {frame_id} of {}: {}",
+                                path.display(),
+                                zstd::zstd_safe::get_error_name(errno)
+                            )
+                        })?;
+                pl.light_update();
+                let decompressed_frame = decompress_frame(
+                    &compressed_frames[offset..offset + frame_compressed_size],
+                    None, // we don't support decompressing with a dict yet
+                )
+                .with_context(|| {
+                    format!(
+                        "Could not decompress frame at offset {offset} of {}",
+                        path.display(),
+                    )
+                })?;
+                let mut compressed_frame =
+                    Vec::with_capacity(zstd::zstd_safe::compress_bound(decompressed_frame.len()));
+                compression_context
+                    .compress_using_cdict(
+                        &mut compressed_frame,
+                        &decompressed_frame,
+                        &compression_dictionary,
+                    )
+                    .map_err(|errno| {
+                        anyhow!(
+                            "Could not compress frame: {}",
+                            zstd::zstd_safe::get_error_name(errno)
+                        )
+                    })?;
+                offset += frame_compressed_size;
+                recompressed_file
+                    .write_all(&compressed_frame)
+                    .with_context(|| {
+                        format!(
+                            "Could not write frame {frame_id} of {}",
+                            recompressed_file.path().display(),
+                        )
+                    })?;
+            }
+            ensure!(
+                compressed_frames[offset..].is_empty(),
+                "Expected {num_frames} in {}, but there are more ({} unread bytes)",
+                path.display(),
+                compressed_frames[offset..].len()
+            );
+
+            Ok(recompressed_file)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    pl.done();
+
+    log::info!("Invalidating index files...");
+    for original_file in &terms_files {
+        let index_file_path = original_file.path.with_extension("frames.ef");
+        if std::fs::exists(&index_file_path)
+            .with_context(|| format!("Could not check if {} exists", index_file_path.display()))?
+        {
+            std::fs::remove_file(&index_file_path).with_context(|| {
+                format!("Could not remove index file {}", index_file_path.display())
+            })?;
+        }
+    }
+
+    log::info!("Committing recompressed files...");
+    config.zstd_dictionary_filename = Some(dictionary_name);
+    let config_path = dir.join("config.json");
+    let config_file = File::create(&config_path)
+        .with_context(|| format!("Could not create {}", config_path.display()))?;
+    serde_json::to_writer_pretty(config_file, &config)
+        .context("Could not write terms store config")?;
+
+    for (original_file, recompressed_file) in
+        terms_files.into_iter().zip(recompressed_files.into_iter())
+    {
+        recompressed_file
+            .persist(original_file.path)
+            .context("Could not persist recompressed file.")?;
+    }
+
+    Ok(())
+}
 
 pub fn index_terms(dir: &Path) -> Result<()> {
     let (config, terms_files) = list_terms_files(dir)?;
@@ -404,6 +734,7 @@ pub struct TermStore {
     config: TermStoreConfiguration,
     path: PathBuf,
     partitions: Vec<TermsPartition>,
+    zstd_decompression_dictionary: Option<zstd::zstd_safe::DDict<'static>>,
 }
 
 impl TermStore {
@@ -414,6 +745,26 @@ impl TermStore {
                 path.display()
             )
         })?;
+
+        let zstd_decompression_dictionary = config
+            .zstd_dictionary_filename
+            .as_ref()
+            .map(|zstd_dictionary_filename| {
+                let dictionary_path = path.join(zstd_dictionary_filename);
+                let dictionary_bytes = std::fs::read(&dictionary_path).with_context(|| {
+                    format!(
+                        "Could not read dictionary from {}",
+                        dictionary_path.display()
+                    )
+                })?;
+                zstd::zstd_safe::DDict::try_create(&dictionary_bytes).with_context(|| {
+                    format!(
+                        "Could not parse dictionary from {}",
+                        dictionary_path.display()
+                    )
+                })
+            })
+            .transpose()?;
 
         let partitions = files
             .into_iter()
@@ -449,6 +800,7 @@ impl TermStore {
             config,
             path,
             partitions,
+            zstd_decompression_dictionary,
         })
     }
 
@@ -487,8 +839,6 @@ impl TermStore {
         // Compute the offset of the term within the frame
         let offset_in_frame = id % self.config.terms_per_frame;
 
-        const ERR_BUFFER_SIZE_TOO_SMALL: zstd::zstd_safe::ErrorCode =
-            zstd::zstd_safe::ErrorCode::MAX - 69; // not documented...
         let frame_compressed_size = match zstd::zstd_safe::find_frame_compressed_size(
             &partition.compressed_frames[frame_position..],
         ) {
@@ -500,31 +850,16 @@ impl TermStore {
             ),
         };
 
-        // heuristic, as zstd_safe::find_decompressed_size is 'experimental'
-        let frame_decompressed_size = frame_compressed_size.saturating_mul(2);
-        let mut decompressed_frame = Vec::with_capacity(frame_decompressed_size);
-        loop {
-            match zstd::zstd_safe::decompress(
-                &mut decompressed_frame,
-                &partition.compressed_frames
-                    [frame_position..frame_position + frame_compressed_size],
-            ) {
-                Ok(_) => break,
-                Err(ERR_BUFFER_SIZE_TOO_SMALL) => {
-                    decompressed_frame = Vec::with_capacity(
-                        decompressed_frame
-                            .capacity()
-                            .checked_mul(2)
-                            .context("frame capacity overflowed usize")?,
-                    );
-                }
-                Err(errno) => bail!(
-                    "Could not decompressed frame at offset {frame_position} of {}: Error {errno} ({})",
-                    partition.path.display(),
-                    zstd::zstd_safe::get_error_name(errno)
-                ),
-            }
-        }
+        let decompressed_frame = decompress_frame(
+            &partition.compressed_frames[frame_position..frame_position + frame_compressed_size],
+            self.zstd_decompression_dictionary.as_ref(),
+        )
+        .with_context(|| {
+            format!(
+                "Could not decompress frame at offset {frame_position} of {}",
+                partition.path.display(),
+            )
+        })?;
         let mut frame_reader = Cursor::new(decompressed_frame);
 
         // Skip all terms before the one we are looking for, then read the right one

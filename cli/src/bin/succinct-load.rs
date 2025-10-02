@@ -5,6 +5,7 @@ use oxigraph::succinct::quads_store::QuadStoreConfiguration;
 use oxigraph::succinct::terms_store::TermStoreConfiguration;
 use oxigraph_cli::utils::{rdf_format_from_name, rdf_format_from_path};
 use std::fs::File;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -99,6 +100,13 @@ pub enum Commands {
         /// Provides an estimated time of completion
         approx_quads_per_file: Option<usize>,
     },
+    /// Step 1.5: (Optional) Trains a Zstd dictionary on the terms and use it to recompress them
+    RecompressTerms {
+        #[arg(long, default_value_t = succinct::terms_store::DEFAULT_ZSTD_TRAINING_SAMPLES)]
+        samples: NonZeroUsize,
+        #[arg(long, default_value_t = succinct::terms_store::DEFAULT_ZSTD_DICTIONARY_SIZE)]
+        max_dictionary_size: NonZeroUsize,
+    },
     /// Step 2a: read the terms/ directory and makes each term accessible in O(1) given its position,
     /// allowing a O(1) map from ids to terms
     IndexTerms {},
@@ -185,6 +193,12 @@ pub fn main() -> Result<()> {
                 .with_parse_quad_args(Some(parse_args.try_into()?))
                 .with_approx_num_quads(approx_quads_per_file)
                 .extract_terms()?;
+        }
+        Commands::RecompressTerms {
+            samples,
+            max_dictionary_size,
+        } => {
+            db_builder.recompress_terms(samples, max_dictionary_size)?;
         }
         Commands::IndexTerms {} => {
             db_builder.index_terms()?;
