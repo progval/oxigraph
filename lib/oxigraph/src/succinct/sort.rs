@@ -134,6 +134,9 @@ impl ExternalDeduplicatingStringSorter {
 
     /// Merges every file of this sorter currently on disk into a single one
     pub fn compact_files(&mut self) -> Result<()> {
+        // FIXME: the current implementation causes 1 large file and 9 small files that get merged
+        // into the larger one. This is incredibly inefficient because we keep compacting the same
+        // items over and over (it's quadratic). We should do some sort of merge tree instead.
         let mut sorted_files = Vec::new();
         std::mem::swap(&mut sorted_files, &mut self.sorted_files);
         self.num_unique_items_upperbound = 0; // self.write_sorted_items() will re-count them after dedup
@@ -410,6 +413,9 @@ impl<const N: usize> ExternalArraySorter<N> {
     }
 
     fn compact_partition(&mut self, partition_id: usize) -> Result<()> {
+        // FIXME: the current implementation causes 1 large file and 9 small files that get merged
+        // into the larger one. This is incredibly inefficient because we keep compacting the same
+        // items over and over (it's quadratic). We should do some sort of merge tree instead.
         let mut sorted_files = Vec::new();
         std::mem::swap(&mut sorted_files, &mut self.sorted_files[partition_id]);
 
@@ -789,10 +795,7 @@ fn test_read_write_sorted_array() -> Result<()> {
         no_logging!(),
     )?;
     assert_eq!(
-        array_file
-            .iter()?
-            .map(Result::unwrap)
-            .collect::<Vec<_>>(),
+        array_file.iter()?.map(Result::unwrap).collect::<Vec<_>>(),
         quads
     );
     Ok(())

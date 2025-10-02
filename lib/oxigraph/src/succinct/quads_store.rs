@@ -460,13 +460,16 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
             })?;
 
             Ok(())
-        })
+        })?;
+
+    pl.done();
+    Ok(())
 }
 
 pub fn index_quads_by_first_two_terms(dir: &Path) -> Result<()> {
     let (config, partitions) = get_quad_partitions(dir)?;
     let mut pl = concurrent_progress_logger!(
-        item_name = "partitions",
+        item_name = "partition",
         display_memory = true,
         local_speed = true,
         expected_updates = Some(config.num_partitions),

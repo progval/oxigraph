@@ -12,10 +12,7 @@ use crate::storage::rocksdb::{
     RocksDbStorageTransaction,
 };
 use oxrdf::Quad;
-#[cfg(all(
-    not(target_family = "wasm"),
-    feature = "rocksdb"
-))]
+#[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
 use std::{io, thread};
