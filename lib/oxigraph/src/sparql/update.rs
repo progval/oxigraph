@@ -1,7 +1,6 @@
 #[cfg(feature = "http-client")]
 use crate::io::{RdfFormat, RdfParser};
 use crate::model::{GraphName as OxGraphName, GraphNameRef, Quad as OxQuad};
-use crate::sparql::algebra::QueryDataset;
 #[expect(deprecated)]
 use crate::sparql::algebra::Update;
 use crate::sparql::dataset::DatasetView;
@@ -14,17 +13,15 @@ use oxiri::Iri;
 #[cfg(feature = "http-client")]
 use oxrdfio::LoadedDocument;
 use rustc_hash::FxHashMap;
-use sparesults::QuerySolution;
-use spareval::{QueryEvaluator, QueryResults};
+use spareval::{DeleteInsertQuad, QueryDatasetSpecification, QueryEvaluator};
+use spargebra::GraphUpdateOperation;
 use spargebra::algebra::{GraphPattern, GraphTarget};
 use spargebra::term::{
-    BlankNode, GraphName, GraphNamePattern, GroundQuad, GroundQuadPattern, GroundTerm,
-    GroundTermPattern, NamedNode, NamedNodePattern, NamedOrBlankNode, Quad, QuadPattern, Term,
-    TermPattern,
+    BlankNode, GraphName, GroundQuad, GroundQuadPattern, GroundTerm, NamedNode, NamedOrBlankNode,
+    Quad, QuadPattern, Term,
 };
 #[cfg(feature = "rdf-12")]
-use spargebra::term::{GroundTriple, GroundTriplePattern, Triple, TriplePattern};
-use spargebra::{GraphUpdateOperation, Query};
+use spargebra::term::{GroundTriple, Triple};
 #[cfg(feature = "http-client")]
 use std::io::Read;
 #[cfg(feature = "http-client")]
@@ -48,7 +45,7 @@ use std::time::Duration;
 pub struct PreparedSparqlUpdate {
     evaluator: QueryEvaluator,
     update: spargebra::Update,
-    using_datasets: Vec<Option<QueryDataset>>,
+    using_datasets: Vec<Option<QueryDatasetSpecification>>,
     #[cfg(feature = "http-client")]
     http_timeout: Option<Duration>,
     #[cfg(feature = "http-client")]
@@ -76,13 +73,13 @@ impl PreparedSparqlUpdate {
 
     /// Returns [the query dataset specification](https://www.w3.org/TR/sparql11-query/#specifyingDataset) in [DELETE/INSERT operations](https://www.w3.org/TR/sparql11-update/#deleteInsert).
     #[inline]
-    pub fn using_datasets(&self) -> impl Iterator<Item = &QueryDataset> {
+    pub fn using_datasets(&self) -> impl Iterator<Item = &QueryDatasetSpecification> {
         self.using_datasets.iter().filter_map(Option::as_ref)
     }
 
     /// Returns [the query dataset specification](https://www.w3.org/TR/sparql11-query/#specifyingDataset) in [DELETE/INSERT operations](https://www.w3.org/TR/sparql11-update/#deleteInsert).
     #[inline]
-    pub fn using_datasets_mut(&mut self) -> impl Iterator<Item = &mut QueryDataset> {
+    pub fn using_datasets_mut(&mut self) -> impl Iterator<Item = &mut QueryDatasetSpecification> {
         self.using_datasets.iter_mut().filter_map(Option::as_mut)
     }
 
@@ -176,7 +173,7 @@ impl PreparedSparqlUpdate {
 pub struct BoundPreparedSparqlUpdate<'a, 'b> {
     evaluator: QueryEvaluator,
     update: spargebra::Update,
-    using_datasets: Vec<Option<QueryDataset>>,
+    using_datasets: Vec<Option<QueryDatasetSpecification>>,
     #[cfg(feature = "http-client")]
     http_timeout: Option<Duration>,
     #[cfg(feature = "http-client")]
@@ -243,7 +240,7 @@ impl<'a, 'b: 'a> ReadableUpdateEvaluator<'a, 'b> {
     fn eval_all(
         &mut self,
         updates: &[GraphUpdateOperation],
-        using_datasets: &[Option<QueryDataset>],
+        using_datasets: &[Option<QueryDatasetSpecification>],
     ) -> Result<(), UpdateEvaluationError> {
         for (update, using_dataset) in updates.iter().zip(using_datasets) {
             self.eval(update, using_dataset)?;
@@ -254,7 +251,7 @@ impl<'a, 'b: 'a> ReadableUpdateEvaluator<'a, 'b> {
     fn eval(
         &mut self,
         update: &GraphUpdateOperation,
-        using_dataset: &Option<QueryDataset>,
+        using_dataset: &Option<QueryDatasetSpecification>,
     ) -> Result<(), UpdateEvaluationError> {
         match update {
             GraphUpdateOperation::InsertData { data } => {
@@ -273,7 +270,9 @@ impl<'a, 'b: 'a> ReadableUpdateEvaluator<'a, 'b> {
             } => self.eval_delete_insert(
                 delete,
                 insert,
-                using_dataset.as_ref().unwrap_or(&QueryDataset::new()),
+                using_dataset
+                    .as_ref()
+                    .unwrap_or(&QueryDatasetSpecification::new()),
                 pattern,
             ),
             GraphUpdateOperation::Load {
@@ -312,42 +311,24 @@ impl<'a, 'b: 'a> ReadableUpdateEvaluator<'a, 'b> {
         &mut self,
         delete: &[GroundQuadPattern],
         insert: &[QuadPattern],
-        using: &QueryDataset,
+        using: &QueryDatasetSpecification,
         algebra: &GraphPattern,
     ) -> Result<(), UpdateEvaluationError> {
-        let QueryResults::Solutions(solutions) = self.query_evaluator.clone().execute(
-            DatasetView::new(self.transaction.reader(), using),
-            &Query::Select {
-                dataset: None,
-                pattern: algebra.clone(),
-                base_iri: self.base_iri.clone(),
-            },
-        )?
-        else {
-            unreachable!("We provided a SELECT query, we must get back solutions")
-        };
-
-        let mut mutations = Vec::new();
-        let mut bnodes = FxHashMap::default();
-        for solution in solutions {
-            let solution = solution?;
-            for quad in delete {
-                if let Some(quad) = fill_ground_quad_pattern(quad, &solution) {
-                    mutations.push(InsertOrDelete::Delete(quad));
-                }
-            }
-            for quad in insert {
-                if let Some(quad) = fill_quad_pattern(quad, &solution, &mut bnodes) {
-                    mutations.push(InsertOrDelete::Insert(quad));
-                }
-            }
-            bnodes.clear();
-        }
-
+        let mut prepared = self.query_evaluator.prepare_delete_insert(
+            delete.to_vec(),
+            insert.to_vec(),
+            self.base_iri.clone(),
+            None,
+            algebra,
+        );
+        *prepared.dataset_mut() = using.clone();
+        let mutations = prepared
+            .execute(DatasetView::new(self.transaction.reader()))?
+            .collect::<Result<Vec<_>, _>>()?;
         for mutation in mutations {
             match mutation {
-                InsertOrDelete::Delete(quad) => self.transaction.remove(quad.as_ref()),
-                InsertOrDelete::Insert(quad) => self.transaction.insert(quad.as_ref()),
+                DeleteInsertQuad::Delete(quad) => self.transaction.remove(quad.as_ref()),
+                DeleteInsertQuad::Insert(quad) => self.transaction.insert(quad.as_ref()),
             }
         }
         Ok(())
@@ -477,7 +458,7 @@ impl WriteOnlyUpdateEvaluator<'_, '_> {
     fn eval_all(
         &mut self,
         updates: &[GraphUpdateOperation],
-        using_datasets: &[Option<QueryDataset>],
+        using_datasets: &[Option<QueryDatasetSpecification>],
     ) -> Result<(), UpdateEvaluationError> {
         for (update, using_dataset) in updates.iter().zip(using_datasets) {
             self.eval(update, using_dataset)?;
@@ -489,7 +470,7 @@ impl WriteOnlyUpdateEvaluator<'_, '_> {
     fn eval(
         &mut self,
         update: &GraphUpdateOperation,
-        using_dataset: &Option<QueryDataset>,
+        using_dataset: &Option<QueryDatasetSpecification>,
     ) -> Result<(), UpdateEvaluationError> {
         match update {
             GraphUpdateOperation::InsertData { data } => {
@@ -508,7 +489,9 @@ impl WriteOnlyUpdateEvaluator<'_, '_> {
             } => self.eval_delete_insert(
                 delete,
                 insert,
-                using_dataset.as_ref().unwrap_or(&QueryDataset::new()),
+                using_dataset
+                    .as_ref()
+                    .unwrap_or(&QueryDatasetSpecification::new()),
                 pattern,
             ),
             GraphUpdateOperation::Load {
@@ -547,7 +530,7 @@ impl WriteOnlyUpdateEvaluator<'_, '_> {
         &mut self,
         delete: &[GroundQuadPattern],
         insert: &[QuadPattern],
-        using: &QueryDataset,
+        using: &QueryDatasetSpecification,
         algebra: &GraphPattern,
     ) -> Result<(), UpdateEvaluationError> {
         let Some(storage) = self.storage_for_initial_read.take() else {
@@ -555,32 +538,22 @@ impl WriteOnlyUpdateEvaluator<'_, '_> {
                 "It is not possible to evaluate delete/insert operations on a write-only transaction after other update operations".into(),
             ));
         };
-        let QueryResults::Solutions(solutions) = self.query_evaluator.clone().execute(
-            DatasetView::new(storage.snapshot(), using),
-            &Query::Select {
-                dataset: None,
-                pattern: algebra.clone(),
-                base_iri: self.base_iri.clone(),
-            },
-        )?
-        else {
-            unreachable!("We provided a SELECT query, we must get back solutions")
-        };
-
-        let mut bnodes = FxHashMap::default();
-        for solution in solutions {
-            let solution = solution?;
-            for quad in delete {
-                if let Some(quad) = fill_ground_quad_pattern(quad, &solution) {
-                    self.transaction.remove(quad.as_ref());
-                }
+        let mut prepared = self.query_evaluator.prepare_delete_insert(
+            delete.to_vec(),
+            insert.to_vec(),
+            self.base_iri.clone(),
+            None,
+            algebra,
+        );
+        *prepared.dataset_mut() = using.clone();
+        let mutations = prepared
+            .execute(DatasetView::new(storage.snapshot()))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for mutation in mutations {
+            match mutation {
+                DeleteInsertQuad::Delete(quad) => self.transaction.remove(quad.as_ref()),
+                DeleteInsertQuad::Insert(quad) => self.transaction.insert(quad.as_ref()),
             }
-            for quad in insert {
-                if let Some(quad) = fill_quad_pattern(quad, &solution, &mut bnodes) {
-                    self.transaction.insert(quad.as_ref());
-                }
-            }
-            bnodes.clear();
         }
         Ok(())
     }
@@ -716,11 +689,6 @@ fn eval_load(
     ))
 }
 
-enum InsertOrDelete {
-    Insert(OxQuad),
-    Delete(OxQuad),
-}
-
 fn convert_quad(quad: &Quad, bnodes: &mut FxHashMap<BlankNode, BlankNode>) -> OxQuad {
     OxQuad {
         subject: match &quad.subject {
@@ -793,129 +761,4 @@ fn convert_ground_triple(triple: &GroundTriple) -> Triple {
             GroundTerm::Triple(subject) => convert_ground_triple(subject).into(),
         },
     }
-}
-
-fn fill_quad_pattern(
-    quad: &QuadPattern,
-    solution: &QuerySolution,
-    bnodes: &mut FxHashMap<BlankNode, BlankNode>,
-) -> Option<OxQuad> {
-    Some(OxQuad {
-        subject: match fill_term_or_var(&quad.subject, solution, bnodes)? {
-            Term::NamedNode(node) => node.into(),
-            Term::BlankNode(node) => node.into(),
-            #[cfg(feature = "rdf-12")]
-            Term::Triple(_) => return None,
-            Term::Literal(_) => return None,
-        },
-        predicate: fill_named_node_or_var(&quad.predicate, solution)?,
-        object: fill_term_or_var(&quad.object, solution, bnodes)?,
-        graph_name: fill_graph_name_or_var(&quad.graph_name, solution)?,
-    })
-}
-
-fn fill_term_or_var(
-    term: &TermPattern,
-    solution: &QuerySolution,
-    bnodes: &mut FxHashMap<BlankNode, BlankNode>,
-) -> Option<Term> {
-    Some(match term {
-        TermPattern::NamedNode(term) => term.clone().into(),
-        TermPattern::BlankNode(bnode) => convert_blank_node(bnode, bnodes).into(),
-        TermPattern::Literal(term) => term.clone().into(),
-        #[cfg(feature = "rdf-12")]
-        TermPattern::Triple(triple) => fill_triple_pattern(triple, solution, bnodes)?.into(),
-        TermPattern::Variable(v) => solution.get(v)?.clone(),
-    })
-}
-
-fn fill_named_node_or_var(term: &NamedNodePattern, solution: &QuerySolution) -> Option<NamedNode> {
-    Some(match term {
-        NamedNodePattern::NamedNode(term) => term.clone(),
-        NamedNodePattern::Variable(v) => {
-            if let Term::NamedNode(s) = solution.get(v)? {
-                s.clone()
-            } else {
-                return None;
-            }
-        }
-    })
-}
-
-fn fill_graph_name_or_var(
-    term: &GraphNamePattern,
-    solution: &QuerySolution,
-) -> Option<OxGraphName> {
-    Some(match term {
-        GraphNamePattern::NamedNode(term) => term.clone().into(),
-        GraphNamePattern::DefaultGraph => OxGraphName::DefaultGraph,
-        GraphNamePattern::Variable(v) => match solution.get(v)? {
-            Term::NamedNode(node) => node.clone().into(),
-            Term::BlankNode(node) => node.clone().into(),
-            Term::Literal(_) => return None,
-            #[cfg(feature = "rdf-12")]
-            Term::Triple(_) => return None,
-        },
-    })
-}
-
-#[cfg(feature = "rdf-12")]
-fn fill_triple_pattern(
-    triple: &TriplePattern,
-    solution: &QuerySolution,
-    bnodes: &mut FxHashMap<BlankNode, BlankNode>,
-) -> Option<Triple> {
-    Some(Triple {
-        subject: match fill_term_or_var(&triple.subject, solution, bnodes)? {
-            Term::NamedNode(node) => node.into(),
-            Term::BlankNode(node) => node.into(),
-            #[cfg(feature = "rdf-12")]
-            Term::Triple(_) => return None,
-            Term::Literal(_) => return None,
-        },
-        predicate: fill_named_node_or_var(&triple.predicate, solution)?,
-        object: fill_term_or_var(&triple.object, solution, bnodes)?,
-    })
-}
-fn fill_ground_quad_pattern(quad: &GroundQuadPattern, solution: &QuerySolution) -> Option<OxQuad> {
-    Some(OxQuad {
-        subject: match fill_ground_term_or_var(&quad.subject, solution)? {
-            Term::NamedNode(node) => node.into(),
-            Term::BlankNode(node) => node.into(),
-            #[cfg(feature = "rdf-12")]
-            Term::Triple(_) => return None,
-            Term::Literal(_) => return None,
-        },
-        predicate: fill_named_node_or_var(&quad.predicate, solution)?,
-        object: fill_ground_term_or_var(&quad.object, solution)?,
-        graph_name: fill_graph_name_or_var(&quad.graph_name, solution)?,
-    })
-}
-
-fn fill_ground_term_or_var(term: &GroundTermPattern, solution: &QuerySolution) -> Option<Term> {
-    Some(match term {
-        GroundTermPattern::NamedNode(term) => term.clone().into(),
-        GroundTermPattern::Literal(term) => term.clone().into(),
-        #[cfg(feature = "rdf-12")]
-        GroundTermPattern::Triple(triple) => fill_ground_triple_pattern(triple, solution)?.into(),
-        GroundTermPattern::Variable(v) => solution.get(v)?.clone(),
-    })
-}
-
-#[cfg(feature = "rdf-12")]
-fn fill_ground_triple_pattern(
-    triple: &GroundTriplePattern,
-    solution: &QuerySolution,
-) -> Option<Triple> {
-    Some(Triple {
-        subject: match fill_ground_term_or_var(&triple.subject, solution)? {
-            Term::NamedNode(node) => node.into(),
-            Term::BlankNode(node) => node.into(),
-            #[cfg(feature = "rdf-12")]
-            Term::Triple(_) => return None,
-            Term::Literal(_) => return None,
-        },
-        predicate: fill_named_node_or_var(&triple.predicate, solution)?,
-        object: fill_ground_term_or_var(&triple.object, solution)?,
-    })
 }
