@@ -2,7 +2,7 @@
 
 This backend is based on the [`sux` crate](https://docs.rs/sux) and its data structures.
 While `sux` underpins [WebGraph's Rust implementation](https://docs.rs/webgraph),
-it does not significantly use WebGraph as WebGraph is not designed to work with triples or quads.
+this backend does not significantly use WebGraph as WebGraph is not designed to work with triples or quads.
 
 `sux` provides two primitives we use to build indexes:
 
@@ -55,7 +55,7 @@ Each quad store is made of a **sorted list of quads** and a bunch of indexes.
 
 This list is sorted and written in a custom binary format using [`dsi-bitstream`](https://docs.rs/dsi-bitstream):
 
-* Split quads into frames using whatever heuristic (by default: split every 100 quads if they have different first terms, or every 10000 quads if they have the first term)
+* Split quads into frames using whatever heuristic (by default: split every 100 quads if they have different first terms, or every 10000 quads if they have the same first term)
 * For each frame of quads:
     * bit 0 if this is the first frame of the file, bit 1 otherwise
     * the first quad of the frame, with each of its term written using [gamma-coding](https://docs.rs/dsi-bitstream/latest/dsi_bitstream/codes/)
@@ -64,7 +64,7 @@ This list is sorted and written in a custom binary format using [`dsi-bitstream`
         * `let mut zigzag = false`
         * for the i-th term of the quad:
             * if `!zigzag`: the gamma-coded increase between the previous quad's i-th term and this quad's i-th term
-                * (that increase is guaranteed to be >= due to quads being lexicographically sorted)
+                * (that increase is guaranteed to be >= 0 due to quads being lexicographically sorted)
                 * if the increase > 0, set `zigzag = true` (ie. the `i+1`th term of this quad is not guaranteed to be >= to the `i+1`th term of the previous quad )
             * if `zigzag`: the gamma-coded [zigzag-encoded](https://docs.rs/dsi-bitstream/latest/dsi_bitstream/codes/trait.ToInt.html) difference between the previous quad's i-th term and this quad's i-th term
 * end with bit 1, then `0` gamma-encoded four times (ie. as if we had the quad `(0, 0, 0, 0)`)
