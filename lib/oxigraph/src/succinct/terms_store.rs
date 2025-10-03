@@ -15,6 +15,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use sux::dict::elias_fano::{EfSeqDict, EliasFanoBuilder};
 use sux::traits::{IndexedDict, IndexedSeq};
+use quick_cache::sync::Cache;
 
 // Increasing either these values doesn't give noticeably better compression on wikidata-20240320-truthy-BETA.
 pub const DEFAULT_ZSTD_TRAINING_SAMPLES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
@@ -735,6 +736,7 @@ pub struct TermStore {
     path: PathBuf,
     partitions: Vec<TermsPartition>,
     zstd_decompression_dictionary: Option<zstd::zstd_safe::DDict<'static>>,
+    decompressed_frame_cache: Cache<usize, Box<[u8]>>,
 }
 
 impl TermStore {
@@ -801,11 +803,45 @@ impl TermStore {
             path,
             partitions,
             zstd_decompression_dictionary,
+            decompressed_frame_cache: Cache::new(4096),
         })
     }
 
     pub fn len(&self) -> usize {
         self.config.num_terms
+    }
+
+    fn get_frame(&self, partition_id: usize, frame_id: usize) -> Result<Box<[u8]>> {
+        let key = self.config.frames_per_file * partition_id + frame_id;
+
+        self.decompressed_frame_cache.get_or_insert_with(&key, || {
+            let partition = &self.partitions[partition_id];
+            let frame_position = partition.frames_index.get(frame_id);
+
+            let frame_compressed_size = match zstd::zstd_safe::find_frame_compressed_size(
+                &partition.compressed_frames[frame_position..],
+            ) {
+                Ok(frame_size) => frame_size,
+                Err(errno) => bail!(
+                    "Could not get compressed size of frame at offset {frame_position} of {}: Error {errno} ({})",
+                    partition.path.display(),
+                    zstd::zstd_safe::get_error_name(errno)
+                ),
+            };
+
+            let decompressed_frame = decompress_frame(
+                &partition.compressed_frames[frame_position..frame_position + frame_compressed_size],
+                self.zstd_decompression_dictionary.as_ref(),
+            )
+            .with_context(|| {
+                format!(
+                    "Could not decompress frame at offset {frame_position} of {}",
+                    partition.path.display(),
+                )
+            })?;
+
+            Ok(decompressed_frame.into())
+        })
     }
 
     pub fn get(&self, id: usize) -> Result<Option<Box<[u8]>>> {
@@ -834,32 +870,11 @@ impl TermStore {
             "Inconsistent partition lengths in terms store {}",
             self.path.display()
         );
-        let frame_position = partition.frames_index.get(frame_id);
 
         // Compute the offset of the term within the frame
         let offset_in_frame = id % self.config.terms_per_frame;
 
-        let frame_compressed_size = match zstd::zstd_safe::find_frame_compressed_size(
-            &partition.compressed_frames[frame_position..],
-        ) {
-            Ok(frame_size) => frame_size,
-            Err(errno) => bail!(
-                "Could not get compressed size of frame at offset {frame_position} of {}: Error {errno} ({})",
-                partition.path.display(),
-                zstd::zstd_safe::get_error_name(errno)
-            ),
-        };
-
-        let decompressed_frame = decompress_frame(
-            &partition.compressed_frames[frame_position..frame_position + frame_compressed_size],
-            self.zstd_decompression_dictionary.as_ref(),
-        )
-        .with_context(|| {
-            format!(
-                "Could not decompress frame at offset {frame_position} of {}",
-                partition.path.display(),
-            )
-        })?;
+        let decompressed_frame = self.get_frame(partition_id, frame_id)?;
         let mut frame_reader = Cursor::new(decompressed_frame);
 
         // Skip all terms before the one we are looking for, then read the right one
@@ -869,13 +884,13 @@ impl TermStore {
                 read_length_prefixed_string(&mut frame_reader, |_| None)
                     .with_context(|| {
                         format!(
-                            "Could not read string frame at offset {frame_position} of {}",
+                            "Could not read string frame {frame_id} of {}",
                             partition.path.display()
                         )
                     })?
                     .with_context(|| {
                         format!(
-                            "Frame at offset {frame_position} of {} has fewer terms than expected",
+                            "Frame {frame_id} of {} has fewer terms than expected",
                             partition.path.display()
                         )
                     })?,

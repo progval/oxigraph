@@ -16,7 +16,7 @@ rust-version.workspace = true
 [features]
 default = ["rocksdb", "succinct"]
 rocksdb = ["oxrocksdb-sys"]
-succinct = ["anyhow", "bytemuck", "clap", "deko", "dsi-progress-logger", "dsi-bitstream", "deko", "epserde", "lender", "log", "itertools", "mmap-rs", "rayon", "rdst", "serde", "serde/derive", "serde_json", "sux", "tempfile", "thread_local", "webgraph", "webgraph-algo", "webgraph-cli", "zstd"]
+succinct = ["anyhow", "bytemuck", "clap", "deko", "dsi-progress-logger", "dsi-bitstream", "deko", "epserde", "lender", "log", "itertools", "mmap-rs", "quick_cache", "rayon", "rdst", "serde", "serde/derive", "serde_json", "sux", "tempfile", "thread_local", "webgraph", "webgraph-algo", "webgraph-cli", "zstd"]
 js = ["getrandom/wasm_js", "oxsdatatypes/js", "js-sys"]
 http-client = ["oxhttp"]
 http-client-native-tls = ["http-client", "oxhttp/native-tls"]
@@ -57,6 +57,7 @@ lender = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
 itertools = { workspace = true, optional = true }
 mmap-rs = { workspace = true, optional = true }
+quick_cache = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 rdst = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }

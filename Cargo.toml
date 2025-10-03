@@ -72,6 +72,7 @@ pkg-config = "0.3.25"
 predicates = ">=2.0, <4.0"
 pyo3 = "0.26"
 quick-xml = "0.37"
+quick_cache = "0.6.16"
 rand = "0.9"
 rayon = "1.8.1"
 rdst = { version = "0.20.14", features = ["multi-threaded"] }
