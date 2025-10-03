@@ -401,8 +401,9 @@ pub fn main() -> anyhow::Result<()> {
                     prepared.explain()
                 }
                 Database::Succinct(store) => {
-                    let dataset = store.with_query_dataset(prepared.dataset())?;
-                    let mut prepared = prepared.clone().on_queryable_dataset(dataset);
+                    let mut prepared = prepared
+                        .clone()
+                        .on_queryable_dataset(store.queryable_dataset());
                     if stats {
                         prepared = prepared.compute_statistics();
                     }
@@ -1435,16 +1436,10 @@ fn evaluate_sparql_query(
             .on_store(store)
             .execute()
             .map_err(internal_server_error)?,
-        Database::Succinct(store) => {
-            let store = store.clone();
-            let dataset = store
-                .with_query_dataset(prepared.dataset())
-                .map_err(internal_server_error)?;
-            prepared
-                .on_queryable_dataset(dataset)
-                .execute()
-                .map_err(internal_server_error)?
-        }
+        Database::Succinct(store) => prepared
+            .on_queryable_dataset(store.clone().queryable_dataset())
+            .execute()
+            .map_err(internal_server_error)?,
     };
     match results {
         QueryResults::Solutions(solutions) => {

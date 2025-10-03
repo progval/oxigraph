@@ -27,22 +27,8 @@ impl<D: Clone> SuccinctStore<D>
 where
     for<'a> D: QueryableDataset<'a>,
 {
-    pub fn with_query_dataset(self, query_dataset: &QueryDataset) -> Result<D> {
-        if let Some(default_graph_graphs) = query_dataset.default_graph_graphs() {
-            if default_graph_graphs != vec![GraphName::DefaultGraph] {
-                bail!(
-                    "Succinct backend does not support query datasets (got default_graph_graphs={:?})",
-                    default_graph_graphs
-                );
-            }
-        }
-        if let Some(available_named_graphs) = query_dataset.available_named_graphs() {
-            bail!(
-                "Succinct backend does not support query datasets (got available_named_graphs={:?})",
-                available_named_graphs
-            );
-        }
-        Ok(self.dataset)
+    pub fn queryable_dataset(self) -> D {
+        self.dataset
     }
 
     pub fn quads_for_pattern<'b>(
