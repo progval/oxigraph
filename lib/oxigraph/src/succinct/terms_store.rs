@@ -803,7 +803,7 @@ impl TermStore {
             path,
             partitions,
             zstd_decompression_dictionary,
-            decompressed_frame_cache: Cache::new(4096),
+            decompressed_frame_cache: Cache::new(65536), // a frame is about 1kB, so this sums to 64MiB
         })
     }
 
