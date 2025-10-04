@@ -799,11 +799,11 @@ impl TermStore {
             )
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            config,
             path,
             partitions,
             zstd_decompression_dictionary,
-            decompressed_frame_cache: Cache::new(65536), // a frame is about 1kB, so this sums to 64MiB
+            decompressed_frame_cache: Cache::new(1048576 / config.terms_per_frame), // about 64MiB
+            config,
         })
     }
 
