@@ -167,6 +167,15 @@ pub enum Commands {
         #[arg(long)]
         order: succinct::quads_store::QuadOrder,
     },
+    /// Build indexes to list subjects (or objects) from a predicate
+    IndexBySecondTerm {
+        /// Which quad store to build the index from.
+        ///
+        /// The index will map from the second term of each quad (usually the predicate) to the
+        /// first term of each quad (usually subject or object)
+        #[arg(long)]
+        order: succinct::quads_store::QuadOrder,
+    },
 }
 
 pub fn main() -> Result<()> {
@@ -269,6 +278,9 @@ pub fn main() -> Result<()> {
         }
         Commands::IndexQuadsByFirstTwoTerms { order } => {
             db_builder.index_quad_store_by_first_two_terms(order)?;
+        }
+        Commands::IndexBySecondTerm { order } => {
+            db_builder.index_by_second_term(order)?;
         }
     }
 

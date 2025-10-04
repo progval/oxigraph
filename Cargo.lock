@@ -3401,43 +3401,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sux"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8fa277060967d1e232806a1ae332010e01b1caf67193c430d50360a0fac3d2a"
-dependencies = [
- "ambassador",
- "anyhow",
- "arbitrary-chunks",
- "bitflags 2.9.4",
- "clap",
- "common_traits",
- "crossbeam-channel",
- "derivative",
- "derive_setters",
- "dsi-progress-logger",
- "env_logger",
- "epserde",
- "flate2",
- "impl-tools 0.11.2",
- "itertools 0.14.0",
- "lambert_w",
- "lender",
- "libc",
- "log",
- "mem_dbg",
- "rand",
- "rayon",
- "rdst",
- "tempfile",
- "thiserror 2.0.16",
- "thread-priority 2.1.1",
- "value-traits",
- "xxhash-rust",
- "zstd",
-]
-
-[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3945,7 +3908,7 @@ dependencies = [
  "rayon",
  "rdst",
  "sealed",
- "sux 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sux 0.8.0",
  "sync-cell-slice",
  "tempfile",
  "thiserror 2.0.16",
@@ -3971,7 +3934,7 @@ dependencies = [
  "rand",
  "rayon",
  "sealed",
- "sux 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sux 0.8.0",
  "sync-cell-slice",
  "thiserror 2.0.16",
  "value-traits",
@@ -4003,7 +3966,7 @@ dependencies = [
  "predicates",
  "rand",
  "rayon",
- "sux 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sux 0.8.0",
  "sysinfo",
  "tempfile",
  "webgraph",

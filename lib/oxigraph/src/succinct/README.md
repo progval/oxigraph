@@ -7,7 +7,7 @@ this backend does not significantly use WebGraph as WebGraph is not designed to 
 `sux` provides two primitives we use to build indexes:
 
 * [Elias-Fano sequences](https://docs.rs/sux/latest/sux/dict/elias_fano/), which are very small structures monotonically mapping a range of integers to a set of integers.
-  Queries run in `O(range_size)` but are actually really fast in practice.
+  Queries run in `O(range_size)` but are actually really fast in practice (~100ns/query when in RAM).
 * [VFunc static function](https://docs.rs/sux/latest/sux/func/), which is a data structure that maps arbitrary keys to integers in `O(key_size)`.
   It achieves compactness by being probabilistic: it gives perfect results when queried with one of the keys it was built with, but undefined results for other keys.
 
@@ -125,3 +125,19 @@ This indexes `wikidata-20240320-truthy-BETA` quads in
 * 280MiB for the vfunc of spog quads
 * 74MiB for the Elias-Fano of frame offsets of opsg quads
 * 1.6GiB for the vfunc of opsg quads
+
+## Secondary index
+
+Finally, we need an index to query quads matching `(_, predicate, _, _)`.
+
+We could do this with an extra quad store (ordered by psog or posg) and a first-term index, but this can be achieved with a lightweight index mapping each `predicate` to the list of `subject` such that there are quads matching `(subject, predicate, _, _)`.
+
+For this, we extract the list of term ids used as a predicate in any quad, and build an Elias-Fano structure containing them all. We call it a contraction (because it contracts a range of integers to a smaller one).
+As a small fraction of terms are every used as predicate, this allows mapping predicates' term ids to an internal id that is a much smaller integer, and avoid wasting space in the next structure.
+
+Next, we build a [BvGraph](https://docs.rs/webgraph/latest/webgraph/graphs/bvgraph/), which is a data structure that maps from integers to sets of integers, using as keys the internal ids we just computed, and as values subject ids.
+
+This indexes `wikidata-20240320-truthy-BETA` in:
+
+* 30kiB for the contraction
+* 503MiB for BvGraph itself, 30kiB for its own internal Elias-Fano

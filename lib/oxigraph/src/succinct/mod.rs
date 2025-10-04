@@ -3,6 +3,7 @@
 pub mod database_builder;
 pub mod quads_store;
 pub mod queryable_dataset;
+pub mod secondary_indexes;
 pub mod sort;
 pub mod store;
 pub mod terms_mphf;

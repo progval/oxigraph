@@ -243,7 +243,7 @@ pub fn compress_quads(
     Ok(())
 }
 
-fn get_quad_partitions(dir: &Path) -> Result<(QuadStoreConfiguration, Vec<PathBuf>)> {
+pub(super) fn get_quad_partitions(dir: &Path) -> Result<(QuadStoreConfiguration, Vec<PathBuf>)> {
     let config_path = dir.join("config.json");
     let config_file = File::open(&config_path)
         .with_context(|| format!("Could not open {}", config_path.display()))?;
@@ -651,6 +651,19 @@ impl QuadStore {
         self.get_partition(term1)?
             .iter_quads_by_first_two_terms(term1, term2)
     }
+
+    /// Same as [`iter_quads_by_first_two_terms`](Self::iter_quads_by_first_two_terms) but does not
+    /// perform early checks for false positives
+    ///
+    /// This is useful when the caller knows it is very likely to get results
+    pub fn iter_quads_by_first_two_terms_without_pruning(
+        &self,
+        term1: usize,
+        term2: usize,
+    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<>>> {
+        self.get_partition(term1)?
+            .iter_quads_by_first_two_terms_without_pruning(term1, term2)
+    }
 }
 
 struct QuadPartition {
@@ -769,6 +782,27 @@ impl QuadPartition {
         term1: usize,
         term2: usize,
     ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<>>> {
+        self._iter_quads_by_first_two_terms::<true>(term1, term2)
+    }
+
+    /// Same as [`iter_quads_by_first_two_terms`](Self::iter_quads_by_first_two_terms) but does not
+    /// perform early checks for false positives
+    ///
+    /// This is useful when the caller knows it is very likely to get results
+    pub fn iter_quads_by_first_two_terms_without_pruning(
+        &self,
+        term1: usize,
+        term2: usize,
+    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<>>> {
+        self._iter_quads_by_first_two_terms::<false>(term1, term2)
+    }
+
+    #[inline(always)]
+    fn _iter_quads_by_first_two_terms<const EARLY_PRUNING: bool>(
+        &self,
+        term1: usize,
+        term2: usize,
+    ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<EARLY_PRUNING>>> {
         let relative_term1 = term1
             .checked_sub(self.first_first_term)
             .context("term1 is before the start of the partition")?;
@@ -799,64 +833,66 @@ impl QuadPartition {
         }
         let maybe_from_bit_position = self.frame_index.get(maybe_first_frame_id);
 
-        // Quick check based only on the first term.
-        // It is redundant with the next checks (based on the first two terms) but
-        // is faster because it does a read in the frame index (small EF) right after the read we
-        // just did (so it's most likely already cached) instead of a random read in the quad file
-        if relative_term1 + 1 < self.first_term_index.len() {
-            if self.first_term_index.get(relative_term1 + 1) < maybe_from_bit_position {
-                // the first match of `(relative_term1+1, _, _, _)` has to be after (or equal to)
-                // the first match of `(relative_term1, term2, _, _)`'.
-                // If it is not, it means `first_two_terms_index` returned a false positive
-                return Ok(None);
+        if EARLY_PRUNING {
+            // Quick check based only on the first term.
+            // It is redundant with the next checks (based on the first two terms) but
+            // is faster because it does a read in the frame index (small EF) right after the read we
+            // just did (so it's most likely already cached) instead of a random read in the quad file
+            if relative_term1 + 1 < self.first_term_index.len() {
+                if self.first_term_index.get(relative_term1 + 1) < maybe_from_bit_position {
+                    // the first match of `(relative_term1+1, _, _, _)` has to be after (or equal to)
+                    // the first match of `(relative_term1, term2, _, _)`'.
+                    // If it is not, it means `first_two_terms_index` returned a false positive
+                    return Ok(None);
+                }
             }
-        }
 
-        if maybe_first_frame_id > 0 {
-            // maybe_first_frame_id is not the id of the first frame.
-            // Let's get the first quad of the previous frame
-            let previous_frame_bit_position = self.frame_index.get(maybe_first_frame_id - 1);
-            let first_quad_in_previous_frame = self
-                .quads
-                .iter_from_position(previous_frame_bit_position)?
-                .next()
-                .with_context(|| {
-                    format!("Got no quad when reading from frame {maybe_first_frame_id}-1")
-                })?
-                .with_context(|| format!("Could not peek frame {maybe_first_frame_id}-1"))?;
-            if (
-                first_quad_in_previous_frame[0],
-                first_quad_in_previous_frame[1],
-            ) > (term1, term2)
-            {
-                // maybe_first_frame_id was allegedly the id of the first frame
-                // containing (term1, term2, _, _).
-                // However, we find that maybe_first_frame_id-1 contains a quad
-                // that comes after (term1, term2, _, _).
-                // This means that maybe_first_frame_id was a false positive.
-                return Ok(None);
+            if maybe_first_frame_id > 0 {
+                // maybe_first_frame_id is not the id of the first frame.
+                // Let's get the first quad of the previous frame
+                let previous_frame_bit_position = self.frame_index.get(maybe_first_frame_id - 1);
+                let first_quad_in_previous_frame = self
+                    .quads
+                    .iter_from_position(previous_frame_bit_position)?
+                    .next()
+                    .with_context(|| {
+                        format!("Got no quad when reading from frame {maybe_first_frame_id}-1")
+                    })?
+                    .with_context(|| format!("Could not peek frame {maybe_first_frame_id}-1"))?;
+                if (
+                    first_quad_in_previous_frame[0],
+                    first_quad_in_previous_frame[1],
+                ) > (term1, term2)
+                {
+                    // maybe_first_frame_id was allegedly the id of the first frame
+                    // containing (term1, term2, _, _).
+                    // However, we find that maybe_first_frame_id-1 contains a quad
+                    // that comes after (term1, term2, _, _).
+                    // This means that maybe_first_frame_id was a false positive.
+                    return Ok(None);
+                }
             }
-        }
 
-        if maybe_first_frame_id + 1 < self.frame_index.len() {
-            // maybe_first_frame_id is not the id of the last frame.
-            // Let's get the first quad of the next frame
-            let next_frame_bit_position = self.frame_index.get(maybe_first_frame_id + 1);
-            let first_quad_in_next_frame = self
-                .quads
-                .iter_from_position(next_frame_bit_position)?
-                .next()
-                .with_context(|| {
-                    format!("Got no quad when reading from frame {maybe_first_frame_id}+1")
-                })?
-                .with_context(|| format!("Could not peek frame {maybe_first_frame_id}+1"))?;
-            if (first_quad_in_next_frame[0], first_quad_in_next_frame[1]) < (term1, term2) {
-                // maybe_first_frame_id was allegedly the id of the first frame
-                // containing (term1, term2, _, _).
-                // However, we find that maybe_first_frame_id+1 contains a quad
-                // that comes before (term1, term2, _, _).
-                // This means that maybe_first_frame_id was a false positive.
-                return Ok(None);
+            if maybe_first_frame_id + 1 < self.frame_index.len() {
+                // maybe_first_frame_id is not the id of the last frame.
+                // Let's get the first quad of the next frame
+                let next_frame_bit_position = self.frame_index.get(maybe_first_frame_id + 1);
+                let first_quad_in_next_frame = self
+                    .quads
+                    .iter_from_position(next_frame_bit_position)?
+                    .next()
+                    .with_context(|| {
+                        format!("Got no quad when reading from frame {maybe_first_frame_id}+1")
+                    })?
+                    .with_context(|| format!("Could not peek frame {maybe_first_frame_id}+1"))?;
+                if (first_quad_in_next_frame[0], first_quad_in_next_frame[1]) < (term1, term2) {
+                    // maybe_first_frame_id was allegedly the id of the first frame
+                    // containing (term1, term2, _, _).
+                    // However, we find that maybe_first_frame_id+1 contains a quad
+                    // that comes before (term1, term2, _, _).
+                    // This means that maybe_first_frame_id was a false positive.
+                    return Ok(None);
+                }
             }
         }
 

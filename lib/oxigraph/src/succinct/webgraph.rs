@@ -7,6 +7,7 @@ use lender::Lender;
 use rayon::prelude::*;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use sux::prelude::*;
 use webgraph::graphs::arc_list_graph::ArcListGraph;
 use webgraph::graphs::bvgraph::{BvComp, CompFlags};
 use webgraph::prelude::*;
@@ -14,6 +15,80 @@ use webgraph::traits::SequentialLabeling;
 use webgraph::utils::par_sort_pairs::ParSortPairs;
 use webgraph_algo::preds::MinGain;
 use webgraph_algo::{combine_labels, labels_to_ranks};
+
+pub(super) type DynamicBvGraph = BvGraph<
+    DynCodesDecoderFactory<
+        BigEndian,
+        MmapHelper<u32>,
+        EliasFano<
+            SelectAdaptConst<BitVec<&'static [usize]>, &'static [usize], 12, 4>,
+            BitFieldVec<usize, &'static [usize]>,
+        >,
+    >,
+>;
+
+/// Given an iterator of `(src, dst)` pairs and a path, writes a BVGraph mapping each `src` to its
+/// set of `dst`. at the given path
+pub fn bv(
+    pairs: impl ParallelIterator<Item = Result<(usize, usize)>>,
+    path: impl AsRef<Path>,
+    num_terms: usize,
+    num_pairs: Option<usize>,
+) -> Result<()> {
+    let path = path.as_ref();
+
+    let num_partitions = NonZeroUsize::new(256).unwrap();
+    let num_terms_per_partition = num_terms.div_ceil(num_partitions.into());
+
+    let mut pair_sorter = ParSortPairs::new(num_terms)
+        .context("Could not initialize ParSortPairs")?
+        .batch_size(NonZeroUsize::new(10_000_000).unwrap()) // default uses too much RAM
+        .num_partitions(num_partitions);
+
+    if let Some(num_pairs) = num_pairs {
+        pair_sorter = pair_sorter.expected_num_pairs(num_pairs)
+    }
+
+    let pairs = pairs.map(|pair| pair.unwrap()); // TODO: add support for Result in ParSortPairs
+
+    let sorted_pairs = pair_sorter
+        .par_sort_pairs(pairs)
+        .context("Could not initialize ParSortPairs::par_sort_pairs")?;
+
+    let bvcomp_tmp_dir = tempfile::tempdir().unwrap();
+
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("Could not create {}", path.display()))?;
+
+    // TODO: Switch to LittleEndian once webgraph publishes a release that includes this fix:
+    // https://github.com/vigna/webgraph-rs/pull/141
+    BvComp::parallel_iter::<BigEndian, _>(
+        &path.join("graph"),
+        sorted_pairs
+            .into_iter()
+            .enumerate()
+            .map(|(partition_id, partition)| {
+                let partition = partition.into_iter().dedup();
+                ArcListGraph::new(num_terms, partition)
+                    .iter_from(partition_id * num_terms_per_partition)
+                    .take(num_terms_per_partition)
+            }),
+        num_terms,
+        CompFlags {
+            // BvComp stores as many successor lists as the value of `compression_window`.
+            // As we have some very long successor lists (eg.
+            // http://www.wikidata.org/prop/direct/P31) this can use tens of gigabytes
+            // of RAM as compression_window defaults to 7
+            compression_window: 1,
+            ..Default::default()
+        },
+        &rayon::ThreadPoolBuilder::default().build().unwrap(),
+        bvcomp_tmp_dir.path(),
+    )
+    .context("Could not run BvComp")?;
+
+    Ok(())
+}
 
 /// Given an iterator of quads and a path, writes all pairwise combinations of the quad
 /// to a bvgraph at the given path
@@ -116,10 +191,7 @@ pub fn symmetric_bv(
             compression_window: 1,
             ..Default::default()
         },
-        &rayon::ThreadPoolBuilder::default()
-            .num_threads(1)
-            .build()
-            .unwrap(),
+        &rayon::ThreadPoolBuilder::default().build().unwrap(),
         bvcomp_tmp_dir.path(),
     )
     .context("Could not run BvComp")?;

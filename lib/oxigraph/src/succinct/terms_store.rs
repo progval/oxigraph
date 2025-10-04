@@ -7,6 +7,7 @@ use epserde::deser::{Deserialize as EpDeserialize, DeserializeInner as EpDeseria
 use epserde::ser::Serialize as EpSerialize;
 use itertools::Itertools;
 use mmap_rs::Mmap;
+use quick_cache::sync::Cache;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -14,8 +15,7 @@ use std::io::{Cursor, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use sux::dict::elias_fano::{EfSeqDict, EliasFanoBuilder};
-use sux::traits::{IndexedDict, IndexedSeq};
-use quick_cache::sync::Cache;
+use sux::traits::IndexedSeq;
 
 // Increasing either these values doesn't give noticeably better compression on wikidata-20240320-truthy-BETA.
 pub const DEFAULT_ZSTD_TRAINING_SAMPLES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();

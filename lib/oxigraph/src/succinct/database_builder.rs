@@ -1,6 +1,5 @@
-use super::quads_store::{self, QuadOrder, QuadStoreConfiguration};
-use super::terms_mphf;
-use super::terms_store::{self};
+use super::quads_store::{QuadOrder, QuadStoreConfiguration};
+use super::{quads_store, secondary_indexes, terms_mphf, terms_store};
 use crate::io::{RdfFormat, RdfParseError, RdfParser};
 use crate::model::{NamedNode, Quad};
 use anyhow::{Context, Result, bail, ensure};
@@ -134,6 +133,13 @@ impl DatabaseBuilder {
             log::info!("Building first-term index on {quad_order} quad store");
             self.index_quad_store(quad_order)
                 .with_context(|| format!("Could not index {quad_order} quad store"))?;
+        }
+
+        // we only need one
+        if let Some(quad_order) = self.quad_orders.first() {
+            self.index_by_second_term(*quad_order).with_context(|| {
+                format!("Could not index by second term using {quad_order} quad store")
+            })?;
         }
 
         Ok(())
@@ -331,6 +337,13 @@ impl DatabaseBuilder {
         let quads_path = self.location.join(format!("quads-{order}"));
         quads_store::index_quads_by_first_two_terms(&quads_path)
             .context("Could not index quad store by first two terms")
+    }
+
+    pub fn index_by_second_term(&self, order: QuadOrder) -> Result<()> {
+        let quads_path = self.location.join(format!("quads-{order}"));
+        let index_path = self.location.join(format!("secondary-{order}"));
+        secondary_indexes::build_secondary_index(&quads_path, &index_path)
+            .context("Could not index by second term")
     }
 }
 

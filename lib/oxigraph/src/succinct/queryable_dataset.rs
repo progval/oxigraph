@@ -1,4 +1,5 @@
 use super::quads_store::{QuadOrder, QuadStore};
+use super::secondary_indexes::SecondaryIndex;
 use super::terms_mphf::{DefaultDeserializedTermMphf, TermHasher, TermMphf};
 use super::terms_store::{TermStore, deserialize_term, serialize_graph_name, serialize_term};
 use anyhow::{Context, Result, anyhow, ensure};
@@ -19,6 +20,7 @@ pub struct SuccinctDatasetViewInner {
     terms: TermStore,
     spog_quads: QuadStore,
     opsg_quads: QuadStore,
+    predicate_to_subject: SecondaryIndex,
 
     // if the default graph exists in the dataset, this is its id.
     default_graph_name: Option<usize>,
@@ -50,11 +52,17 @@ impl SuccinctDatasetView {
                 format!("Could not load terms MPHF from {}", mphf_path.display())
             })?
         };
+
+        let predicate_to_subject_path = path.join("secondary-spog");
+        let predicate_to_subject = SecondaryIndex::mmap(&predicate_to_subject_path)
+            .context("Could not load secondary index")?;
+
         let view = Self(Arc::new(SuccinctDatasetViewInner {
             terms_mphf,
             terms,
             spog_quads,
             opsg_quads,
+            predicate_to_subject,
             default_graph_name: None,
             extras: RwLock::default(),
             _dataset: InternalizedDatasetSpec {
@@ -232,6 +240,50 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
                     })
                 },
             ),
+            (None, Some(predicate), _, _) => {
+                let notself = notself.clone();
+                let Some(subjects) = notself.0.predicate_to_subject.get(predicate) else {
+                    return Box::new(std::iter::empty()) as _;
+                };
+
+                Box::new(subjects.into_iter()
+                .flat_map(move |subject| -> Box<dyn Iterator<Item = _>> {
+                    let notself = notself.clone();
+                    let iter = match notself.0
+                        .spog_quads
+                        .iter_quads_by_first_two_terms_without_pruning(subject, predicate) {
+                        Ok(Some(iter)) => iter,
+                        Ok(None) => {
+                            return Box::new(std::iter::once(Err(SuccinctDatasetError(anyhow!("predicate_to_subject claims a quad matching ({subject}, {predicate}, _, _) exists, but none was found"))))) as _;
+                        }
+                        Err(e) => {
+                            return Box::new(std::iter::once(Err(SuccinctDatasetError(e)))) as _;
+                        }
+                    };
+                    Box::new(iter.filter_map(move |quad| -> Option<Result<_, SuccinctDatasetError>> {
+                        ({
+                            || -> Result<Option<_>> {
+                                let quad = QuadOrder::Spog.mapper()(quad?);
+                                ensure!(quad[0] == subject, "subject did not match");
+                                ensure!(quad[1] == predicate, "predicate did not match");
+                                if let Some(object) = object {
+                                    if quad[2] != object {
+                                        return Ok(None);
+                                    }
+                                }
+                                if let Some(graph_name) = graph_name {
+                                    if quad[3] != graph_name {
+                                        return Ok(None);
+                                    }
+                                }
+                                Ok(Some(notself.to_internal_quad(quad)))
+                            }
+                        })()
+                        .map_err(SuccinctDatasetError)
+                        .transpose()
+                    }))
+                })) as _
+            }
             (None, None, None, None) => {
                 map_iterator(self.0.spog_quads.iter_all_quads(), move |iter| {
                     let notself = notself.clone();
@@ -258,7 +310,6 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
                     })
                 })
             }
-            pattern => todo!("internal_quads_for_pattern pattern: {pattern:?}"),
         }
     }
 

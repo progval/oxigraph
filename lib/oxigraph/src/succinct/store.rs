@@ -1,6 +1,5 @@
 use super::queryable_dataset::SuccinctDatasetView;
 use crate::model::*;
-use crate::sparql::QueryDataset;
 use anyhow::{Context, Result, bail};
 use spareval::{InternalQuad, QueryableDataset};
 use std::path::Path;
