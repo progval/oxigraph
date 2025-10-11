@@ -243,7 +243,9 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
             (None, Some(predicate), _, _) => {
                 let notself = notself.clone();
                 let Some(subjects) = notself.0.predicate_to_subject.get(predicate) else {
-                    return Box::new(std::iter::empty()) as _;
+                    // type checker needs the coercion
+                    let it: Box<dyn Iterator<Item = _>> = Box::new(std::iter::empty());
+                    return it;
                 };
 
                 Box::new(subjects.into_iter()
@@ -254,10 +256,10 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
                         .iter_quads_by_first_two_terms_without_pruning(subject, predicate) {
                         Ok(Some(iter)) => iter,
                         Ok(None) => {
-                            return Box::new(std::iter::once(Err(SuccinctDatasetError(anyhow!("predicate_to_subject claims a quad matching ({subject}, {predicate}, _, _) exists, but none was found"))))) as _;
+                            return Box::new(std::iter::once(Err(SuccinctDatasetError(anyhow!("predicate_to_subject claims a quad matching ({subject}, {predicate}, _, _) exists, but none was found")))));
                         }
                         Err(e) => {
-                            return Box::new(std::iter::once(Err(SuccinctDatasetError(e)))) as _;
+                            return Box::new(std::iter::once(Err(SuccinctDatasetError(e))));
                         }
                     };
                     Box::new(iter.filter_map(move |quad| -> Option<Result<_, SuccinctDatasetError>> {
@@ -282,7 +284,7 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
                         .map_err(SuccinctDatasetError)
                         .transpose()
                     }))
-                })) as _
+                }))
             }
             (None, None, None, None) => {
                 map_iterator(self.0.spog_quads.iter_all_quads(), move |iter| {
