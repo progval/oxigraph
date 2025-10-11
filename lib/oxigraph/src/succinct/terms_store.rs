@@ -178,21 +178,27 @@ pub fn serialize_graph_name(graph_name: &GraphName) -> Result<Vec<u8>> {
             // 0 is encoded as a single bit whereas any other value takes at least four bits.
             Ok(Vec::new())
         }
-        GraphName::NamedNode(nn) => Ok(nn.as_str().as_bytes().to_vec()),
-        GraphName::BlankNode(bn) => Ok(bn.as_str().as_bytes().to_vec()),
+        GraphName::NamedNode(nn) => Ok([TERM_TYPE_NAMED_NODE]
+            .into_iter()
+            .chain(nn.as_str().as_bytes().into_iter().copied())
+            .collect()),
+        GraphName::BlankNode(bn) => Ok([TERM_TYPE_BLANK_NODE]
+            .into_iter()
+            .chain(bn.as_str().as_bytes().into_iter().copied())
+            .collect()),
     }
 }
 
 pub fn deserialize_graph_name(bytes: &[u8]) -> Result<GraphName> {
-    if bytes.is_empty() {
-        Ok(GraphName::DefaultGraph)
-    } else {
-        serde_json::from_slice(bytes).with_context(|| {
-            format!(
-                "Could not deserialize graph name '{}'",
-                String::from_utf8_lossy(bytes)
-            )
-        })
+    match bytes.get(0).copied() {
+        None => Ok(GraphName::DefaultGraph),
+        Some(TERM_TYPE_NAMED_NODE) => Ok(GraphName::NamedNode(NamedNode::new_unchecked(
+            str::from_utf8(&bytes[1..]).context("Non-UTF8 NamedNode in store")?,
+        ))),
+        Some(TERM_TYPE_BLANK_NODE) => Ok(GraphName::BlankNode(BlankNode::new_unchecked(
+            str::from_utf8(&bytes[1..]).context("Non-UTF8 NamedNode in store")?,
+        ))),
+        Some(tag) => bail!("Unknown graph_name tag in store: 0x{tag:x}"),
     }
 }
 
