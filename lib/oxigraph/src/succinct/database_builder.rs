@@ -42,7 +42,7 @@ impl DatabaseBuilder {
             approx_quads_per_file: None,
             rebuild: false,
             rdf_format_from_path: default_rdf_format_from_path,
-            quad_orders: vec![QuadOrder::Opsg, QuadOrder::Spog],
+            quad_orders: vec![QuadOrder::Spog, QuadOrder::Opsg],
         }
     }
 
