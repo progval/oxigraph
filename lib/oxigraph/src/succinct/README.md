@@ -34,7 +34,8 @@ Each string is encoded as:
 * a varint of the size of the suffix
 * the suffix itself (which is also the whole string, for the first string of the frame)
 
-This approach is inspired by [sux's RearCodedList](https://docs.rs/sux/latest/sux/dict/rear_coded_list/struct.RearCodedList.html) but adapted to work on binary strings.
+This approach is inspired by [sux's RearCodedList](https://docs.rs/sux/latest/sux/dict/rear_coded_list/struct.RearCodedList.html) but adapted to work on binary strings
+and be written to disk while building instead of needing to fit in memory.
 
 Each term is then associated to an id, which is its position in the compressed files.
 

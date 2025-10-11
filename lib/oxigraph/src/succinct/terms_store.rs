@@ -9,15 +9,15 @@ use itertools::Itertools;
 use lender::{Lender, Lending};
 use mmap_rs::Mmap;
 use oxrdf::vocab::{rdf, xsd};
-use oxrdf::{BlankNode, Literal, NamedNode};
+use oxrdf::{BlankNode, Literal, NamedNode, NamedNodeRef};
 use quick_cache::sync::Cache;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use sux::dict::elias_fano::{EfSeqDict, EliasFanoBuilder};
+use sux::dict::elias_fano::{EfSeq, EfSeqDict, EliasFanoBuilder};
 use sux::traits::IndexedSeq;
 use sux::utils::RewindableIoLender;
 
@@ -80,8 +80,9 @@ const TERM_TYPE_BLANK_NODE: u8 = 2;
 const TERM_TYPE_LITERAL_SIMPLE: u8 = 4;
 const TERM_TYPE_LITERAL_LANGUAGE: u8 = 5;
 const TERM_TYPE_LITERAL_TYPED: u8 = 6;
+const TERM_TYPE_LITERAL_TYPED_IN_DICT: u8 = 7;
 
-pub fn serialize_term(term: &Term) -> Result<Vec<u8>> {
+pub fn serialize_term(term: &Term, dictionary: Option<&TermDictionary>) -> Result<Vec<u8>> {
     match term {
         Term::NamedNode(nn) => Ok([TERM_TYPE_NAMED_NODE]
             .into_iter()
@@ -98,16 +99,31 @@ pub fn serialize_term(term: &Term) -> Result<Vec<u8>> {
                 .collect()),
             (Some(lang), rdf::LANG_STRING) => Ok([TERM_TYPE_LITERAL_LANGUAGE]
                 .into_iter()
-                .chain(lang.as_bytes().len().to_be_bytes().into_iter())
                 .chain(lang.as_bytes().into_iter().copied())
                 .chain(lit.value().as_bytes().into_iter().copied())
+                .chain(
+                    u16::try_from(lang.as_bytes().len())
+                        .context("Language is 2^16 bytes or longer")?
+                        .to_be_bytes()
+                        .into_iter(),
+                )
                 .collect()),
-            (None, datatype) => Ok([TERM_TYPE_LITERAL_TYPED]
-                .into_iter()
-                .chain(datatype.as_str().as_bytes().len().to_be_bytes().into_iter())
-                .chain(datatype.as_str().as_bytes().into_iter().copied())
-                .chain(lit.value().as_bytes().into_iter().copied())
-                .collect()),
+            (None, datatype) => match dictionary
+                .and_then(|dict| dict.get_datatype_id(datatype).transpose())
+                .transpose()?
+            {
+                Some(datatype_id) => Ok([TERM_TYPE_LITERAL_TYPED_IN_DICT]
+                    .into_iter()
+                    .chain(lit.value().as_bytes().into_iter().copied())
+                    .chain(datatype_id.to_be_bytes().into_iter())
+                    .collect()),
+                None => Ok([TERM_TYPE_LITERAL_TYPED]
+                    .into_iter()
+                    .chain(lit.value().as_bytes().into_iter().copied())
+                    .chain(datatype.as_str().as_bytes().into_iter().copied())
+                    .chain(datatype.as_str().as_bytes().len().to_be_bytes().into_iter())
+                    .collect()),
+            },
             (Some(lang), datatype) => bail!(
                 "{term:?} has both a language ({lang:?}) and a non-langString type ({datatype:?})"
             ),
@@ -117,7 +133,7 @@ pub fn serialize_term(term: &Term) -> Result<Vec<u8>> {
     }
 }
 
-pub fn deserialize_term(bytes: &[u8]) -> Result<Term> {
+pub fn deserialize_term(bytes: &[u8], dictionary: Option<&TermDictionary>) -> Result<Term> {
     let &tag = bytes
         .get(0)
         .context("Empty byte string is not a valid term")?;
@@ -132,31 +148,53 @@ pub fn deserialize_term(bytes: &[u8]) -> Result<Term> {
             str::from_utf8(&bytes[1..]).context("Non-UTF8 Literal value in store")?,
         )),
         TERM_TYPE_LITERAL_LANGUAGE => {
-            let lang_offset = 1 + size_of::<usize>();
-            let lang_length = usize::from_be_bytes(
-                bytes[1..lang_offset]
-                    .try_into()
-                    .context("Language tag literal in store is smaller than size_of<usize>()+1")?,
-            );
+            let lang_length_offset = bytes
+                .len()
+                .checked_sub(size_of::<u16>())
+                .context("Language tag literal in store is smaller than size_of<u16>()+1")?;
+            let lang_length = usize::from(u16::from_be_bytes(
+                bytes[lang_length_offset..].try_into().unwrap(),
+            ));
+
             Term::Literal(Literal::new_language_tagged_literal_unchecked(
-                str::from_utf8(&bytes[lang_offset + lang_length..])
+                str::from_utf8(&bytes[1 + lang_length..lang_length_offset])
                     .context("Non-UTF8 Literal value in store")?,
-                str::from_utf8(&bytes[lang_offset..lang_offset + lang_length])
+                str::from_utf8(&bytes[1..1 + lang_length])
                     .context("Non-UTF8 Literal language in store")?,
             ))
         }
-        TERM_TYPE_LITERAL_TYPED => {
-            let type_offset = 1 + size_of::<usize>();
-            let type_length = usize::from_be_bytes(
-                bytes[1..type_offset]
-                    .try_into()
-                    .context("Language tag literal in store is smaller than size_of<usize>()+1")?,
-            );
+        TERM_TYPE_LITERAL_TYPED_IN_DICT => {
+            let type_id_size = size_of::<u32>();
+            let type_id_offset = bytes.len().checked_sub(type_id_size).context(
+                "Datatype-in-dict tagged literal in store is smaller than size_of<u32>()+1",
+            )?;
+            let type_id = u32::from_be_bytes(bytes[type_id_offset..].try_into().unwrap());
+            let type_ = dictionary
+                .context("Terms store was compressed with a dictionary, but no dictionary was given to decompress")?
+                .get_datatype(type_id)
+                .with_context(|| format!("Unknown datatype id: {type_id}"))?;
             Term::Literal(Literal::new_typed_literal(
-                str::from_utf8(&bytes[type_offset + type_length..])
+                str::from_utf8(&bytes[1..type_id_offset])
+                    .context("Non-UTF8 Literal value in store")?,
+                type_,
+            ))
+        }
+        TERM_TYPE_LITERAL_TYPED => {
+            let type_length_offset = bytes
+                .len()
+                .checked_sub(size_of::<u32>())
+                .context("Language tag literal in store is smaller than size_of<u32>()+1")?;
+            let type_length = u32::from_be_bytes(bytes[type_length_offset..].try_into().unwrap());
+            let type_length = usize::try_from(type_length).context("Datatype overflowed usize")?;
+            let type_offset = type_length_offset
+                .checked_sub(type_length)
+                .context("Inconsistent type_length")?;
+
+            Term::Literal(Literal::new_typed_literal(
+                str::from_utf8(&bytes[type_offset..type_length_offset])
                     .context("Non-UTF8 Literal value in store")?,
                 NamedNode::new_unchecked(
-                    str::from_utf8(&bytes[type_offset..type_offset + type_length])
+                    str::from_utf8(&bytes[1..type_offset])
                         .context("Non-UTF8 Literal type in store")?,
                 ),
             ))
@@ -202,11 +240,376 @@ pub fn deserialize_graph_name(bytes: &[u8]) -> Result<GraphName> {
     }
 }
 
+pub struct TermDictionary {
+    name: String,
+    datatypes: Mmap,
+    datatypes_offsets: MemCase<<EfSeq as EpDeserializeInner>::DeserType<'static>>,
+}
+
+impl TermDictionary {
+    pub fn mmap(path: &Path) -> Result<Self> {
+        let datatypes_path = path.join("datatypes.strings");
+        let datatypes_offsets_path = path.join("datatypes.ef");
+
+        let datatypes_file = File::open(&datatypes_path)
+            .with_context(|| format!("Could not open {}", datatypes_path.display()))?;
+        let datatypes_file_len = usize::try_from(
+            datatypes_file
+                .metadata()
+                .with_context(|| format!("Could not stat {}", datatypes_path.display()))?
+                .len(),
+        )
+        .context("File is larger than usize")?;
+        Ok(Self {
+            name: path
+                .file_name()
+                .context("TermDictionary path cannot be root")?
+                .to_str()
+                .context("TermDictionary file name is not valid UTF-8")?
+                .to_string(),
+            datatypes: unsafe {
+                mmap_rs::MmapOptions::new(datatypes_file_len)
+                    .context("Could not initialize mmap")?
+                    .with_file(&datatypes_file, 0)
+                    .map()
+                    .with_context(|| format!("Could not mmap {}", datatypes_path.display()))?
+            },
+            datatypes_offsets: EfSeq::mmap(&datatypes_offsets_path, Flags::RANDOM_ACCESS)
+                .with_context(|| {
+                    format!(
+                        "Could not epdeserialize frames index from {}",
+                        datatypes_offsets_path.display()
+                    )
+                })?,
+        })
+    }
+
+    /// Reads all files in the store and writes a new dictionary that can be used to compress it
+    /// more efficiently, and returns its file name.
+    ///
+    /// Call [`recompress_with_dictionary`] to use that dictionary.
+    pub fn train(dir: &Path) -> Result<Self> {
+        let (config, terms_files) = list_terms_files(dir)?;
+
+        let dictionary = config.get_dictionary(dir)?;
+
+        let mut pl = concurrent_progress_logger!(
+            item_name = "term",
+            display_memory = true,
+            local_speed = true,
+            expected_updates = Some(config.num_terms),
+        );
+        pl.start("Reading terms...");
+
+        let mut unique_sorted_datatypes = terms_files
+            .into_par_iter()
+            .map_with(pl.clone(), |pl, terms_file| {
+                let TermsFile {
+                    first_term_id: _,
+                   num_terms: _,
+                    path: _,
+                    compressed_frames,
+                } = terms_file;
+                let compressed_frames = compressed_frames.as_ref();
+
+                let max_buffer_size = 100_000_000;
+                let max_num_files = 10;
+
+                let mut namednode_sorter  = ExternalDeduplicatingStringSorter::new(
+                    max_buffer_size, max_num_files).context("Could not initialize sorter")?;
+
+                let mut push_namednode = |nn: NamedNodeRef<'_>| namednode_sorter.push_boxed_bytes(nn.as_str().as_bytes().to_vec().into());
+                push_namednode(xsd::STRING)?;
+
+                FrameLender::new(compressed_frames, config.terms_per_frame)?
+                    .try_for_each(|term| {
+                    let term = term?;
+                        if term.is_empty() {
+                            // FIXME: that's GraphName::DefaultGraph because we currently store
+                            // graph names in the terms store, but we shouldn't.
+                            pl.light_update();
+                            return Ok(());
+                        }
+                        let term = deserialize_term(term, dictionary.as_ref()).context("Could not deserialize term from store")?;
+                        match &term {
+                            Term::NamedNode(_) => (),
+                            Term::BlankNode(_) => (),
+                            Term::Literal(lit) => match (lit.language(), lit.datatype()) {
+                                (None, xsd::STRING) => (),
+                                (Some(_lang), rdf::LANG_STRING) =>(),
+                                (None, datatype) => push_namednode(datatype)?,
+                                (Some(lang), datatype) => bail!(
+                                    "{term:?} has both a language ({lang:?}) and a non-langString type ({datatype:?})"
+                                ),
+                            },
+                            #[cfg(feature = "rdf-12")]
+                            Term::Triple(_) => todo!("Term::Triple"),
+                        }
+                        pl.light_update();
+                        Ok(())
+                    })?;
+
+                Ok(namednode_sorter)
+            })
+            .reduce(
+                || {
+                    ExternalDeduplicatingStringSorter::new(100 * 1024 * 1024, 10)
+                        .context("Could not create reducer ExternalDeduplicatingStringSorter")
+                },
+                |left, right| {
+                    left?
+                        .merge(right?)
+                        .context("Could not merge ExternalDeduplicatingStringSorter")
+                },
+            )?;
+        pl.done();
+
+        let dict_dir = tempfile::tempdir_in(dir).with_context(|| {
+            format!("Could not create temporary directory in {}", dir.display())
+        })?;
+
+        // Write datatypes
+        let mut pl = progress_logger!(
+            item_name = "datatype",
+            display_memory = true,
+            local_speed = true,
+        );
+        pl.start("Writing datatypes...");
+        let datatypes_path = dict_dir.path().join("datatypes.strings");
+        let file = File::create_new(&datatypes_path)
+            .with_context(|| format!("Could not create {}", datatypes_path.display()))?;
+        let mut writer = BufWriter::new(file);
+        let mut num_datatypes = 0usize;
+        let mut file_len = 0usize;
+        for datatype in unique_sorted_datatypes
+            .drain_boxed_bytes()
+            .context("Could not read deduplicated datatypes")?
+        {
+            let datatype = datatype?;
+            write_length_prefixed_string(&mut writer, &datatype, &datatypes_path)?;
+
+            num_datatypes = num_datatypes
+                .checked_add(1)
+                .context("Number of data types overflows usize")?;
+            file_len = file_len
+                .checked_add(size_of::<u32>() + datatype.len())
+                .context("datatypes dictionary size overflowed usize")?;
+            pl.light_update();
+        }
+        let mut file = writer
+            .into_inner()
+            .with_context(|| format!("Could not flush to {}", datatypes_path.display()))?;
+        file.flush()
+            .with_context(|| format!("Could not flush to {}", datatypes_path.display()))?;
+        pl.done();
+
+        // Index the data types
+        let mut pl = progress_logger!(
+            item_name = "datatype",
+            display_memory = true,
+            local_speed = true,
+            expected_updates = Some(num_datatypes),
+        );
+        pl.start("Indexing datatypes...");
+        file.rewind()
+            .with_context(|| format!("Could not rewind {}", datatypes_path.display()))?;
+        let mut reader = BufReader::new(file);
+        let mut efb = EliasFanoBuilder::new(num_datatypes + 1, file_len);
+        efb.push(0);
+        let mut offset = 0usize;
+        for i in 0..num_datatypes {
+            let datatype = read_length_prefixed_string(&mut reader, |reader| {
+                Some(reader.stream_position().map_err(Into::into))
+            })
+            .with_context(|| format!("Could not read {i}th datatype"))?
+            .context("Unexpected end of file")?;
+
+            // write to the index
+            let len = datatype.len();
+            offset = offset + size_of::<u32>() + len; // can't overflow, we already checked the file len
+            efb.push(offset);
+
+            pl.light_update()
+        }
+
+        let ef = efb.build_with_seq();
+        let datatypes_index_path = dict_dir.path().join("datatypes.ef");
+        let mut index_file = File::create(&datatypes_index_path)
+            .with_context(|| format!("Could not create {}", datatypes_index_path.display()))?;
+        ef.serialize(&mut index_file).with_context(|| {
+            format!(
+                "Could not write Elias-Fano index to {}",
+                datatypes_index_path.display()
+            )
+        })?;
+        pl.done();
+
+        let tmp_dict_path = dict_dir.keep();
+        let dict_path = dir.join("dict");
+        std::fs::rename(&tmp_dict_path, &dict_path).context("Could not rename dict")?;
+
+        let dict = Self::mmap(&dict_path)
+            .with_context(|| format!("Could not mmap dictionary from {}", dict_path.display()))?;
+        Ok(dict)
+    }
+
+    fn get_datatype_id(&self, datatype: NamedNodeRef<'_>) -> Result<Option<u32>> {
+        // TODO: use VFunc instead of bisection
+        let mut left = 0;
+        let mut right = u32::try_from(self.datatypes_offsets.len() - 1)
+            .context("Number of datatypes overflowed u32")?;
+        while left < right {
+            let pivot_id = (left + right) / 2;
+            assert!(
+                pivot_id > left || pivot_id < right,
+                "{left} | {pivot_id} | {right}"
+            );
+            let pivot = self.get_datatype(pivot_id)?;
+            if pivot == datatype {
+                return Ok(Some(pivot_id));
+            } else if pivot < datatype {
+                if left == pivot_id {
+                    break;
+                }
+                assert!(left < pivot_id);
+                left = pivot_id;
+            } else {
+                if right == pivot_id {
+                    break;
+                }
+                assert!(right > pivot_id);
+                right = pivot_id;
+            }
+        }
+        if self.get_datatype(left)? == datatype {
+            Ok(Some(left))
+        } else {
+            Ok(None)
+        }
+    }
+    fn get_datatype(&self, id: u32) -> Result<NamedNode> {
+        let id = usize::try_from(id).with_context(|| format!("Invalid datatype id: {id}"))?;
+        ensure!(
+            id < self.datatypes_offsets.len(),
+            "Invalid datatype id: {id}"
+        );
+
+        let offset = self.datatypes_offsets.get(id);
+        let bytes = read_length_prefixed_string(&mut Cursor::new(&self.datatypes), |_| {
+            Some(u64::try_from(offset).context("Offset overflowed u64"))
+        })
+        .context("Could not get datatype")?
+        .context("Unexpected end of file")?;
+        Ok(NamedNode::new_unchecked(
+            str::from_utf8(&bytes).context("Non-UTF8 NamedNode in store")?,
+        ))
+    }
+}
+
+pub fn recompress_with_dictionary(dir: &Path, dictionary: &TermDictionary) -> Result<()> {
+    let (mut config, terms_files) = list_terms_files(dir)?;
+
+    let old_dictionary = config.get_dictionary(dir)?;
+
+    let mut pl = concurrent_progress_logger!(
+        item_name = "term",
+        display_memory = true,
+        local_speed = true,
+        expected_updates = Some(config.num_terms),
+    );
+    pl.start("Recompressing terms...");
+
+    let recompressed_files = terms_files
+        .par_iter()
+        .map_with(pl.clone(), |pl, terms_file| {
+            let TermsFile {
+                first_term_id: _,
+                num_terms: _,
+                path,
+                compressed_frames,
+            } = terms_file;
+            let compressed_frames = compressed_frames.as_ref();
+
+            let recompressed_file = tempfile::NamedTempFile::with_prefix_in(
+                path.file_name().expect("File has no name"),
+                path.parent().expect("File has no parent directory"),
+            )
+            .context("Could not create temporary file")?;
+            let mut writer = BufWriter::new(recompressed_file);
+
+            let mut buf = Vec::with_capacity(config.terms_per_frame.into());
+            FrameLender::new(compressed_frames, config.terms_per_frame)?.try_for_each(
+                |term| -> Result<_> {
+                    let term = term?;
+                    if term.is_empty() {
+                        // FIXME: that's GraphName::DefaultGraph because we currently store
+                        // graph names in the terms store, but we shouldn't.
+                        buf.push(term.into());
+                    } else {
+                        let term = deserialize_term(term, old_dictionary.as_ref())
+                            .context("Could not deserialize term from store")?;
+                        buf.push(serialize_term(&term, Some(dictionary))?.into());
+                    }
+                    if buf.len() == usize::from(config.terms_per_frame) {
+                        write_frame(&mut writer, buf.drain(..).map(Ok))?;
+                    }
+                    pl.light_update();
+                    Ok(())
+                },
+            )?;
+            if !buf.is_empty() {
+                write_frame(&mut writer, buf.drain(..).map(Ok))?;
+            }
+
+            let mut recompressed_file = writer
+                .into_inner()
+                .with_context(|| format!("Could not flush to {}", path.display()))?;
+            recompressed_file
+                .flush()
+                .with_context(|| format!("Could not flush to {}", path.display()))?;
+
+            Ok(recompressed_file)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    pl.done();
+
+    log::info!("Invalidating index files...");
+    for original_file in &terms_files {
+        let index_file_path = original_file.path.with_extension("frames.ef");
+        if std::fs::exists(&index_file_path)
+            .with_context(|| format!("Could not check if {} exists", index_file_path.display()))?
+        {
+            std::fs::remove_file(&index_file_path).with_context(|| {
+                format!("Could not remove index file {}", index_file_path.display())
+            })?;
+        }
+    }
+
+    log::info!("Committing recompressed files...");
+    config.dictionary_filename = Some(dictionary.name.clone());
+    let config_path = dir.join("config.json");
+    let config_file = File::create(&config_path)
+        .with_context(|| format!("Could not create {}", config_path.display()))?;
+    serde_json::to_writer_pretty(config_file, &config)
+        .context("Could not write terms store config")?;
+
+    for (original_file, recompressed_file) in
+        terms_files.into_iter().zip(recompressed_files.into_iter())
+    {
+        recompressed_file
+            .persist(original_file.path)
+            .context("Could not persist recompressed file.")?;
+    }
+
+    Ok(())
+}
+
 fn deduplicate_terms(
     quads: impl ParallelIterator<Item = Result<Quad>>,
 ) -> Result<ExternalDeduplicatingStringSorter> {
     fn push_term(sorter: &mut ExternalDeduplicatingStringSorter, term: Term) -> Result<()> {
-        sorter.push_boxed_bytes(serialize_term(&term)?.into_boxed_slice())
+        sorter.push_boxed_bytes(serialize_term(&term, None)?.into_boxed_slice())
     }
 
     let unique_sorted_terms = quads
@@ -257,7 +660,17 @@ pub struct TermStoreConfiguration {
     pub terms_per_frame: NonZeroUsize,
     pub frames_per_file: usize,
     pub num_terms: usize,
-    pub zstd_dictionary_filename: Option<String>,
+    pub dictionary_filename: Option<String>,
+}
+
+impl TermStoreConfiguration {
+    pub fn get_dictionary(&self, path: impl AsRef<Path>) -> Result<Option<TermDictionary>> {
+        self.dictionary_filename
+        .as_ref()
+        .map(|dict_name| TermDictionary::mmap(&path.as_ref().join(dict_name)))
+        .transpose()
+        .context("Could not mmap dictionary")
+    }
 }
 
 pub fn write_unique_terms(
@@ -269,7 +682,7 @@ pub fn write_unique_terms(
         terms_per_frame: NonZeroUsize::new(16).unwrap(),
         frames_per_file: 1024 * 1024,
         num_terms: 0,
-        zstd_dictionary_filename: None,
+        dictionary_filename: None,
     };
 
     let mut pl = concurrent_progress_logger!(
@@ -303,7 +716,7 @@ pub fn write_unique_terms(
         let strings_file = File::create(&strings_path)
             .with_context(|| format!("Could not create {}", strings_path.display()))?;
 
-        let mut writer = std::io::BufWriter::new(strings_file);
+        let mut writer = BufWriter::new(strings_file);
         let term_chunk_iterator = big_chunk.chunks(config.terms_per_frame.into());
         for (frame_id, small_chunk) in term_chunk_iterator.into_iter().enumerate() {
             let chunk_len = write_frame(&mut writer, small_chunk).with_context(|| {

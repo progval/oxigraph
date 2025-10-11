@@ -1,6 +1,8 @@
 use super::terms_store::{FrameLender, TermsFile, list_terms_files};
 use crate::model::{GraphName, NamedNode, NamedOrBlankNode, Term};
-use crate::succinct::terms_store::{serialize_graph_name, serialize_term};
+use crate::succinct::terms_store::{
+    deserialize_term, serialize_graph_name, serialize_term,
+};
 use anyhow::{Context, Result, ensure};
 use bytemuck::TransparentWrapper;
 use dsi_progress_logger::{ProgressLog, progress_logger};
@@ -64,14 +66,14 @@ pub trait TermHasher {
     fn hash_bytes(&self, s: impl AsRef<[u8]>) -> Result<usize>;
 
     fn hash_namedorblanknode(&self, term: &NamedOrBlankNode) -> Result<usize> {
-        self.hash_bytes(serialize_term(&term.clone().into())?)
+        self.hash_bytes(serialize_term(&term.clone().into(), None)?)
     }
     fn hash_namednode(&self, term: &NamedNode) -> Result<usize> {
-        self.hash_bytes(serialize_term(&term.clone().into())?)
+        self.hash_bytes(serialize_term(&term.clone().into(), None)?)
     }
 
     fn hash_term(&self, term: &Term) -> Result<usize> {
-        self.hash_bytes(serialize_term(term)?)
+        self.hash_bytes(serialize_term(term, None)?)
     }
 
     fn hash_graphname(&self, graph_name: &GraphName) -> Result<usize> {
@@ -162,34 +164,57 @@ impl TermMphf<BitFieldVec<usize>> {
 
 pub fn build_terms_mphf(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
     let (config, terms_files) = list_terms_files(dir)?;
+    let dictionary = config.get_dictionary(dir)?;
 
-    let terms_lender = RewindableIoFlattenLender::new(
-        terms_files
-            .iter()
-            .map(|terms_file| {
-                let TermsFile {
-                    first_term_id: _,
-                    num_terms: _,
-                    path,
-                    compressed_frames,
-                } = terms_file;
+    let terms_lender =
+        RewindableIoFlattenLender::new(
+            terms_files
+                .iter()
+                .map(|terms_file| {
+                    let TermsFile {
+                        first_term_id: _,
+                        num_terms: _,
+                        path,
+                        compressed_frames,
+                    } = terms_file;
 
-                sux::utils::FromResultLenderFactory::new(|| {
-                    Ok(FrameLender::new(compressed_frames, config.terms_per_frame)
-                        .with_context(|| format!("Could not decompress {}", path.display()))
-                        .map_err(DecodeError)?
-                        .map(
-                            lender::hrc_mut!(for<'all> |term: Result<&'all [u8]>| -> Result<
+                    sux::utils::FromResultLenderFactory::new(|| {
+                        Ok(FrameLender::new(compressed_frames, config.terms_per_frame)
+                            .with_context(|| format!("Could not decompress {}", path.display()))
+                            .map_err(DecodeError)?
+                            .map(
+                                lender::hrc_mut!(for<'all> |term: Result<&'all [u8]>| -> Result<
                                     BoxedRawTerm,
                                     DecodeError,
                                 > {
-                                    Ok(BoxedRawTerm(term.map_err(DecodeError)?.into()))
+                                    let term = term.map_err(DecodeError)?;
+                                    let term = if term.is_empty() {
+                                        // FIXME: that's GraphName::DefaultGraph because we currently store
+                                        // graph names in the terms store, but we shouldn't.
+                                        term.to_vec()
+                                    } else {
+                                        match &dictionary {
+                                            // reencode without the dictionary, to avoid dictionary
+                                            // lookups when hashing terms
+                                            // FIXME: this seems to be buggy somehow, and makes the
+                                            // quads extraction crash, claiming it can't hash
+                                            // some literals with datatype
+                                            Some(dictionary) => serialize_term(
+                                                &deserialize_term(term, Some(dictionary))
+                                                    .context("Could not deserialize term")?,
+                                                None,
+                                            )
+                                            .context("Could not serialize term")?,
+                                            None => term.to_vec(),
+                                        }
+                                    };
+                                    Ok(BoxedRawTerm(term.into()))
                                 }),
-                        ))
+                            ))
+                    })
                 })
-            })
-            .collect::<Result<_, DecodeError>>()?,
-    );
+                .collect::<Result<_, DecodeError>>()?,
+        );
 
     let mut pl = progress_logger!(
         item_name = "term",

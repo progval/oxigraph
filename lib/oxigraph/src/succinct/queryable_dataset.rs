@@ -319,7 +319,7 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
     fn internalize_term(&self, term: Term) -> Result<Self::InternalTerm, Self::Error> {
         if let Ok(id) = self.0.terms_mphf.hash_term(&term) {
             if let Some(expected_term_bytes) = self.0.terms.get(id)? {
-                let term_bytes_matches = *expected_term_bytes == *serialize_term(&term)?;
+                let term_bytes_matches = *expected_term_bytes == *serialize_term(&term, None)?;
 
                 if term_bytes_matches {
                     // not a hash collision
@@ -340,7 +340,7 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
     /// Builds a [`Term`] from an internal term
     fn externalize_term(&self, term: Self::InternalTerm) -> Result<Term, Self::Error> {
         if let Some(bytes) = self.0.terms.get(term)? {
-            Ok(deserialize_term(&bytes).with_context(|| {
+            Ok(deserialize_term(&bytes, None).with_context(|| {
                 format!(
                     "Could not parse stored term {:?}",
                     String::from_utf8_lossy(&bytes)

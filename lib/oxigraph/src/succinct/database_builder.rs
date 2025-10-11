@@ -112,6 +112,10 @@ impl DatabaseBuilder {
         log::info!("Extracting terms...");
         self.extract_terms().context("Could not extract terms")?;
 
+        log::info!("Building dictionary and recompressing terms...");
+        self.recompress_terms()
+            .context("Could not recompress terms")?;
+
         log::info!("Indexing terms...");
         self.index_terms().context("Could not index terms")?;
 
@@ -173,6 +177,23 @@ impl DatabaseBuilder {
             )
             .context("Could not deduplicate or write terms")
         }
+    }
+
+    pub fn recompress_terms(&self) -> Result<()> {
+        if !self.rebuild {
+            let config_path = self.terms_path().join("config.json");
+            let config_file = File::open(&config_path)
+                .with_context(|| format!("Could not open {}", config_path.display()))?;
+            let config: terms_store::TermStoreConfiguration = serde_json::from_reader(config_file)
+                .with_context(|| format!("Could not read config from {}", config_path.display()))?;
+            if config.dictionary_filename.is_some() {
+                return Ok(());
+            }
+        }
+
+        let dictionary = terms_store::TermDictionary::train(&self.terms_path())?;
+        terms_store::recompress_with_dictionary(&self.terms_path(), &dictionary)?;
+        Ok(())
     }
 
     pub fn index_terms(&self) -> Result<()> {

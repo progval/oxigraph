@@ -99,6 +99,8 @@ pub enum Commands {
         /// Provides an estimated time of completion
         approx_quads_per_file: Option<usize>,
     },
+    /// Step 1.5: (Optional) Trains a dictionary on the terms and use it to recompress them
+    RecompressTerms {},
     /// Step 2a: read the terms/ directory and makes each term accessible in O(1) given its position,
     /// allowing a O(1) map from ids to terms
     IndexTerms {},
@@ -194,6 +196,9 @@ pub fn main() -> Result<()> {
                 .with_parse_quad_args(Some(parse_args.try_into()?))
                 .with_approx_num_quads(approx_quads_per_file)
                 .extract_terms()?;
+        }
+        Commands::RecompressTerms {} => {
+            db_builder.recompress_terms()?;
         }
         Commands::IndexTerms {} => {
             db_builder.index_terms()?;
