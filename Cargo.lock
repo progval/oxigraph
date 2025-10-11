@@ -2315,10 +2315,10 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.16",
  "thread_local",
+ "tiny-varint",
  "webgraph",
  "webgraph-algo",
  "webgraph-cli",
- "zstd",
 ]
 
 [[package]]
@@ -3620,6 +3620,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tiny-varint"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "208916571688a0d90ad99136e5b8ba24df5a201310eee3c6a2e8363a3747d45c"
+dependencies = [
+ "zigzag-rs",
+]
+
+[[package]]
 name = "tinystr"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4595,6 +4604,12 @@ dependencies = [
  "quote",
  "syn 2.0.106",
 ]
+
+[[package]]
+name = "zigzag-rs"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4be13092fdf7a0e970ca30ab3dd64d35e0f78bfd5b47c922648bd8945d6f43bb"
 
 [[package]]
 name = "zstd"

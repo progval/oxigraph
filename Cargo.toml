@@ -88,6 +88,7 @@ tempfile = "3.1"
 thiserror = ">=1.0.50, <3.0"
 thread_local = "1.1.9"
 time = "0.3"
+tiny-varint = "0.2.0"
 tokio = "1.29"
 url = "2.4"
 wasm-bindgen = "0.2.100"
@@ -95,7 +96,6 @@ webgraph = { git = "https://github.com/vigna/webgraph-rs.git", rev = "1477e7b986
 webgraph-algo = { git = "https://github.com/vigna/webgraph-rs.git", rev = "1477e7b98637c02e4d1b72e689a3302df2c11132" }
 webgraph-cli = { git = "https://github.com/vigna/webgraph-rs.git", rev = "1477e7b98637c02e4d1b72e689a3302df2c11132" }
 wkt = "0.14"
-zstd = "0.13.3"
 
 # Internal dependencies
 oxigraph = { version = "=0.5.0", path = "lib/oxigraph" }

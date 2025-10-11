@@ -16,7 +16,7 @@ rust-version.workspace = true
 [features]
 default = ["rocksdb", "succinct"]
 rocksdb = ["oxrocksdb-sys"]
-succinct = ["anyhow", "bytemuck", "clap", "deko", "dsi-progress-logger", "dsi-bitstream", "deko", "epserde", "lender", "log", "itertools", "mmap-rs", "quick_cache", "rayon", "rdst", "serde", "serde/derive", "serde_json", "sux", "tempfile", "thread_local", "webgraph", "webgraph-algo", "webgraph-cli", "zstd"]
+succinct = ["anyhow", "bytemuck", "clap", "deko", "dsi-progress-logger", "dsi-bitstream", "deko", "epserde", "lender", "log", "itertools", "mmap-rs", "quick_cache", "rayon", "rdst", "serde", "serde/derive", "serde_json", "sux", "tempfile", "thread_local", "tiny-varint", "webgraph", "webgraph-algo", "webgraph-cli"]
 js = ["getrandom/wasm_js", "oxsdatatypes/js", "js-sys"]
 http-client = ["oxhttp"]
 http-client-native-tls = ["http-client", "oxhttp/native-tls"]
@@ -65,10 +65,10 @@ serde_json = { workspace = true, optional = true }
 sux = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 thread_local = { workspace = true, optional = true }
+tiny-varint = { workspace = true, optional = true }
 webgraph = { workspace = true, optional = true }
 webgraph-algo = { workspace = true, optional = true }
 webgraph-cli = { workspace = true, optional = true }
-zstd = { workspace = true, optional = true }
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 getrandom.workspace = true

@@ -23,11 +23,20 @@ To allow database construction to be parallel, terms and quads are sharded into 
 
 # Terms
 
-**Terms are sorted alphabetically** and zstd-compressed.
-Zstd files are built so that each frame contains exactly the same number of terms (`terms_per_frame`, 16 by default).
-Sorting them means that similar terms are in the same zstd frame, so they compress well.
+**Terms are sorted alphabetically** and compressed using prefix omission.
 
-Each term is then associated to an id, which is its position in the zstd-compressed files.
+Terms are grouped by frame so that each frame contains exactly the same number of terms (`terms_per_frame`, 16 by default).
+The first string of each frame is written explicitly, but the next string can reuse a prefix of that string to avoid repeating it.
+
+Each string is encoded as:
+
+* a varint of how many bytes to remove from the previous string (or 0 for the first string of a frame)
+* a varint of the size of the suffix
+* the suffix itself (which is also the whole string, for the first string of the frame)
+
+This approach is inspired by [sux's RearCodedList](https://docs.rs/sux/latest/sux/dict/rear_coded_list/struct.RearCodedList.html) but adapted to work on binary strings.
+
+Each term is then associated to an id, which is its position in the compressed files.
 
 We map each frame's id to its position in the zstd-compressed files using an Elias-Fano sequence.
 This allows getting a term's frame given its id, by dividing the id by `terms_per_frame`.

@@ -6,16 +6,20 @@ use epserde::deser::mem_case::{Flags, MemCase};
 use epserde::deser::{Deserialize as EpDeserialize, DeserializeInner as EpDeserializeInner};
 use epserde::ser::Serialize as EpSerialize;
 use itertools::Itertools;
+use lender::{Lender, Lending};
 use mmap_rs::Mmap;
+use oxrdf::vocab::{rdf, xsd};
+use oxrdf::{BlankNode, Literal, NamedNode};
 use quick_cache::sync::Cache;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use sux::dict::elias_fano::{EfSeqDict, EliasFanoBuilder};
 use sux::traits::IndexedSeq;
+use sux::utils::RewindableIoLender;
 
 // Increasing either these values doesn't give noticeably better compression on wikidata-20240320-truthy-BETA.
 pub const DEFAULT_ZSTD_TRAINING_SAMPLES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
@@ -71,33 +75,111 @@ pub(super) fn read_length_prefixed_string<R: Read>(
     Ok(Some(string.into()))
 }
 
+const TERM_TYPE_NAMED_NODE: u8 = 1;
+const TERM_TYPE_BLANK_NODE: u8 = 2;
+const TERM_TYPE_LITERAL_SIMPLE: u8 = 4;
+const TERM_TYPE_LITERAL_LANGUAGE: u8 = 5;
+const TERM_TYPE_LITERAL_TYPED: u8 = 6;
+
 pub fn serialize_term(term: &Term) -> Result<Vec<u8>> {
-    serde_json::to_vec(term).with_context(|| format!("Could not serialize term {term:?}"))
+    match term {
+        Term::NamedNode(nn) => Ok([TERM_TYPE_NAMED_NODE]
+            .into_iter()
+            .chain(nn.as_str().as_bytes().into_iter().copied())
+            .collect()),
+        Term::BlankNode(bn) => Ok([TERM_TYPE_BLANK_NODE]
+            .into_iter()
+            .chain(bn.as_str().as_bytes().into_iter().copied())
+            .collect()),
+        Term::Literal(lit) => match (lit.language(), lit.datatype()) {
+            (None, xsd::STRING) => Ok([TERM_TYPE_LITERAL_SIMPLE]
+                .into_iter()
+                .chain(lit.value().as_bytes().into_iter().copied())
+                .collect()),
+            (Some(lang), rdf::LANG_STRING) => Ok([TERM_TYPE_LITERAL_LANGUAGE]
+                .into_iter()
+                .chain(lang.as_bytes().len().to_be_bytes().into_iter())
+                .chain(lang.as_bytes().into_iter().copied())
+                .chain(lit.value().as_bytes().into_iter().copied())
+                .collect()),
+            (None, datatype) => Ok([TERM_TYPE_LITERAL_TYPED]
+                .into_iter()
+                .chain(datatype.as_str().as_bytes().len().to_be_bytes().into_iter())
+                .chain(datatype.as_str().as_bytes().into_iter().copied())
+                .chain(lit.value().as_bytes().into_iter().copied())
+                .collect()),
+            (Some(lang), datatype) => bail!(
+                "{term:?} has both a language ({lang:?}) and a non-langString type ({datatype:?})"
+            ),
+        },
+        #[cfg(feature = "rdf-12")]
+        Term::Triple(_) => todo!("Term::Triple"),
+    }
 }
 
 pub fn deserialize_term(bytes: &[u8]) -> Result<Term> {
-    serde_json::from_slice(bytes).with_context(|| {
-        format!(
-            "Could not deserialize term '{}'",
-            String::from_utf8_lossy(bytes)
-        )
+    let &tag = bytes
+        .get(0)
+        .context("Empty byte string is not a valid term")?;
+    Ok(match tag {
+        TERM_TYPE_NAMED_NODE => Term::NamedNode(NamedNode::new_unchecked(
+            str::from_utf8(&bytes[1..]).context("Non-UTF8 NamedNode in store")?,
+        )),
+        TERM_TYPE_BLANK_NODE => Term::BlankNode(BlankNode::new_unchecked(
+            str::from_utf8(&bytes[1..]).context("Non-UTF8 BlankNode in store")?,
+        )),
+        TERM_TYPE_LITERAL_SIMPLE => Term::Literal(Literal::new_simple_literal(
+            str::from_utf8(&bytes[1..]).context("Non-UTF8 Literal value in store")?,
+        )),
+        TERM_TYPE_LITERAL_LANGUAGE => {
+            let lang_offset = 1 + size_of::<usize>();
+            let lang_length = usize::from_be_bytes(
+                bytes[1..lang_offset]
+                    .try_into()
+                    .context("Language tag literal in store is smaller than size_of<usize>()+1")?,
+            );
+            Term::Literal(Literal::new_language_tagged_literal_unchecked(
+                str::from_utf8(&bytes[lang_offset + lang_length..])
+                    .context("Non-UTF8 Literal value in store")?,
+                str::from_utf8(&bytes[lang_offset..lang_offset + lang_length])
+                    .context("Non-UTF8 Literal language in store")?,
+            ))
+        }
+        TERM_TYPE_LITERAL_TYPED => {
+            let type_offset = 1 + size_of::<usize>();
+            let type_length = usize::from_be_bytes(
+                bytes[1..type_offset]
+                    .try_into()
+                    .context("Language tag literal in store is smaller than size_of<usize>()+1")?,
+            );
+            Term::Literal(Literal::new_typed_literal(
+                str::from_utf8(&bytes[type_offset + type_length..])
+                    .context("Non-UTF8 Literal value in store")?,
+                NamedNode::new_unchecked(
+                    str::from_utf8(&bytes[type_offset..type_offset + type_length])
+                        .context("Non-UTF8 Literal type in store")?,
+                ),
+            ))
+        }
+        _ => bail!("Unknown term tag in store: 0x{tag:x}"),
     })
 }
 
 pub fn serialize_graph_name(graph_name: &GraphName) -> Result<Vec<u8>> {
-    if graph_name == &GraphName::DefaultGraph {
-        // The empty string is very handy in datasets that have most of their quads
-        // in the default graph, because it comes first in the sorted list of terms,
-        // which means that the DefaultGraph gets hashed to id 0.
-        // And because sorted quad files have to write the graph at the beginning
-        // of each frame, the shorter the graph id is, the better.
-        // And because we use gamma coding
-        // (https://docs.rs/dsi-bitstream/latest/dsi_bitstream/codes/index.html),
-        // 0 is encoded as a single bit whereas any other value takes at least four bits.
-        return Ok(Vec::new());
-    } else {
-        serde_json::to_vec(graph_name)
-            .with_context(|| format!("Could not serialize graph name {graph_name:?}"))
+    match graph_name {
+        GraphName::DefaultGraph => {
+            // The empty string is very handy in datasets that have most of their quads
+            // in the default graph, because it comes first in the sorted list of terms,
+            // which means that the DefaultGraph gets hashed to id 0.
+            // And because sorted quad files have to write the graph at the beginning
+            // of each frame, the shorter the graph id is, the better.
+            // And because we use gamma coding
+            // (https://docs.rs/dsi-bitstream/latest/dsi_bitstream/codes/index.html),
+            // 0 is encoded as a single bit whereas any other value takes at least four bits.
+            Ok(Vec::new())
+        }
+        GraphName::NamedNode(nn) => Ok(nn.as_str().as_bytes().to_vec()),
+        GraphName::BlankNode(bn) => Ok(bn.as_str().as_bytes().to_vec()),
     }
 }
 
@@ -166,7 +248,7 @@ fn deduplicate_terms(
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TermStoreConfiguration {
-    pub terms_per_frame: usize,
+    pub terms_per_frame: NonZeroUsize,
     pub frames_per_file: usize,
     pub num_terms: usize,
     pub zstd_dictionary_filename: Option<String>,
@@ -178,12 +260,11 @@ pub fn write_unique_terms(
     approx_num_quads: Option<usize>,
 ) -> Result<()> {
     let mut config = TermStoreConfiguration {
-        terms_per_frame: 16,
+        terms_per_frame: NonZeroUsize::new(16).unwrap(),
         frames_per_file: 1024 * 1024,
         num_terms: 0,
         zstd_dictionary_filename: None,
     };
-    let compression_level = 1; // we are going to read it very often and in small chunks
 
     let mut pl = concurrent_progress_logger!(
         item_name = "quad",
@@ -210,36 +291,29 @@ pub fn write_unique_terms(
     let term_chunk_iterator = sorter
         .drain_boxed_bytes()
         .context("Could not read final iterator of terms")?
-        .chunks(config.terms_per_frame * config.frames_per_file);
+        .chunks(usize::from(config.terms_per_frame) * config.frames_per_file);
     for (file_id, big_chunk) in term_chunk_iterator.into_iter().enumerate() {
-        let file_path = dir.join(format!("{file_id:0>10}.zst"));
-        let mut file = File::create(&file_path)
-            .with_context(|| format!("Could not create {}", file_path.display()))?;
-        let term_chunk_iterator = big_chunk.chunks(config.terms_per_frame);
+        let strings_path = dir.join(format!("{file_id:0>10}.strings"));
+        let strings_file = File::create(&strings_path)
+            .with_context(|| format!("Could not create {}", strings_path.display()))?;
+
+        let mut writer = std::io::BufWriter::new(strings_file);
+        let term_chunk_iterator = big_chunk.chunks(config.terms_per_frame.into());
         for (frame_id, small_chunk) in term_chunk_iterator.into_iter().enumerate() {
-            let mut uncompressed_frame = Cursor::new(Vec::new());
-            for term in small_chunk {
-                write_length_prefixed_string(&mut uncompressed_frame, &term?, &file_path)?;
-                pl.light_update();
-                config.num_terms += 1;
-            }
-            let uncompressed_frame = &uncompressed_frame.into_inner();
-            let mut compressed_frame =
-                Vec::with_capacity(zstd::zstd_safe::compress_bound(uncompressed_frame.len()));
-            zstd::zstd_safe::compress(&mut compressed_frame, uncompressed_frame, compression_level)
-                .map_err(|errno| {
-                    anyhow!(
-                        "Could not compress frame: {}",
-                        zstd::zstd_safe::get_error_name(errno)
-                    )
-                })?;
-            file.write_all(&compressed_frame).with_context(|| {
+            let chunk_len = write_frame(&mut writer, small_chunk).with_context(|| {
                 format!(
-                    "Could not write frame {frame_id} of {}",
-                    file_path.display(),
+                    "Could not write frame {frame_id} to {}",
+                    strings_path.display()
                 )
             })?;
+            pl.update_with_count(chunk_len);
+            config.num_terms += chunk_len;
         }
+        writer
+            .into_inner()
+            .with_context(|| format!("Could not flush to {}", strings_path.display()))?
+            .flush()
+            .with_context(|| format!("Could not flush to {}", strings_path.display()))?;
     }
     pl.done();
 
@@ -250,6 +324,207 @@ pub fn write_unique_terms(
         .context("Could not write terms store config")?;
 
     Ok(())
+}
+
+pub fn write_frame(
+    writer: &mut impl Write,
+    terms: impl Iterator<Item = Result<Box<[u8]>>>,
+) -> Result<usize> {
+    let mut previous_string = Box::<[u8]>::default();
+    let mut num_strings = 0;
+    for string in terms {
+        let string = string?;
+
+        // compute number of bytes shared between this string and the previous one
+        let longest_common_prefix = previous_string
+            .iter()
+            .zip(string.iter())
+            .take_while(|(c1, c2)| c1 == c2)
+            .count();
+
+        // compute number of bytes to trim at the end of the previous one, to use as prefix
+        // of this one
+        let mut buf = [0; 8];
+        let num_discard_bytes: u32 = previous_string
+            .len()
+            .checked_sub(longest_common_prefix)
+            .expect("Incorrect longest_common_prefix")
+            .try_into()
+            .context("String is 2^32 bytes or longer")?;
+
+        // write how many bytes to discard from the previous string
+        let varint_bytes = tiny_varint::encode(num_discard_bytes, &mut buf)
+            .map_err(|_| anyhow!("varint of u32 does not fit in 8 bytes"))?;
+        writer
+            .write_all(&buf[0..varint_bytes])
+            .context("Could not write")?;
+
+        // write how many bytes are in the suffix of this string
+        let num_new_bytes: u32 = string
+            .len()
+            .checked_sub(longest_common_prefix)
+            .expect("Incorrect longest_common_prefix")
+            .try_into()
+            .context("String is 2^32 bytes or longer")?;
+        let varint_bytes = tiny_varint::encode(num_new_bytes, &mut buf)
+            .map_err(|_| anyhow!("varint of u32 does not fit in 8 bytes"))?;
+        writer
+            .write_all(&buf[0..varint_bytes])
+            .context("Could not write")?;
+
+        // write the new string minus the shared prefix
+        writer
+            .write_all(&string[longest_common_prefix..])
+            .context("Could not write")?;
+
+        previous_string = string;
+        num_strings += 1;
+    }
+
+    Ok(num_strings)
+}
+
+pub fn get_from_frame(
+    frame: &[u8],
+    terms_per_frame: NonZeroUsize,
+    position: usize,
+) -> Result<Box<[u8]>> {
+    Ok(FrameLender::new(frame, terms_per_frame)?
+        .skip(position)
+        .next()
+        .with_context(|| format!("Frame has fewer than {} strings", position + 1))?
+        .context("Could not decode frame")?
+        .into())
+}
+
+pub struct FrameLender<'frame> {
+    // TODO: rename
+    all_data: &'frame [u8],
+    data: &'frame [u8],
+    previous_string: Vec<u8>,
+    errored: Option<String>,
+    max_strings_per_frame: NonZeroUsize,
+    remaining_strings_in_frame: usize,
+}
+
+impl<'frame> FrameLender<'frame> {
+    pub fn new(frame: &'frame [u8], max_strings_per_frame: NonZeroUsize) -> Result<Self> {
+        Ok(FrameLender {
+            all_data: frame,
+            data: frame,
+            previous_string: Vec::new(),
+            errored: None,
+            max_strings_per_frame,
+            remaining_strings_in_frame: max_strings_per_frame.into(),
+        })
+    }
+}
+
+impl<'frame, 'lend> Lending<'lend> for FrameLender<'frame> {
+    type Lend = Result<&'lend [u8], anyhow::Error>;
+}
+
+impl<'frame> Lender for FrameLender<'frame> {
+    fn next(&mut self) -> Option<<Self as Lending<'_>>::Lend> {
+        if self.data.is_empty() {
+            return None;
+        }
+        if let Some(e) = &self.errored {
+            return Some(Err(anyhow!("Previous iteration failed: {e}")));
+        }
+
+        if self.remaining_strings_in_frame == 0 {
+            // new frame
+            self.previous_string.clear();
+            self.remaining_strings_in_frame = self.max_strings_per_frame.into();
+        }
+        self.remaining_strings_in_frame -= 1;
+
+        match (|| {
+            let (num_discard_bytes, varint_size) = tiny_varint::decode::<u32>(self.data)
+                .map_err(|e| anyhow!("Could not decode num_discard_bytes: {e:?}"))?;
+            let num_discard_bytes: usize = num_discard_bytes
+                .try_into()
+                .context("String size overflows usize")?;
+            self.data = &self.data[varint_size..];
+
+            let (num_new_bytes, varint_size) = tiny_varint::decode::<u32>(self.data)
+                .map_err(|e| anyhow!("Could not decode num_new_bytes: {e:?}"))?;
+            let num_new_bytes: usize = num_new_bytes
+                .try_into()
+                .context("String size overflows usize")?;
+            self.data = &self.data[varint_size..];
+
+            self.previous_string.resize(
+                self.previous_string
+                    .len()
+                    .checked_sub(num_discard_bytes)
+                    .context(
+                        "num_discard_bytes is greater than the length of the previous string",
+                    )?,
+                0,
+            );
+            self.previous_string.extend(&self.data[..num_new_bytes]);
+
+            ensure!(
+                self.data.len() >= num_new_bytes,
+                "Fewer remaining bytes than num_new_bytes"
+            );
+            self.data = &self.data[num_new_bytes..];
+
+            Ok(())
+        })() {
+            Ok(()) => Some(Ok(&self.previous_string[..])),
+            Err(e) => {
+                self.errored = Some(format!("{e}")); // anyhow::Error does not impl Clone
+                Some(Err(e))
+            }
+        }
+    }
+}
+impl<'frame> RewindableIoLender<[u8]> for FrameLender<'frame> {
+    type Error = anyhow::Error;
+
+    fn rewind(mut self) -> Result<Self, Self::Error> {
+        self.data = self.all_data;
+        self.errored = None;
+        self.previous_string.clear();
+        self.remaining_strings_in_frame = self.max_strings_per_frame.into();
+        Ok(self)
+    }
+}
+
+pub fn get_frame_size(frame: &[u8], max_num_strings: usize) -> Result<usize> {
+    let mut data = frame;
+
+    for _ in 0..max_num_strings {
+        if data.len() == 0 {
+            // end of file
+            break;
+        }
+
+        let (_num_discard_bytes, varint_size) = tiny_varint::decode::<u32>(data)
+            .map_err(|e| anyhow!("Could not decode num_discard_bytes: {e:?}"))?;
+        data = &data[varint_size..];
+
+        let (num_new_bytes, varint_size) = tiny_varint::decode::<u32>(data)
+            .map_err(|e| anyhow!("Could not decode num_new_bytes: {e:?}"))?;
+        let num_new_bytes: usize = num_new_bytes
+            .try_into()
+            .context("String size overflows usize")?;
+        data = &data[varint_size..];
+
+        ensure!(
+            data.len() >= num_new_bytes,
+            "Fewer remaining bytes than num_new_bytes"
+        );
+        data = &data[num_new_bytes..];
+    }
+
+    Ok(frame
+        .len()
+        .checked_sub(data.len())
+        .expect("data is longer than frame, but it should be a subslice of it"))
 }
 
 pub(super) struct TermsFile<D> {
@@ -273,15 +548,15 @@ pub(super) fn list_terms_files(
         .collect::<Result<Vec<_>, _>>()
         .with_context(|| format!("Could not stat {} entry", dir.display()))?
         .into_iter()
-        .filter(|entry| entry.path().extension() == Some("zst".as_ref()))
+        .filter(|entry| entry.path().extension() == Some("strings".as_ref()))
         .collect::<Vec<_>>();
     entries.sort_by_key(|entry| entry.path());
 
-    let terms_per_file = config.terms_per_frame * config.frames_per_file;
+    let terms_per_file = usize::from(config.terms_per_frame) * config.frames_per_file;
     let num_files = config.num_terms.div_ceil(terms_per_file);
     ensure!(
         num_files == entries.len(),
-        "Inconsistent number of .zst files in {}: expected {num_files}, got {}",
+        "Inconsistent number of .strings files in {}: expected {num_files}, got {}",
         dir.display(),
         entries.len()
     );
@@ -332,329 +607,6 @@ pub(super) fn list_terms_files(
             .collect::<Result<_>>()?,
     ))
 }
-fn decompress_frame(
-    compressed_frame: &[u8],
-    zstd_decompression_dictionary: Option<&zstd::zstd_safe::DDict<'static>>,
-) -> Result<Vec<u8>> {
-    let frame_compressed_size = compressed_frame.len();
-
-    // The doc claims we should reuse DCtx instead of creating it every time, but this doesn't seem
-    // to be true outside the streaming API.
-    let mut decompression_context = zstd::zstd_safe::DCtx::create();
-
-    // heuristic, as zstd_safe::find_decompressed_size is 'experimental'
-    let frame_decompressed_size = frame_compressed_size.saturating_mul(2);
-    let mut decompressed_frame = Vec::with_capacity(frame_decompressed_size);
-
-    const ERR_BUFFER_SIZE_TOO_SMALL: zstd::zstd_safe::ErrorCode =
-        zstd::zstd_safe::ErrorCode::MAX - 69; // not documented...
-    loop {
-        let res = match zstd_decompression_dictionary {
-            Some(zstd_decompression_dictionary) => decompression_context.decompress_using_ddict(
-                &mut decompressed_frame,
-                compressed_frame,
-                &zstd_decompression_dictionary,
-            ),
-            None => decompression_context.decompress(&mut decompressed_frame, compressed_frame),
-        };
-        match res {
-            Ok(_) => return Ok(decompressed_frame),
-            Err(ERR_BUFFER_SIZE_TOO_SMALL) => {
-                decompressed_frame = Vec::with_capacity(
-                    decompressed_frame
-                        .capacity()
-                        .checked_mul(2)
-                        .context("frame capacity overflowed usize")?,
-                );
-            }
-            Err(errno) => bail!(
-                "Could not decompress frame: Error {errno} ({})",
-                zstd::zstd_safe::get_error_name(errno)
-            ),
-        }
-    }
-}
-
-/// Reads all files in the store and writes a new zstd dictionary that can be used to compress it
-/// more efficiently, and returns its file name.
-///
-/// A sample of frames will be selected according to `inverse_sample_rate`. Larger values provide a
-/// better dictionay but use more memory, as all sampled frames need to fit in memory at the same
-/// time.
-///
-/// Call [`recompress_with_dictionary`] to use that dictionary.
-pub fn train_zstd_dictionary(
-    dir: &Path,
-    samples: NonZeroUsize,
-    max_dictionary_size: NonZeroUsize,
-) -> Result<String> {
-    let (config, terms_files) = list_terms_files(dir)?;
-    let total_num_frames = terms_files
-        .iter()
-        .map(|tf| tf.num_terms.div_ceil(config.terms_per_frame))
-        .sum();
-    let mut pl = concurrent_progress_logger!(
-        item_name = "frame",
-        display_memory = true,
-        local_speed = true,
-        expected_updates = Some(total_num_frames),
-    );
-    pl.start("Reading terms...");
-
-    let sample_rate = usize::from(samples) as f64 / total_num_frames as f64;
-
-    let (samples, sample_sizes): (Vec<_>, Vec<_>) = terms_files
-        .into_par_iter()
-        .map_with(pl.clone(), |pl, terms_file| {
-            let TermsFile {
-                first_term_id: _,
-                num_terms,
-                path,
-                compressed_frames,
-            } = terms_file;
-            let num_frames = num_terms.div_ceil(config.terms_per_frame);
-            let compressed_frames = compressed_frames.as_ref();
-
-            let mut offset = 0;
-            let mut samples = Vec::new();
-            let mut sample_sizes = Vec::new();
-
-            for frame_id in 0..num_frames {
-                ensure!(
-                    !compressed_frames[offset..].is_empty(),
-                    "Expected {num_frames} in {}, but there are only {frame_id}",
-                    path.display()
-                );
-                let frame_compressed_size =
-                    zstd::zstd_safe::find_frame_compressed_size(&compressed_frames[offset..])
-                        .map_err(|errno| {
-                            anyhow!(
-                                "Could not get compressed size of frame {frame_id} of {}: {}",
-                                path.display(),
-                                zstd::zstd_safe::get_error_name(errno)
-                            )
-                        })?;
-                pl.light_update();
-                if (rand::random::<u32>() as f64) < sample_rate * (u32::MAX as f64) {
-                    let decompressed_frame = decompress_frame(
-                        &compressed_frames[offset..offset + frame_compressed_size],
-                        None, // we don't support decompressing with a dict yet
-                    )
-                    .with_context(|| {
-                        format!(
-                            "Could not decompress frame at offset {offset} of {}",
-                            path.display(),
-                        )
-                    })?;
-                    sample_sizes.push(decompressed_frame.len());
-                    samples.extend(decompressed_frame);
-                }
-                offset += frame_compressed_size;
-            }
-            ensure!(
-                compressed_frames[offset..].is_empty(),
-                "Expected {num_frames} in {}, but there are more ({} unread bytes)",
-                path.display(),
-                compressed_frames[offset..].len()
-            );
-
-            Ok((samples, sample_sizes))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .unzip();
-    pl.done();
-
-    log::info!("Finalizing training data...");
-    let samples: Vec<_> = samples.into_iter().flatten().collect();
-    let sample_sizes: Vec<_> = sample_sizes.into_iter().flatten().collect();
-    let sample_sizes_sum: usize = sample_sizes.iter().sum();
-
-    log::info!(
-        "Training dictionary with {} samples totalling {sample_sizes_sum} bytes...",
-        samples.len()
-    );
-    let dictionary =
-        zstd::dict::from_continuous(&samples, &sample_sizes, max_dictionary_size.into())
-            .context("Could not train dictionary")?;
-
-    let mut dict_file = tempfile::NamedTempFile::with_prefix_in("zstd_dict_", dir)
-        .with_context(|| format!("Could not create temporary file in {}", dir.display()))?;
-    dict_file.write_all(&dictionary).with_context(|| {
-        format!(
-            "Could not write dictionary to {}",
-            dict_file.path().display()
-        )
-    })?;
-    let (mut dict_file, dict_file_path) = dict_file
-        .keep()
-        .context("Could not persist dictionary file")?;
-    dict_file
-        .flush()
-        .with_context(|| format!("Could not flush dictionary to {}", dict_file_path.display()))?;
-    drop(dict_file);
-    Ok(dict_file_path
-        .file_name()
-        .expect("file has no name")
-        .to_str()
-        .context("Dictionary name is not valid UTF-8")?
-        .to_string())
-}
-
-/// Reads all files in the store and writes them again using a dictionary produced by
-/// [`train_zstd_dictionary`].
-pub fn recompress_with_dictionary(dir: &Path, dictionary_name: String) -> Result<()> {
-    let compression_level = 1; // we are going to read it very often and in small chunks
-    //
-    log::info!("Reading dictionary...");
-    let dictionary_path = dir.join(&dictionary_name);
-    let mut dictionary_file = File::open(&dictionary_path).with_context(|| {
-        format!(
-            "Could not open dictionary file {}",
-            dictionary_path.display()
-        )
-    })?;
-    let mut dictionary_bytes = Vec::new();
-    dictionary_file
-        .read_to_end(&mut dictionary_bytes)
-        .with_context(|| {
-            format!(
-                "Could not read dictionary from {}",
-                dictionary_path.display()
-            )
-        })?;
-    log::info!("Building compression dictionary...");
-    let compression_dictionary =
-        zstd::zstd_safe::CDict::create(&dictionary_bytes, compression_level);
-
-    let (mut config, terms_files) = list_terms_files(dir)?;
-    let mut pl = concurrent_progress_logger!(
-        item_name = "frame",
-        display_memory = true,
-        local_speed = true,
-        expected_updates = Some(
-            terms_files
-                .iter()
-                .map(|tf| tf.num_terms.div_ceil(config.terms_per_frame))
-                .sum()
-        ),
-    );
-    pl.start("Recompressing_terms...");
-
-    let recompressed_files = terms_files
-        .par_iter()
-        .map_with(pl.clone(), |pl, terms_file| {
-            let TermsFile {
-                first_term_id: _,
-                num_terms,
-                path,
-                compressed_frames,
-            } = terms_file;
-            let num_frames = num_terms.div_ceil(config.terms_per_frame);
-            let compressed_frames = compressed_frames.as_ref();
-
-            let mut offset = 0;
-            let mut compression_context = zstd::zstd_safe::CCtx::create();
-
-            let mut recompressed_file = tempfile::NamedTempFile::with_prefix_in(
-                path.file_name().expect("File has no name"),
-                path.parent().expect("File has no parent directory"),
-            )
-            .context("Could not create temporary directory")?;
-
-            for frame_id in 0..num_frames {
-                ensure!(
-                    !compressed_frames[offset..].is_empty(),
-                    "Expected {num_frames} in {}, but there are only {frame_id}",
-                    path.display()
-                );
-                let frame_compressed_size =
-                    zstd::zstd_safe::find_frame_compressed_size(&compressed_frames[offset..])
-                        .map_err(|errno| {
-                            anyhow!(
-                                "Could not get compressed size of frame {frame_id} of {}: {}",
-                                path.display(),
-                                zstd::zstd_safe::get_error_name(errno)
-                            )
-                        })?;
-                pl.light_update();
-                let decompressed_frame = decompress_frame(
-                    &compressed_frames[offset..offset + frame_compressed_size],
-                    None, // we don't support decompressing with a dict yet
-                )
-                .with_context(|| {
-                    format!(
-                        "Could not decompress frame at offset {offset} of {}",
-                        path.display(),
-                    )
-                })?;
-                let mut compressed_frame =
-                    Vec::with_capacity(zstd::zstd_safe::compress_bound(decompressed_frame.len()));
-                compression_context
-                    .compress_using_cdict(
-                        &mut compressed_frame,
-                        &decompressed_frame,
-                        &compression_dictionary,
-                    )
-                    .map_err(|errno| {
-                        anyhow!(
-                            "Could not compress frame: {}",
-                            zstd::zstd_safe::get_error_name(errno)
-                        )
-                    })?;
-                offset += frame_compressed_size;
-                recompressed_file
-                    .write_all(&compressed_frame)
-                    .with_context(|| {
-                        format!(
-                            "Could not write frame {frame_id} of {}",
-                            recompressed_file.path().display(),
-                        )
-                    })?;
-            }
-            ensure!(
-                compressed_frames[offset..].is_empty(),
-                "Expected {num_frames} in {}, but there are more ({} unread bytes)",
-                path.display(),
-                compressed_frames[offset..].len()
-            );
-
-            Ok(recompressed_file)
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    pl.done();
-
-    log::info!("Invalidating index files...");
-    for original_file in &terms_files {
-        let index_file_path = original_file.path.with_extension("frames.ef");
-        if std::fs::exists(&index_file_path)
-            .with_context(|| format!("Could not check if {} exists", index_file_path.display()))?
-        {
-            std::fs::remove_file(&index_file_path).with_context(|| {
-                format!("Could not remove index file {}", index_file_path.display())
-            })?;
-        }
-    }
-
-    log::info!("Committing recompressed files...");
-    config.zstd_dictionary_filename = Some(dictionary_name);
-    let config_path = dir.join("config.json");
-    let config_file = File::create(&config_path)
-        .with_context(|| format!("Could not create {}", config_path.display()))?;
-    serde_json::to_writer_pretty(config_file, &config)
-        .context("Could not write terms store config")?;
-
-    for (original_file, recompressed_file) in
-        terms_files.into_iter().zip(recompressed_files.into_iter())
-    {
-        recompressed_file
-            .persist(original_file.path)
-            .context("Could not persist recompressed file.")?;
-    }
-
-    Ok(())
-}
 
 pub fn index_terms(dir: &Path) -> Result<()> {
     let (config, terms_files) = list_terms_files(dir)?;
@@ -665,7 +617,7 @@ pub fn index_terms(dir: &Path) -> Result<()> {
         expected_updates = Some(
             terms_files
                 .iter()
-                .map(|tf| tf.num_terms.div_ceil(config.terms_per_frame))
+                .map(|tf| tf.num_terms.div_ceil(config.terms_per_frame.into()))
                 .sum()
         ),
     );
@@ -680,7 +632,7 @@ pub fn index_terms(dir: &Path) -> Result<()> {
                 path,
                 compressed_frames,
             } = terms_file;
-            let num_frames = num_terms.div_ceil(config.terms_per_frame);
+            let num_frames = num_terms.div_ceil(config.terms_per_frame.into());
             let compressed_frames = compressed_frames.as_ref();
 
             let mut efb = EliasFanoBuilder::new(num_frames, compressed_frames.len());
@@ -692,12 +644,11 @@ pub fn index_terms(dir: &Path) -> Result<()> {
                     path.display()
                 );
                 let frame_compressed_size =
-                    zstd::zstd_safe::find_frame_compressed_size(&compressed_frames[offset..])
-                        .map_err(|errno| {
-                            anyhow!(
-                                "Could not get compressed size of frame {frame_id} of {}: {}",
+                    get_frame_size(&compressed_frames[offset..], config.terms_per_frame.into())
+                        .with_context(|| {
+                            format!(
+                                "Could not get compressed size of frame {frame_id} of {}",
                                 path.display(),
-                                zstd::zstd_safe::get_error_name(errno)
                             )
                         })?;
                 efb.push(offset);
@@ -735,8 +686,6 @@ pub struct TermStore {
     config: TermStoreConfiguration,
     path: PathBuf,
     partitions: Vec<TermsPartition>,
-    zstd_decompression_dictionary: Option<zstd::zstd_safe::DDict<'static>>,
-    decompressed_frame_cache: Cache<usize, Box<[u8]>>,
 }
 
 impl TermStore {
@@ -748,26 +697,6 @@ impl TermStore {
             )
         })?;
 
-        let zstd_decompression_dictionary = config
-            .zstd_dictionary_filename
-            .as_ref()
-            .map(|zstd_dictionary_filename| {
-                let dictionary_path = path.join(zstd_dictionary_filename);
-                let dictionary_bytes = std::fs::read(&dictionary_path).with_context(|| {
-                    format!(
-                        "Could not read dictionary from {}",
-                        dictionary_path.display()
-                    )
-                })?;
-                zstd::zstd_safe::DDict::try_create(&dictionary_bytes).with_context(|| {
-                    format!(
-                        "Could not parse dictionary from {}",
-                        dictionary_path.display()
-                    )
-                })
-            })
-            .transpose()?;
-
         let partitions = files
             .into_iter()
             .enumerate()
@@ -778,7 +707,7 @@ impl TermStore {
                      path,
                      compressed_frames,
                  })| {
-                    let num_frames = num_terms.div_ceil(config.terms_per_frame);
+                    let num_frames = num_terms.div_ceil(config.terms_per_frame.into());
                     let frames_index_path = path.with_extension("frames.ef");
                     let frames_index = EfSeqDict::mmap(&frames_index_path, Flags::RANDOM_ACCESS)
                         .with_context(|| {
@@ -801,8 +730,6 @@ impl TermStore {
         Ok(Self {
             path,
             partitions,
-            zstd_decompression_dictionary,
-            decompressed_frame_cache: Cache::new(1048576 / config.terms_per_frame), // about 64MiB
             config,
         })
     }
@@ -811,37 +738,11 @@ impl TermStore {
         self.config.num_terms
     }
 
-    fn get_frame(&self, partition_id: usize, frame_id: usize) -> Result<Box<[u8]>> {
-        let key = self.config.frames_per_file * partition_id + frame_id;
+    fn get_frame(&self, partition_id: usize, frame_id: usize) -> Result<&[u8]> {
+        let partition = &self.partitions[partition_id];
+        let frame_position = partition.frames_index.get(frame_id);
 
-        self.decompressed_frame_cache.get_or_insert_with(&key, || {
-            let partition = &self.partitions[partition_id];
-            let frame_position = partition.frames_index.get(frame_id);
-
-            let frame_compressed_size = match zstd::zstd_safe::find_frame_compressed_size(
-                &partition.compressed_frames[frame_position..],
-            ) {
-                Ok(frame_size) => frame_size,
-                Err(errno) => bail!(
-                    "Could not get compressed size of frame at offset {frame_position} of {}: Error {errno} ({})",
-                    partition.path.display(),
-                    zstd::zstd_safe::get_error_name(errno)
-                ),
-            };
-
-            let decompressed_frame = decompress_frame(
-                &partition.compressed_frames[frame_position..frame_position + frame_compressed_size],
-                self.zstd_decompression_dictionary.as_ref(),
-            )
-            .with_context(|| {
-                format!(
-                    "Could not decompress frame at offset {frame_position} of {}",
-                    partition.path.display(),
-                )
-            })?;
-
-            Ok(decompressed_frame.into())
-        })
+        Ok(&partition.compressed_frames[frame_position..])
     }
 
     pub fn get(&self, id: usize) -> Result<Option<Box<[u8]>>> {
@@ -853,7 +754,8 @@ impl TermStore {
         // frames every time
 
         // Compute which partition the term is in
-        let num_terms_per_partition = self.config.terms_per_frame * self.config.frames_per_file;
+        let num_terms_per_partition =
+            usize::from(self.config.terms_per_frame) * self.config.frames_per_file;
         let partition_id = id / num_terms_per_partition;
         let first_term_in_partition = num_terms_per_partition * partition_id;
         let partition = &self.partitions[partition_id];
@@ -864,7 +766,7 @@ impl TermStore {
             "Unexpected first_term_id in partition {partition_id} of store {}",
             self.path.display()
         );
-        let frame_id = (id - first_term_in_partition) / self.config.terms_per_frame;
+        let frame_id = (id - first_term_in_partition) / usize::from(self.config.terms_per_frame);
         ensure!(
             frame_id < partition.frames_index.len(),
             "Inconsistent partition lengths in terms store {}",
@@ -872,32 +774,16 @@ impl TermStore {
         );
 
         // Compute the offset of the term within the frame
-        let offset_in_frame = id % self.config.terms_per_frame;
+        let offset_in_frame = id % usize::from(self.config.terms_per_frame);
 
-        let decompressed_frame = self.get_frame(partition_id, frame_id)?;
-        let mut frame_reader = Cursor::new(decompressed_frame);
-
-        // Skip all terms before the one we are looking for, then read the right one
-        let mut last_term = None;
-        for _ in 0..=offset_in_frame {
-            last_term = Some(
-                read_length_prefixed_string(&mut frame_reader, |_| None)
-                    .with_context(|| {
-                        format!(
-                            "Could not read string frame {frame_id} of {}",
-                            partition.path.display()
-                        )
-                    })?
-                    .with_context(|| {
-                        format!(
-                            "Frame {frame_id} of {} has fewer terms than expected",
-                            partition.path.display()
-                        )
-                    })?,
-            );
-        }
-
-        Ok(Some(last_term.expect("Loop didn't run").into()))
+        Ok(Some(
+            get_from_frame(
+                self.get_frame(partition_id, frame_id)?,
+                self.config.terms_per_frame,
+                offset_in_frame,
+            )
+            .context("Frame is shorter than expected")?,
+        ))
     }
 }
 

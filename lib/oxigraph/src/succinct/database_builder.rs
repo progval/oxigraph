@@ -6,7 +6,6 @@ use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 pub struct DatabaseBuilder {
@@ -113,13 +112,6 @@ impl DatabaseBuilder {
         log::info!("Extracting terms...");
         self.extract_terms().context("Could not extract terms")?;
 
-        log::info!("Training zstd dictionary on terms...");
-        self.recompress_terms(
-            terms_store::DEFAULT_ZSTD_TRAINING_SAMPLES,
-            terms_store::DEFAULT_ZSTD_DICTIONARY_SIZE,
-        )
-        .context("Could not extract terms")?;
-
         log::info!("Indexing terms...");
         self.index_terms().context("Could not index terms")?;
 
@@ -181,17 +173,6 @@ impl DatabaseBuilder {
             )
             .context("Could not deduplicate or write terms")
         }
-    }
-
-    pub fn recompress_terms(
-        &self,
-        samples: NonZeroUsize,
-        max_dictionary_size: NonZeroUsize,
-    ) -> Result<()> {
-        let dictionary_name =
-            terms_store::train_zstd_dictionary(&self.terms_path(), samples, max_dictionary_size)?;
-        terms_store::recompress_with_dictionary(&self.terms_path(), dictionary_name)?;
-        Ok(())
     }
 
     pub fn index_terms(&self) -> Result<()> {

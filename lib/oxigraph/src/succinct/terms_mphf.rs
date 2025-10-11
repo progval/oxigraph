@@ -1,7 +1,7 @@
-use super::terms_store::{TermsFile, list_terms_files, read_length_prefixed_string};
+use super::terms_store::{FrameLender, TermsFile, list_terms_files};
 use crate::model::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use crate::succinct::terms_store::{serialize_graph_name, serialize_term};
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use bytemuck::TransparentWrapper;
 use dsi_progress_logger::{ProgressLog, progress_logger};
 use epserde::deser::{
@@ -12,14 +12,12 @@ use lender::{Lender, Lending};
 use std::borrow::Borrow;
 use std::fs::File;
 use std::hash::Hasher;
-use std::io::{BufRead, Cursor, Seek};
 use std::marker::PhantomData;
 use std::path::Path;
 use sux::bits::bit_field_vec::BitFieldVec;
 use sux::func::{VBuilder, VFunc};
 use sux::traits::bit_field_slice::BitFieldSlice;
 use sux::utils::{FromIntoIterator, RewindableIoLender};
-use zstd::stream::read::Decoder;
 
 /// workaround while https://github.com/vigna/sux-rs/pull/78 is not merged
 #[derive(Debug, TransparentWrapper)]
@@ -176,9 +174,19 @@ pub fn build_terms_mphf(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
                     compressed_frames,
                 } = terms_file;
 
-                ZstdLengthPrefixedStringLender::new(Cursor::new(compressed_frames))
-                    .with_context(|| format!("Could not decompress {}", path.display()))
-                    .map_err(DecodeError)
+                sux::utils::FromResultLenderFactory::new(|| {
+                    Ok(FrameLender::new(compressed_frames, config.terms_per_frame)
+                        .with_context(|| format!("Could not decompress {}", path.display()))
+                        .map_err(DecodeError)?
+                        .map(
+                            lender::hrc_mut!(for<'all> |term: Result<&'all [u8]>| -> Result<
+                                    BoxedRawTerm,
+                                    DecodeError,
+                                > {
+                                    Ok(BoxedRawTerm(term.map_err(DecodeError)?.into()))
+                                }),
+                        ))
+                })
             })
             .collect::<Result<_, DecodeError>>()?,
     );
@@ -220,61 +228,65 @@ pub fn build_terms_mphf(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
     })
 }
 
-/// Reads a zstd-compressed file using [`read_length_prefixed_string`] on each item of each frame
-struct ZstdLengthPrefixedStringLender<R: BufRead> {
-    decoder: Decoder<'static, R>,
-    string: Option<BoxedRawTerm>,
-}
-
-impl<R: BufRead> ZstdLengthPrefixedStringLender<R> {
-    pub fn new(read: R) -> Result<Self> {
-        Ok(ZstdLengthPrefixedStringLender {
-            decoder: Decoder::with_buffer(read)?,
-            string: None,
-        })
-    }
-}
-
-impl<'lend, R: BufRead> Lending<'lend> for ZstdLengthPrefixedStringLender<R> {
-    type Lend = Result<&'lend BoxedRawTerm, DecodeError>;
-}
-
-impl<R: BufRead> Lender for ZstdLengthPrefixedStringLender<R> {
-    fn next(&mut self) -> Option<<Self as Lending<'_>>::Lend> {
-        match read_length_prefixed_string(&mut self.decoder, |_| None) {
-            Ok(Some(string)) => {
-                if let Some(previous_string) = &self.string {
-                    if string <= previous_string.0 {
-                        return Some(Err(DecodeError(anyhow!(
-                            "Unsorted strings: {} ({:?}) after {} ({:?})",
-                            String::from_utf8_lossy(&string),
-                            &string,
-                            String::from_utf8_lossy(&previous_string.0),
-                            &previous_string.0,
-                        ))));
-                    }
-                }
-                self.string = Some(BoxedRawTerm(string));
-                Some(Ok(self.string.as_ref().unwrap()))
-            }
-            Ok(None) => None,
-            Err(e) => Some(Err(e.into())),
-        }
-    }
-}
-
-impl<R: BufRead + Seek> RewindableIoLender<BoxedRawTerm> for ZstdLengthPrefixedStringLender<R> {
-    type Error = DecodeError;
-
-    fn rewind(mut self) -> Result<Self, Self::Error> {
-        let mut read = self.decoder.finish();
-        read.rewind().context("Could not rewind")?;
-        self.string = None;
-        self.decoder =
-            Decoder::with_buffer(read).context("Could not create new decoder to rewind")?;
-        Ok(self)
-    }
-}
+// Reads a compressed terms file using [`super::terms_store::FrameLender`] on each frame
+// struct FileLender<'a> {
+// data: &'a [u8],
+// lender: FrameLender<'a>,
+// terms_per_frame: usize,
+// lender_position: usize,
+// }
+//
+// impl<'a> FileLender<'a> {
+// pub fn new(data: &'a [u8], terms_per_frame: usize) -> Result<Self> {
+// Ok(FileLender {
+// data,
+// lender: FrameLender::new(data),
+// terms_per_frame,
+// lender_position: 0,
+// })
+// }
+// }
+//
+// impl<'a, 'lend> Lending<'lend> for FileLender<'a> {
+// type Lend = Result<&'lend BoxedRawTerm, DecodeError>;
+// }
+//
+// impl<'a> Lender for FileLender<'a> {
+// fn next(&mut self) -> Option<<Self as Lending<'_>>::Lend> {
+// if self.lender_position == self.terms_per_frame - 1 {
+// if self.data.is_empty() {
+// return None;
+// }
+// self.lender = FrameLender::new(self.data);
+//
+// TODO: don't unnecessarily decode the frame twice here
+// let frame_length = super::terms_store::get_frame_size(self.data);
+// self.data = self.data[frame_length..];
+// self.lender_position = 0;
+// }
+//
+// match self.lender.next() {
+// Some(res) => {
+// self.lender_position += 1;
+// Some(res)
+// },
+// None => None,
+// }
+// }
+// }
+//
+// impl<R: BufRead + Seek> RewindableIoLender<BoxedRawTerm> for ZstdLengthPrefixedStringLender<R> {
+// type Error = DecodeError;
+//
+// fn rewind(mut self) -> Result<Self, Self::Error> {
+// let mut read = self.decoder.finish();
+// read.rewind().context("Could not rewind")?;
+// self.string = None;
+// self.decoder =
+// Decoder::with_buffer(read).context("Could not create new decoder to rewind")?;
+// Ok(self)
+// }
+// }
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
