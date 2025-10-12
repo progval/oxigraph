@@ -666,10 +666,10 @@ pub struct TermStoreConfiguration {
 impl TermStoreConfiguration {
     pub fn get_dictionary(&self, path: impl AsRef<Path>) -> Result<Option<TermDictionary>> {
         self.dictionary_filename
-        .as_ref()
-        .map(|dict_name| TermDictionary::mmap(&path.as_ref().join(dict_name)))
-        .transpose()
-        .context("Could not mmap dictionary")
+            .as_ref()
+            .map(|dict_name| TermDictionary::mmap(&path.as_ref().join(dict_name)))
+            .transpose()
+            .context("Could not mmap dictionary")
     }
 }
 

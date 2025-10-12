@@ -1,8 +1,6 @@
 use super::terms_store::{FrameLender, TermsFile, list_terms_files};
 use crate::model::{GraphName, NamedNode, NamedOrBlankNode, Term};
-use crate::succinct::terms_store::{
-    deserialize_term, serialize_graph_name, serialize_term,
-};
+use crate::succinct::terms_store::{deserialize_term, serialize_graph_name, serialize_term};
 use anyhow::{Context, Result, ensure};
 use bytemuck::TransparentWrapper;
 use dsi_progress_logger::{ProgressLog, progress_logger};
@@ -166,24 +164,23 @@ pub fn build_terms_mphf(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
     let (config, terms_files) = list_terms_files(dir)?;
     let dictionary = config.get_dictionary(dir)?;
 
-    let terms_lender =
-        RewindableIoFlattenLender::new(
-            terms_files
-                .iter()
-                .map(|terms_file| {
-                    let TermsFile {
-                        first_term_id: _,
-                        num_terms: _,
-                        path,
-                        compressed_frames,
-                    } = terms_file;
+    let terms_lender = RewindableIoFlattenLender::new(
+        terms_files
+            .iter()
+            .map(|terms_file| {
+                let TermsFile {
+                    first_term_id: _,
+                    num_terms: _,
+                    path,
+                    compressed_frames,
+                } = terms_file;
 
-                    sux::utils::FromResultLenderFactory::new(|| {
-                        Ok(FrameLender::new(compressed_frames, config.terms_per_frame)
-                            .with_context(|| format!("Could not decompress {}", path.display()))
-                            .map_err(DecodeError)?
-                            .map(
-                                lender::hrc_mut!(for<'all> |term: Result<&'all [u8]>| -> Result<
+                sux::utils::FromResultLenderFactory::new(|| {
+                    Ok(FrameLender::new(compressed_frames, config.terms_per_frame)
+                        .with_context(|| format!("Could not decompress {}", path.display()))
+                        .map_err(DecodeError)?
+                        .map(
+                            lender::hrc_mut!(for<'all> |term: Result<&'all [u8]>| -> Result<
                                     BoxedRawTerm,
                                     DecodeError,
                                 > {
@@ -210,11 +207,11 @@ pub fn build_terms_mphf(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
                                     };
                                     Ok(BoxedRawTerm(term.into()))
                                 }),
-                            ))
-                    })
+                        ))
                 })
-                .collect::<Result<_, DecodeError>>()?,
-        );
+            })
+            .collect::<Result<_, DecodeError>>()?,
+    );
 
     let mut pl = progress_logger!(
         item_name = "term",
