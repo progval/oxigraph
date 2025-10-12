@@ -121,7 +121,12 @@ pub fn serialize_term(term: &Term, dictionary: Option<&TermDictionary>) -> Resul
                     .into_iter()
                     .chain(lit.value().as_bytes().into_iter().copied())
                     .chain(datatype.as_str().as_bytes().into_iter().copied())
-                    .chain(datatype.as_str().as_bytes().len().to_be_bytes().into_iter())
+                    .chain(
+                        u32::try_from(datatype.as_str().as_bytes().len())
+                            .context("Datatype is 2^32 bytes or longer")?
+                            .to_be_bytes()
+                            .into_iter(),
+                    )
                     .collect()),
             },
             (Some(lang), datatype) => bail!(
