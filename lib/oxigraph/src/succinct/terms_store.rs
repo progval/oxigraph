@@ -499,7 +499,7 @@ impl TermDictionary {
         );
 
         let offset = self.datatypes_offsets.get(id);
-        let bytes = read_length_prefixed_string(&mut Cursor::new(&self.datatypes), |_| {
+        let bytes = read_length_prefixed_string(&mut Cursor::new(&self.datatypes[offset..]), |_| {
             Some(u64::try_from(offset).context("Offset overflowed u64"))
         })
         .context("Could not get datatype")?
