@@ -75,12 +75,12 @@ pub(super) fn read_length_prefixed_string<R: Read>(
     Ok(Some(string.into()))
 }
 
-const TERM_TYPE_NAMED_NODE: u8 = 1;
-const TERM_TYPE_BLANK_NODE: u8 = 2;
-const TERM_TYPE_LITERAL_SIMPLE: u8 = 4;
+const TERM_TYPE_NAMED_NODE: u8 = 6;
+const TERM_TYPE_BLANK_NODE: u8 = 1;
+const TERM_TYPE_LITERAL_SIMPLE: u8 = 2;
 const TERM_TYPE_LITERAL_LANGUAGE: u8 = 5;
-const TERM_TYPE_LITERAL_TYPED: u8 = 6;
-const TERM_TYPE_LITERAL_TYPED_IN_DICT: u8 = 7;
+const TERM_TYPE_LITERAL_TYPED: u8 = 3;
+const TERM_TYPE_LITERAL_TYPED_IN_DICT: u8 = 4;
 
 pub fn serialize_term(term: &Term, dictionary: Option<&TermDictionary>) -> Result<Vec<u8>> {
     match term {
@@ -99,8 +99,8 @@ pub fn serialize_term(term: &Term, dictionary: Option<&TermDictionary>) -> Resul
                 .collect()),
             (Some(lang), rdf::LANG_STRING) => Ok([TERM_TYPE_LITERAL_LANGUAGE]
                 .into_iter()
-                .chain(lang.as_bytes().into_iter().copied())
                 .chain(lit.value().as_bytes().into_iter().copied())
+                .chain(lang.as_bytes().into_iter().copied())
                 .chain(
                     u16::try_from(lang.as_bytes().len())
                         .context("Language is 2^16 bytes or longer")?
@@ -156,15 +156,14 @@ pub fn deserialize_term(bytes: &[u8], dictionary: Option<&TermDictionary>) -> Re
             let lang_length_offset = bytes
                 .len()
                 .checked_sub(size_of::<u16>())
-                .context("Language tag literal in store is smaller than size_of<u16>()+1")?;
-            let lang_length = usize::from(u16::from_be_bytes(
-                bytes[lang_length_offset..].try_into().unwrap(),
-            ));
+                .context("Language tagged literal is too short")?;
+            let lang_length = usize::from(u16::from_be_bytes(bytes[lang_length_offset..].try_into().unwrap()));
+            let lang_offset = lang_length_offset.checked_sub(lang_length).unwrap();
 
             Term::Literal(Literal::new_language_tagged_literal_unchecked(
-                str::from_utf8(&bytes[1 + lang_length..lang_length_offset])
+                str::from_utf8(&bytes[1..lang_offset])
                     .context("Non-UTF8 Literal value in store")?,
-                str::from_utf8(&bytes[1..1 + lang_length])
+                str::from_utf8(&bytes[lang_offset..lang_length_offset])
                     .context("Non-UTF8 Literal language in store")?,
             ))
         }
@@ -196,10 +195,10 @@ pub fn deserialize_term(bytes: &[u8], dictionary: Option<&TermDictionary>) -> Re
                 .context("Inconsistent type_length")?;
 
             Term::Literal(Literal::new_typed_literal(
-                str::from_utf8(&bytes[type_offset..type_length_offset])
+                str::from_utf8(&bytes[1..type_offset])
                     .context("Non-UTF8 Literal value in store")?,
                 NamedNode::new_unchecked(
-                    str::from_utf8(&bytes[1..type_offset])
+                    str::from_utf8(&bytes[type_offset..type_length_offset])
                         .context("Non-UTF8 Literal type in store")?,
                 ),
             ))
