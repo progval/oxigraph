@@ -133,8 +133,8 @@ pub fn compress_quads(
         num_partitions: (4 * usize::from(
         std::thread::available_parallelism().context("Could not count CPU threads")?,
     ))
-    .min(16)
-    .max(256) // avoid too many files
+    .max(16)
+    .min(256) // avoid too many files
     .next_power_of_two(),
         num_quads: 0,
         num_terms,
