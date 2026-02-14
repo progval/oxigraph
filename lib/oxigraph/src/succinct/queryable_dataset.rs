@@ -7,7 +7,6 @@ use oxrdf::{GraphName, Term};
 use spareval::{InternalQuad, QueryableDataset};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use value_traits::slices::SliceByValue;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0:#}")]
@@ -32,15 +31,15 @@ pub struct SuccinctDatasetViewInner {
 
 impl SuccinctDatasetView {
     pub fn new(path: &Path, mmap_mphf: bool) -> Result<Self> {
-        let spog_quads_path = path.join(format!("quads-spog"));
+        let spog_quads_path = path.join("quads-spog");
         let spog_quads =
             QuadStore::mmap(spog_quads_path.clone()).context("Could not mmap spog quads")?;
 
-        let opsg_quads_path = path.join(format!("quads-opsg"));
+        let opsg_quads_path = path.join("quads-opsg");
         let opsg_quads =
             QuadStore::mmap(opsg_quads_path.clone()).context("Could not mmap opsg quads")?;
 
-        let terms_path = path.join(format!("terms"));
+        let terms_path = path.join("terms");
         let terms = TermStore::mmap(terms_path.clone()).context("Could not mmap terms store")?;
 
         let mphf_path = path.join("terms_mphf");
@@ -78,6 +77,35 @@ impl SuccinctDatasetView {
             default_graph_name,
             ..Arc::into_inner(view.0).context("Arc leaked before SuccinctDatasetView creation")?
         })))
+    }
+
+    fn to_internal_quad(&self, quad: [usize; 4]) -> InternalQuad<usize> {
+        let [subject, predicate, object, graph_name] = quad;
+        InternalQuad {
+            subject,
+            predicate,
+            object,
+            graph_name: if Some(graph_name) == self.0.default_graph_name {
+                None
+            } else {
+                Some(graph_name)
+            },
+        }
+    }
+
+    fn internalize_graph_name(&self, graph_name: &GraphName) -> Result<Option<usize>> {
+        if let Ok(id) = self.0.terms_mphf.hash_graphname(graph_name) {
+            if let Some(expected_graph_name_bytes) = self.0.terms.get(id)? {
+                let graph_name_bytes_matches =
+                    *expected_graph_name_bytes == serialize_graph_name(graph_name);
+
+                if graph_name_bytes_matches {
+                    // not a hash collision
+                    return Ok(Some(id));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -328,13 +356,16 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
                 }
             }
         }
-        let mut extras = self.0.extras.write().expect("Poisoned RwLock");
-        match extras.iter().position(|item| *item == term) {
-            Some(id) => Ok(id),
-            None => {
-                extras.push(term);
-                Ok(self.0.terms.len() + extras.len() - 1)
-            }
+        let mut extras = self
+            .0
+            .extras
+            .write()
+            .map_err(|_| anyhow!("Poisoned RwLock"))?;
+        if let Some(id) = extras.iter().position(|item| *item == term) {
+            Ok(id)
+        } else {
+            extras.push(term);
+            Ok(self.0.terms.len() + extras.len() - 1)
         }
     }
 
@@ -348,39 +379,8 @@ impl<'a> QueryableDataset<'a> for SuccinctDatasetView {
                 )
             })?)
         } else {
-            Err(anyhow!("Unknown term: {term}"))?
+            Err(anyhow!("Unknown term: {term}").into())
         }
-    }
-}
-
-impl SuccinctDatasetView {
-    fn to_internal_quad(&self, quad: [usize; 4]) -> InternalQuad<usize> {
-        let [subject, predicate, object, graph_name] = quad;
-        InternalQuad {
-            subject,
-            predicate,
-            object,
-            graph_name: if Some(graph_name) == self.0.default_graph_name {
-                None
-            } else {
-                Some(graph_name)
-            },
-        }
-    }
-
-    fn internalize_graph_name(&self, graph_name: &GraphName) -> Result<Option<usize>> {
-        if let Ok(id) = self.0.terms_mphf.hash_graphname(graph_name) {
-            if let Some(expected_graph_name_bytes) = self.0.terms.get(id)? {
-                let graph_name_bytes_matches =
-                    *expected_graph_name_bytes == *serialize_graph_name(&graph_name)?;
-
-                if graph_name_bytes_matches {
-                    // not a hash collision
-                    return Ok(Some(id));
-                }
-            }
-        }
-        Ok(None)
     }
 }
 

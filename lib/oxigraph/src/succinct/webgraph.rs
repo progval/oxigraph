@@ -1,17 +1,13 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use dsi_bitstream::prelude::BigEndian;
 use epserde::deser::Deserialize;
 use epserde::prelude::Flags;
-use itertools::Itertools;
-use lender::Lender;
 use rayon::prelude::*;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use sux::prelude::*;
-use webgraph::graphs::arc_list_graph::ArcListGraph;
 use webgraph::graphs::bvgraph::{BvComp, CompFlags};
 use webgraph::prelude::*;
-use webgraph::traits::SequentialLabeling;
 use webgraph::utils::par_sort_pairs::ParSortPairs;
 use webgraph_algo::preds::MinGain;
 use webgraph_algo::{combine_labels, labels_to_ranks};
@@ -38,7 +34,6 @@ pub fn bv(
     let path = path.as_ref();
 
     let num_partitions = NonZeroUsize::new(256).unwrap();
-    let num_terms_per_partition = num_terms.div_ceil(num_partitions.into());
 
     let mut pair_sorter = ParSortPairs::new(num_terms)
         .context("Could not initialize ParSortPairs")?
@@ -55,13 +50,16 @@ pub fn bv(
         .context("Could not initialize ParSortPairs::par_sort_pairs")?;
     let sorted_pairs: Vec<_> = sorted_pairs.into();
 
-    let bvcomp_tmp_dir = tempfile::tempdir().unwrap();
+    let bvcomp_tmp_dir = tempfile::tempdir().context("Could not create temporary directory")?;
 
     std::fs::create_dir_all(path)
         .with_context(|| format!("Could not create {}", path.display()))?;
 
     // TODO: Switch to LittleEndian once webgraph publishes a release that includes this fix:
     // https://github.com/vigna/webgraph-rs/pull/141
+    let thread_pool = rayon::ThreadPoolBuilder::default()
+        .build()
+        .context("Could not build thread pool")?;
     BvComp::parallel_iter::<BigEndian, _>(
         &path.join("graph"),
         sorted_pairs.into_iter(),
@@ -74,7 +72,7 @@ pub fn bv(
             compression_window: 1,
             ..Default::default()
         },
-        &rayon::ThreadPoolBuilder::default().build().unwrap(),
+        &thread_pool,
         bvcomp_tmp_dir.path(),
     )
     .context("Could not run BvComp")?;
@@ -96,16 +94,30 @@ pub fn symmetric_bv(
     let path = path.as_ref();
 
     let num_partitions = NonZeroUsize::new(256).unwrap();
-    let num_terms_per_partition = num_terms.div_ceil(num_partitions.into());
 
     let pairs = quads
-        .flat_map_iter(|quad| {
-            let [s, p, o, _g] = quad.expect("Could not read quad");
-            [(s, p), (s, o), (p, s), (p, o), (o, s), (o, p)]
+        .flat_map_iter(|quad| match quad.context("Could not read quad") {
+            Ok([s, p, o, _g]) => vec![
+                Ok((s, p)),
+                Ok((s, o)),
+                Ok((p, s)),
+                Ok((p, o)),
+                Ok((o, s)),
+                Ok((o, p)),
+            ],
+            Err(e) => vec![Err(e)],
         })
-        .inspect(|(src, dst)| {
-            assert!(*src < num_terms);
-            assert!(*dst < num_terms);
+        .map(|pair| {
+            let (src, dst) = pair?;
+            ensure!(
+                src < num_terms,
+                "Source term ID must be less than num_terms"
+            );
+            ensure!(
+                dst < num_terms,
+                "Destination term ID must be less than num_terms"
+            );
+            Ok((src, dst))
         });
 
     let pair_sorter = ParSortPairs::new(num_terms)
@@ -114,11 +126,11 @@ pub fn symmetric_bv(
         .num_partitions(num_partitions);
 
     let sorted_pairs = pair_sorter
-        .sort(pairs)
+        .try_sort(pairs)
         .context("Could not initialize ParSortPairs::par_sort_pairs")?;
     let sorted_pairs: Vec<_> = sorted_pairs.into();
 
-    let bvcomp_tmp_dir = tempfile::tempdir().unwrap();
+    let bvcomp_tmp_dir = tempfile::tempdir().context("Could not create temporary directory")?;
 
     // let mut g = webgraph::graphs::vec_graph::VecGraph::new();
     // for i in 0..num_terms {
@@ -138,6 +150,9 @@ pub fn symmetric_bv(
 
     // TODO: Switch to LittleEndian once webgraph publishes a release that includes this fix:
     // https://github.com/vigna/webgraph-rs/pull/141
+    let thread_pool = rayon::ThreadPoolBuilder::default()
+        .build()
+        .context("Could not build thread pool")?;
     BvComp::parallel_iter::<BigEndian, _>(
         &path.join("graph"),
         sorted_pairs.into_iter(),
@@ -150,7 +165,7 @@ pub fn symmetric_bv(
             compression_window: 1,
             ..Default::default()
         },
-        &rayon::ThreadPoolBuilder::default().build().unwrap(),
+        &thread_pool,
         bvcomp_tmp_dir.path(),
     )
     .context("Could not run BvComp")?;
@@ -192,22 +207,27 @@ pub fn llp(graph_path: &Path, permutation_path: &Path, gammas: &[String]) -> Res
 
     // parse the gamma format
     let mut gammas = gammas
-        .into_iter()
+        .iter()
         .map(|gamma| {
             let t: Vec<_> = gamma.split('-').collect();
             if t.len() != 2 {
-                bail!("Invalid gamma: {}", gamma);
+                bail!("Invalid gamma: {gamma}");
             }
 
             Ok(if t[0].is_empty() {
                 1.0
             } else {
-                t[0].parse::<usize>()? as f64
-            } * (0.5_f64).powf(t[1].parse::<usize>()? as f64))
+                // Precision loss is acceptable here: gamma values are typically single digits
+                #[expect(clippy::cast_precision_loss)]
+                let base = t[0].parse::<usize>()? as f64;
+                #[expect(clippy::cast_precision_loss)]
+                let exp = t[1].parse::<usize>()? as f64;
+                base * (0.5_f64).powf(exp)
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 
-    gammas.sort_by(|a, b| a.total_cmp(b));
+    gammas.sort_by(f64::total_cmp);
 
     let predicate = MinGain::try_from(MinGain::DEFAULT_THRESHOLD)?;
     let granularity = Granularity::default();

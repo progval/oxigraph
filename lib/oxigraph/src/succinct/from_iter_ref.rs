@@ -58,7 +58,7 @@ impl<I: FallibleIterator> FallibleLender for FromIterRef<I> {
         Ok(self.current.as_ref())
     }
 
-    #[inline(always)]
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.iter.size_hint()
     }
@@ -69,7 +69,7 @@ impl<I: FallibleIterator> FallibleLender for FromIterRef<I> {
         Ok(self.current.as_ref())
     }
 
-    #[inline(always)]
+    #[inline]
     fn count(self) -> Result<usize, Self::Error>
     where
         Self: Sized,
@@ -118,7 +118,7 @@ impl<I: DoubleEndedFallibleIterator> DoubleEndedFallibleLender for FromIterRef<I
 // ExactSizeFallibleIterator marker traits.
 
 impl<I: FallibleIterator> From<I> for FromIterRef<I> {
-    #[inline(always)]
+    #[inline]
     fn from(iter: I) -> Self {
         from_iter_ref(iter)
     }

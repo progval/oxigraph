@@ -6,7 +6,7 @@ use bytemuck::TransparentWrapper;
 use dsi_progress_logger::{ProgressLog, progress_logger};
 use epserde::deser::{DeserInner as EpDeserInner, Deserialize as EpDeserialize, MemCase};
 use epserde::ser::Serialize as EpSerialize;
-use lender::{FallibleLender, FallibleLending, IteratorExt};
+use lender::{FallibleLender, FallibleLending};
 use std::borrow::Borrow;
 use std::fs::File;
 use std::hash::Hasher;
@@ -15,7 +15,7 @@ use std::path::Path;
 use sux::bits::bit_field_vec::BitFieldVec;
 use sux::func::{VBuilder, VFunc};
 use sux::traits::bit_field_slice::BitFieldSlice;
-use sux::utils::{FallibleRewindableLender, FromIntoIterator};
+use sux::utils::FallibleRewindableLender;
 
 /// workaround while https://github.com/vigna/sux-rs/pull/78 is not merged
 #[derive(Debug, TransparentWrapper)]
@@ -59,6 +59,11 @@ pub trait TermHasher {
     /// Returns the number of known terms
     fn len(&self) -> usize;
 
+    /// Returns true if there are no known terms
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     fn hash_bytes(&self, s: impl AsRef<[u8]>) -> Result<usize>;
 
     fn hash_namedorblanknode(&self, term: &NamedOrBlankNode) -> Result<usize> {
@@ -73,7 +78,7 @@ pub trait TermHasher {
     }
 
     fn hash_graphname(&self, graph_name: &GraphName) -> Result<usize> {
-        self.hash_bytes(serialize_graph_name(graph_name)?)
+        self.hash_bytes(serialize_graph_name(graph_name))
     }
 }
 
@@ -114,14 +119,14 @@ where
 impl<D: BitFieldSlice<usize>> TermMphf<D, epserde::deser::Owned<VFunc<RawTerm, usize, D>>>
 where
     for<'a> D: EpDeserInner<DeserType<'a>: BitFieldSlice<usize>>,
-    for<'a> VFunc<RawTerm, usize, D>: EpSerialize,
+    VFunc<RawTerm, usize, D>: EpSerialize,
 {
     pub fn serialize(&self, path: impl AsRef<Path>) -> Result<()>
     where
         VFunc<RawTerm, usize, D>: EpSerialize,
     {
         let path = path.as_ref();
-        std::fs::create_dir(&path)
+        std::fs::create_dir_all(path)
             .with_context(|| format!("Could not create {}", path.display()))?;
 
         let vfunc_path = path.join("mphf.vfunc");
@@ -178,17 +183,12 @@ pub fn build_terms_mphf(dir: &Path, dest: &Path) -> Result<()> {
             .iter()
             .map(|terms_file| {
                 let TermsFile {
-                    first_term_id: _,
-                    num_terms: _,
-                    path,
-                    compressed_frames,
+                    compressed_frames, ..
                 } = terms_file;
 
                 sux::utils::FromIntoFallibleLenderFactory::new(|| {
                     Ok(super::from_iter_ref::from_iter_ref(
                         FrameLender::new(compressed_frames, config.terms_per_frame)
-                        .with_context(|| format!("Could not decompress {}", path.display()))
-                        .map_err(DecodeError)? // on Result<FallibleLending<Item=Item>>
                         .map_err(DecodeError) // on Result<Item>
                         .map(
                             lender::hrc_mut!(for<'all> |term: &'all [u8]| -> Result<
@@ -238,21 +238,17 @@ pub fn build_terms_mphf(dir: &Path, dest: &Path) -> Result<()> {
         .offline(true) // Save memory by spilling to disk
         .low_mem(true) // Save memory by using slightly more CPU;
         ;
+    let Ok(counting_lender) = sux::utils::lenders::FromIntoFallibleLenderFactory::new(
+        || -> Result<_, std::convert::Infallible> {
+            Ok(super::from_iter_ref::from_iter_ref(
+                fallible_iterator::convert(
+                    (0..config.num_terms).map(Ok::<_, std::convert::Infallible>),
+                ),
+            ))
+        },
+    );
     let vfunc = builder
-        .try_build_func::<RawTerm, BoxedRawTerm>(
-            terms_lender,
-            sux::utils::lenders::FromIntoFallibleLenderFactory::new(
-                || -> Result<_, std::convert::Infallible> {
-                    Ok(super::from_iter_ref::from_iter_ref(
-                        fallible_iterator::convert(
-                            (0..config.num_terms).map(Ok::<_, std::convert::Infallible>),
-                        ),
-                    ))
-                },
-            )
-            .unwrap(),
-            &mut pl,
-        )
+        .try_build_func::<RawTerm, BoxedRawTerm>(terms_lender, counting_lender, &mut pl)
         .context("Could not build VFunc")?;
     pl.done();
 
@@ -401,7 +397,7 @@ impl<L: FallibleRewindableLender> FallibleRewindableLender for FallibleRewindabl
         {
             new_lenders.push(lender.rewind()?);
         }
-        new_lenders.extend(self.lenders.drain(..));
+        new_lenders.append(&mut self.lenders);
         std::mem::swap(&mut new_lenders, &mut self.lenders);
         self.current_index = 0;
         Ok(self)

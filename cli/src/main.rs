@@ -80,11 +80,10 @@ impl Database {
             DatabaseFormat::Autodetect => {
                 if fs::exists(location.join("terms"))? {
                     bail!("Succinct backend can only be opened read-only");
-                } else {
-                    Ok(Store::open(location)
-                        .context("Could not open database with RocksDB backend")?
-                        .into())
                 }
+                Ok(Store::open(location)
+                    .context("Could not open database with RocksDB backend")?
+                    .into())
             }
             DatabaseFormat::Rocksdb => Ok(Store::open(location)?.into()),
             DatabaseFormat::Succinct => {
@@ -111,7 +110,6 @@ impl Database {
         }
     }
 
-    #[expect(clippy::unnecessary_wraps)] // we are going to add support for other bulk loaders later
     fn bulk_loader(&self) -> anyhow::Result<BulkLoader<'_>> {
         match self {
             Self::Store(store) => Ok(store.bulk_loader()),

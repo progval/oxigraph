@@ -8,7 +8,6 @@ use epserde::deser::mem_case::{Flags, MemCase};
 use epserde::deser::{DeserInner as EpDeserInner, Deserialize as EpDeserialize};
 use epserde::ser::Serialize as EpSerialize;
 use fallible_iterator::FallibleIterator;
-use lender::{FallibleLender, IteratorExt};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -36,10 +35,9 @@ impl QuadOrder {
             let [s, p, o, g] = quad;
             [o, p, s, g]
         }
-        use QuadOrder::*;
         match self {
-            Spog => order_spog,
-            Opsg => order_opsg,
+            QuadOrder::Spog => order_spog,
+            QuadOrder::Opsg => order_opsg,
         }
     }
 
@@ -52,34 +50,33 @@ impl QuadOrder {
             let [o, p, s, g] = quad;
             [s, p, o, g]
         }
-        use QuadOrder::*;
         match self {
-            Spog => order_spog,
-            Opsg => order_opsg,
+            QuadOrder::Spog => order_spog,
+            QuadOrder::Opsg => order_opsg,
         }
     }
 }
 
 impl std::fmt::Display for QuadOrder {
-    #[inline(always)]
+    #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use QuadOrder::*;
         let s = match self {
-            Spog => "spog",
-            Opsg => "opsg",
+            QuadOrder::Spog => "spog",
+            QuadOrder::Opsg => "opsg",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[expect(clippy::struct_field_names)]
 pub struct QuadStoreConfiguration {
     pub num_partitions: usize,
     pub num_quads: usize,
     pub num_terms: usize,
 }
 
-pub fn compress_parsed_quads<D: BitFieldSlice<usize> + Sync + Send>(
+pub fn compress_parsed_quads<D>(
     quads: impl ParallelIterator<Item = Result<Quad>>,
     dst_dir: &Path,
     mphf: &TermMphf<D>,
@@ -87,6 +84,7 @@ pub fn compress_parsed_quads<D: BitFieldSlice<usize> + Sync + Send>(
     order: QuadOrder,
 ) -> Result<()>
 where
+    D: BitFieldSlice<usize> + Sync + Send,
     for<'a> D: EpDeserInner<DeserType<'a>: BitFieldSlice<usize>>,
 {
     let compressed_quads = quads.map(|quad| {
@@ -138,8 +136,7 @@ pub fn compress_quads(
         num_partitions: (4 * usize::from(
         std::thread::available_parallelism().context("Could not count CPU threads")?,
     ))
-    .max(16)
-    .min(256) // avoid too many files
+    .clamp(16, 256) // avoid excessively large files, or too many small files
     .next_power_of_two(),
         num_quads: 0,
         num_terms,
@@ -177,7 +174,9 @@ pub fn compress_quads(
             ))
         },
         |acc, quad| -> Result<_> {
-            let (pl, sorter) = acc.as_mut().expect("Could not get sorter"); // FIXME don't panic
+            let (pl, sorter) = acc
+                .as_mut()
+                .map_err(|e| anyhow!("Could not get sorter: {e:?}"))?;
             let sorter = sorter
                 .as_mut()
                 .map_err(|e| anyhow!("Could not create sorter ExternalArraySorter: {e:#?}"))?;
@@ -189,35 +188,30 @@ pub fn compress_quads(
         },
     )?;
 
-    let mut sorted_quads =
-        sorter_pool
-            .into_iter()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|sorter| {
-                let mut sorter = sorter.into_inner().context("Could not get sorter")?;
-                sorter.flush_buffers().context("Could not flush")?;
-                Ok(sorter)
-            })
-            .reduce(
-                || {
-                    Ok(ExternalArraySorter::<4>::new(
-                        max_value,
-                        max_buffer_size,
-                        config.num_partitions,
-                    )
-                    .context("Could not create sorter ExternalArraySorter")?)
-                },
-                |left: Result<_>, right| {
-                    Ok(left?
-                        .merge(right?)
-                        .context("Could not merge ExternalDeduplicatingStringSorter")?)
-                },
-            )?;
+    let mut sorted_quads = sorter_pool
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|sorter| {
+            let mut sorter = sorter.into_inner().context("Could not get sorter")?;
+            sorter.flush_buffers().context("Could not flush")?;
+            Ok(sorter)
+        })
+        .reduce(
+            || {
+                ExternalArraySorter::<4>::new(max_value, max_buffer_size, config.num_partitions)
+                    .context("Could not create sorter ExternalArraySorter")
+            },
+            |left: Result<_>, right| {
+                left?
+                    .merge(right?)
+                    .context("Could not merge ExternalDeduplicatingStringSorter")
+            },
+        )?;
     pl.done();
 
     config.num_quads = num_quads.into_inner();
-    std::fs::create_dir(dst_dir)
+    std::fs::create_dir_all(dst_dir)
         .with_context(|| format!("Could not create {}", dst_dir.display()))?;
     let mut pl = concurrent_progress_logger!(
         item_name = "quad",
@@ -316,8 +310,8 @@ pub fn index_frames(dir: &Path) -> Result<()> {
                 })
                 .with_context(|| format!("Could not read frame offsets from {}", path.display()))?;
 
-            let file_len_bits = usize::try_from(arrays_file.file_len())
-                .with_context(|| format!("Size (in bytes) of {} overflows usize", path.display()))?
+            let file_len_bits = arrays_file
+                .file_len()
                 .checked_mul(8)
                 .with_context(|| format!("Size (in bits) of {} overflows usize", path.display()))?;
             let mut efb = EliasFanoBuilder::new(num_frames, file_len_bits);
@@ -523,12 +517,11 @@ pub fn index_quads_by_first_two_terms(dir: &Path) -> Result<()> {
                         move |item: (Option<u64>, [usize; 4])| -> Result<_, SuccinctDatasetError> {
                             let (position, quad) = item;
                             if let Some(position) = position {
-                                if frame_id.is_none() {
-                                    if position != 0 {
-                                        Err(anyhow!("Got position={position:?} for first frame"))?;
+                                if frame_id.is_none()
+                                    && position != 0 {
+                                        return Err(anyhow!("Got position={position:?} for first frame").into());
                                     }
-                                }
-                                frame_id = Some(frame_id.map(|id| id + 1).unwrap_or(0));
+                                frame_id = Some(frame_id.map_or(0, |id| id + 1));
                             }
                             let frame_id = frame_id.context("Got quad before first frame")?;
 
@@ -547,7 +540,7 @@ pub fn index_quads_by_first_two_terms(dir: &Path) -> Result<()> {
                             // as an absolute number, so it takes less space on disk.
                             // And we can use the Elias-Fano sequence built by
                             // index_quads_by_first_term to get the first frame of (x, _, _, _)
-                            Ok(Some(frame_id.checked_sub(first_frame_id_of_current_first_term).expect("(x, y, _, _) is before the first occurence of (x, _, _, _)")))
+                            Ok(Some(frame_id.checked_sub(first_frame_id_of_current_first_term).context("(x, y, _, _) is before the first occurence of (x, _, _, _)")?))
                         },
                     )))
             })?;
@@ -640,7 +633,7 @@ impl QuadStore {
         let parts = self
             .partitions
             .iter()
-            .map(|partition| partition.iter_all_quads())
+            .map(QuadPartition::iter_all_quads)
             .collect::<Result<Vec<_>>>()?;
         Ok(Some(parts.into_iter().flatten()))
     }
@@ -742,7 +735,7 @@ impl QuadPartition {
     }
 
     pub fn iter_all_quads(&self) -> Result<impl Iterator<Item = Result<[usize; 4]>> + use<>> {
-        Ok(self.quads.owned_iter()?)
+        self.quads.owned_iter()
     }
 
     pub fn iter_quads_by_first_term(
@@ -794,7 +787,7 @@ impl QuadPartition {
         term1: usize,
         term2: usize,
     ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<>>> {
-        self._iter_quads_by_first_two_terms::<true>(term1, term2)
+        self.iter_quads_by_first_two_terms_impl::<true>(term1, term2)
     }
 
     /// Same as [`iter_quads_by_first_two_terms`](Self::iter_quads_by_first_two_terms) but does not
@@ -806,11 +799,11 @@ impl QuadPartition {
         term1: usize,
         term2: usize,
     ) -> Result<Option<impl Iterator<Item = Result<[usize; 4]>> + use<>>> {
-        self._iter_quads_by_first_two_terms::<false>(term1, term2)
+        self.iter_quads_by_first_two_terms_impl::<false>(term1, term2)
     }
 
-    #[inline(always)]
-    fn _iter_quads_by_first_two_terms<const EARLY_PRUNING: bool>(
+    #[inline]
+    fn iter_quads_by_first_two_terms_impl<const EARLY_PRUNING: bool>(
         &self,
         term1: usize,
         term2: usize,
@@ -856,13 +849,13 @@ impl QuadPartition {
             // It is redundant with the next checks (based on the first two terms) but
             // is faster because it does a read in the frame index (small EF) right after the read we
             // just did (so it's most likely already cached) instead of a random read in the quad file
-            if relative_term1 + 1 < first_term_index.len() {
-                if first_term_index.get(relative_term1 + 1) < maybe_from_bit_position {
-                    // the first match of `(relative_term1+1, _, _, _)` has to be after (or equal to)
-                    // the first match of `(relative_term1, term2, _, _)`'.
-                    // If it is not, it means `first_two_terms_index` returned a false positive
-                    return Ok(None);
-                }
+            if relative_term1 + 1 < first_term_index.len()
+                && first_term_index.get(relative_term1 + 1) < maybe_from_bit_position
+            {
+                // the first match of `(relative_term1+1, _, _, _)` has to be after (or equal to)
+                // the first match of `(relative_term1, term2, _, _)`'.
+                // If it is not, it means `first_two_terms_index` returned a false positive
+                return Ok(None);
             }
 
             if maybe_first_frame_id > 0 {

@@ -10,7 +10,7 @@ use itertools::Itertools;
 use rayon::prelude::*;
 use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use sux::bits::{AtomicBitVec, BitVec};
 use sux::dict::elias_fano::{EfSeqDict, EliasFanoBuilder};
 use sux::traits::{AtomicBitVecOps, BitVecOps, BitVecOpsMut, IndexedDict};
@@ -24,7 +24,7 @@ where
 impl Contraction<EfSeqDict> {
     pub fn mmap(path: &Path) -> Result<Contraction<EfSeqDict>> {
         Ok(Contraction(
-            unsafe { EfSeqDict::mmap(&path, Flags::RANDOM_ACCESS) }.with_context(|| {
+            unsafe { EfSeqDict::mmap(path, Flags::RANDOM_ACCESS) }.with_context(|| {
                 format!(
                     "Could not epdeserialize Contraction index from {}",
                     path.display()
@@ -56,10 +56,11 @@ pub fn build_secondary_index(quads_dir: &Path, index_dir: &Path) -> Result<()> {
     );
     pl.start("Listing second terms...");
     let present = AtomicBitVec::new(config.num_terms);
+    #[expect(clippy::match_same_arms)]
     partitions
         .par_iter()
         .try_for_each_with(pl.clone(), |pl, path| -> Result<_> {
-            let terms = SortedArraysFile::<4>::mmap(&path)
+            let terms = SortedArraysFile::<4>::mmap(path)
             .with_context(|| format!("Could not mmap array file {}", path.display()))?
             .owned_iter()
             .with_context(|| format!("Could not read array file {}", path.display()))?
@@ -113,6 +114,7 @@ pub fn build_secondary_index(quads_dir: &Path, index_dir: &Path) -> Result<()> {
         expected_updates = Some(config.num_quads),
     );
     pl.start("Building BVGraph...");
+    #[expect(clippy::match_same_arms)]
     let pairs = partitions
         .into_par_iter()
         .map_with(pl.clone(), |pl, path| -> Result<_> {

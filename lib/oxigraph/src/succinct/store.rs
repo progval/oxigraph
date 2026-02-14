@@ -30,8 +30,8 @@ where
         self.dataset
     }
 
-    pub fn quads_for_pattern<'b>(
-        &'b self,
+    pub fn quads_for_pattern(
+        &self,
         subject: Option<NamedOrBlankNodeRef<'_>>,
         predicate: Option<NamedNodeRef<'_>>,
         object: Option<TermRef<'_>>,
@@ -84,10 +84,7 @@ where
                         .externalize_term(predicate)?
                         .try_into()
                         .context("Unexpected predicate type")?,
-                    object: dataset
-                        .externalize_term(object)?
-                        .try_into()
-                        .context("Unexpected object type")?,
+                    object: dataset.externalize_term(object)?,
                     graph_name: match graph_name {
                         Some(graph_name) => match dataset.externalize_term(graph_name)? {
                             Term::BlankNode(g) => g.into(),
@@ -100,7 +97,7 @@ where
             }))
     }
 
-    pub fn contains_named_graph(&self, graph_name: &NamedNode) -> Result<bool> {
+    pub fn contains_named_graph(&self, _graph_name: &NamedNode) -> Result<bool> {
         todo!("contains_graph_name");
     }
 }
