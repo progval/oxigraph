@@ -17,6 +17,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
     "Programming Language :: Rust",
@@ -36,13 +37,14 @@ Tracker = "https://github.com/oxigraph/oxigraph/issues"
 [dependency-groups]
 build = [
     "maturin~=1.0",
-    "ruff~=0.13.0"
+    "ruff~=0.14.0"
 ]
 dev = [
     { include-group = "build" },
     "furo",
     "mypy~=1.0",
-    "sphinx>=7.0,<9.0",
+    "ty~=0.0.2",
+    "sphinx>=7.0,<10.0",
     "sphinx-lint~=1.0"
 ]
 

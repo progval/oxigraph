@@ -1,6 +1,6 @@
 [package]
 name = "oxrdfxml"
-version = "0.2.0"
+version = "0.2.2"
 authors.workspace = true
 license.workspace = true
 readme = "README.md"
@@ -13,6 +13,7 @@ rust-version.workspace = true
 
 [features]
 default = []
+rdf-12 = ["oxrdf/rdf-12"]
 async-tokio = ["dep:tokio", "quick-xml/async-tokio"]
 
 [dependencies]

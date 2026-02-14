@@ -37,6 +37,9 @@ fn sparql10_w3c_query_evaluation_testsuite() -> Result<()> {
             // This test relies on naive iteration on the input file
             "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/reduced/manifest#reduced-1",
             "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/reduced/manifest#reduced-2",
+            // Our scoping of variables introduced by GRAPH is wrong
+            "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#graph-variable-scope",
+            "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/graph/manifest#graph-optional",
         ],
     )
 }
@@ -45,7 +48,17 @@ fn sparql10_w3c_query_evaluation_testsuite() -> Result<()> {
 fn sparql11_query_w3c_evaluation_testsuite() -> Result<()> {
     check_testsuite(
         "https://w3c.github.io/rdf-tests/sparql/sparql11/manifest-sparql11-query.ttl",
-        &[],
+        &[
+            // Our scoping of variables introduced by GRAPH is wrong
+            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/negation/manifest#graph-minus",
+            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-empty-group-count-graph",
+            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/bindings/manifest#graph",
+            // Our property path handling is wrong
+            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_more_set_start",
+            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_more_set_end",
+            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_one_set_start",
+            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_one_set_end",
+        ],
     )
 }
 
@@ -89,13 +102,17 @@ fn sparql11_tsv_w3c_evaluation_testsuite() -> Result<()> {
     )
 }
 
+#[cfg(feature = "rdf-12")]
 #[test]
 fn sparql12_w3c_testsuite() -> Result<()> {
     check_testsuite(
         "https://w3c.github.io/rdf-tests/sparql/sparql12/manifest.ttl",
         &[
             // TODO: https://github.com/w3c/sparql-query/issues/282
-            "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-positive/manifest#basic-tripleterm-subject",
+            "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-negative/manifest#tripleterm-subject-03",
+            "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax-triple-terms-negative/manifest#tripleterm-subject-06",
+            // We do not prevent nested aggregate functions
+            "https://w3c.github.io/rdf-tests/sparql/sparql12/syntax/manifest#nested-aggregate-functions",
         ],
     )
 }

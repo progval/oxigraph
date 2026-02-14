@@ -92,18 +92,6 @@ pub fn register_parser_tests(evaluator: &mut TestEvaluator) {
         evaluate_positive_c14n_test(t, RdfFormat::NQuads)
     });
     evaluator.register(
-        "https://w3c.github.io/rdf-canon/tests/vocab#RDFC10EvalTest",
-        |t| evaluate_positive_syntax_test(t, RdfFormat::NQuads), //TODO: not a proper implementation!
-    );
-    evaluator.register(
-        "https://w3c.github.io/rdf-canon/tests/vocab#RDFC10NegativeEvalTest",
-        |_| Ok(()), // TODO: not a proper implementation
-    );
-    evaluator.register(
-        "https://w3c.github.io/rdf-canon/tests/vocab#RDFC10MapTest",
-        |_| Ok(()), // TODO: not a proper implementation
-    );
-    evaluator.register(
         "https://github.com/oxigraph/oxigraph/tests#TestNTripleRecovery",
         |t| evaluate_eval_test(t, RdfFormat::NTriples, true, false),
     );
@@ -329,7 +317,9 @@ fn n3_to_dataset(quads: Vec<N3Quad>) -> Dataset {
                 subject: match q.subject {
                     N3Term::NamedNode(n) => n.into(),
                     N3Term::BlankNode(n) => n.into(),
-                    N3Term::Triple(_) | N3Term::Literal(_) => return None,
+                    N3Term::Literal(_) => return None,
+                    #[cfg(feature = "rdf-12")]
+                    N3Term::Triple(_) => return None,
                     N3Term::Variable(v) => BlankNode::new_unchecked(v.into_string()).into(),
                 },
                 predicate: match q.predicate {
@@ -339,6 +329,7 @@ fn n3_to_dataset(quads: Vec<N3Quad>) -> Dataset {
                 object: match q.object {
                     N3Term::NamedNode(n) => n.into(),
                     N3Term::BlankNode(n) => n.into(),
+                    #[cfg(feature = "rdf-12")]
                     N3Term::Triple(n) => n.into(),
                     N3Term::Literal(n) => n.into(),
                     N3Term::Variable(v) => BlankNode::new_unchecked(v.into_string()).into(),

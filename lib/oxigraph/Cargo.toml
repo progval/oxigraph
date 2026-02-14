@@ -29,7 +29,7 @@ rdf-12 = ["oxrdfio/rdf-12", "spareval/sparql-12"]
 [dependencies]
 dashmap.workspace = true
 oxiri.workspace = true
-oxrdf = { workspace = true, features = ["oxsdatatypes", "serde"] }
+oxrdf = { workspace = true, features = ["oxsdatatypes", "serde", "rdfc-10"] }
 oxrdfio.workspace = true
 oxsdatatypes.workspace = true
 rand.workspace = true
@@ -73,6 +73,7 @@ webgraph-cli = { workspace = true, optional = true }
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 getrandom.workspace = true
 js-sys = { workspace = true, optional = true }
+rand = "0.9"
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 codspeed-criterion-compat.workspace = true

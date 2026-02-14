@@ -38,7 +38,6 @@ use std::path::PathBuf;
 /// >>> str(store)
 /// '<http://example.com> <http://example.com/p> "1" <http://example.com/g> .\n'
 #[pyclass(frozen, name = "Store", module = "pyoxigraph")]
-#[derive(Clone)]
 pub struct PyStore {
     inner: Store,
 }
@@ -125,7 +124,7 @@ impl PyStore {
     fn extend(&self, quads: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<()> {
         let quads = quads
             .try_iter()?
-            .map(|q| q?.extract())
+            .map(|q| Ok(q?.extract()?))
             .collect::<PyResult<Vec<PyQuad>>>()?;
         py.detach(|| {
             self.inner.extend(quads).map_err(map_storage_error)?;
@@ -150,7 +149,7 @@ impl PyStore {
     fn bulk_extend(&self, quads: &Bound<'_, PyAny>) -> PyResult<()> {
         let mut loader = self.inner.bulk_loader();
         loader.load_ok_quads::<PyErr, PythonOrStorageError>(
-            quads.try_iter()?.map(|q| q?.extract::<PyQuad>()),
+            quads.try_iter()?.map(|q| Ok(q?.extract::<PyQuad>()?)),
         )?;
         loader.commit().map_err(map_storage_error)?;
         Ok(())
@@ -378,7 +377,7 @@ impl PyStore {
     ///
     /// It currently supports the following formats:
     ///
-    /// * `JSON-LD 1.0 <https://www.w3.org/TR/json-ld/>`_ (:py:attr:`RdfFormat.JSON_LD`)
+    /// * `JSON-LD <https://www.w3.org/TR/json-ld/>`_ (:py:attr:`RdfFormat.JSON_LD`)
     /// * `N-Triples <https://www.w3.org/TR/n-triples/>`_ (:py:attr:`RdfFormat.N_TRIPLES`)
     /// * `N-Quads <https://www.w3.org/TR/n-quads/>`_ (:py:attr:`RdfFormat.N_QUADS`)
     /// * `Turtle <https://www.w3.org/TR/turtle/>`_ (:py:attr:`RdfFormat.TURTLE`)
@@ -449,7 +448,7 @@ impl PyStore {
     ///
     /// It currently supports the following formats:
     ///
-    /// * `JSON-LD 1.0 <https://www.w3.org/TR/json-ld/>`_ (:py:attr:`RdfFormat.JSON_LD`)
+    /// * `JSON-LD <https://www.w3.org/TR/json-ld/>`_ (:py:attr:`RdfFormat.JSON_LD`)
     /// * `N-Triples <https://www.w3.org/TR/n-triples/>`_ (:py:attr:`RdfFormat.N_TRIPLES`)
     /// * `N-Quads <https://www.w3.org/TR/n-quads/>`_ (:py:attr:`RdfFormat.N_QUADS`)
     /// * `Turtle <https://www.w3.org/TR/turtle/>`_ (:py:attr:`RdfFormat.TURTLE`)
@@ -550,7 +549,7 @@ impl PyStore {
     ///
     /// It currently supports the following formats:
     ///
-    /// * `JSON-LD 1.0 <https://www.w3.org/TR/json-ld/>`_ (:py:attr:`RdfFormat.JSON_LD`)
+    /// * `JSON-LD <https://www.w3.org/TR/json-ld/>`_ (:py:attr:`RdfFormat.JSON_LD`)
     /// * `N-Triples <https://www.w3.org/TR/n-triples/>`_ (:py:attr:`RdfFormat.N_TRIPLES`)
     /// * `N-Quads <https://www.w3.org/TR/n-quads/>`_ (:py:attr:`RdfFormat.N_QUADS`)
     /// * `Turtle <https://www.w3.org/TR/turtle/>`_ (:py:attr:`RdfFormat.TURTLE`)

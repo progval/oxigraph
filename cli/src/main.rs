@@ -10,7 +10,7 @@ use oxhttp::model::header::{
     ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD,
     CONTENT_TYPE, LOCATION, ORIGIN,
 };
-use oxhttp::model::uri::PathAndQuery;
+use oxhttp::model::uri::{Authority, PathAndQuery, Scheme};
 use oxhttp::model::{Body, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use oxigraph::io::{JsonLdProfileSet, LoadedDocument, RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::{
@@ -188,6 +188,11 @@ pub fn main() -> anyhow::Result<()> {
             } else {
                 None
             };
+            if !lenient {
+                eprintln!(
+                    "Some files like Wikidata dumps contain invalid IRIs or language tags. If you want to load them anyway use the `--lenient` option."
+                );
+            }
             #[expect(clippy::cast_precision_loss)]
             if file.is_empty() {
                 // We read from stdin
@@ -937,8 +942,12 @@ fn handle_request(
             let query = url_query(request);
             if query.is_empty() {
                 let format = rdf_content_negotiation(request)?;
-                let description =
-                    generate_service_description(format, EndpointKind::Query, union_default_graph);
+                let description = generate_service_description(
+                    format,
+                    EndpointKind::Query,
+                    union_default_graph,
+                    &request_original_target_url(request)?.to_string(),
+                );
                 Response::builder()
                     .header(CONTENT_TYPE, format.media_type())
                     .body(description.into())
@@ -954,7 +963,7 @@ fn handle_request(
                 )
             }
         }
-        ("/query", "POST") => {
+        ("/query", "POST" | "QUERY") => {
             let content_type =
                 content_type(request).ok_or_else(|| bad_request("No Content-Type given"))?;
             if content_type == "application/sparql-query" {
@@ -986,8 +995,12 @@ fn handle_request(
                 return Err(the_server_is_read_only());
             }
             let format = rdf_content_negotiation(request)?;
-            let description =
-                generate_service_description(format, EndpointKind::Update, union_default_graph);
+            let description = generate_service_description(
+                format,
+                EndpointKind::Update,
+                union_default_graph,
+                &request_original_target_url(request)?.to_string(),
+            );
             Response::builder()
                 .header(CONTENT_TYPE, format.media_type())
                 .body(description.into())
@@ -1495,6 +1508,7 @@ fn evaluate_sparql_query(
 }
 
 fn default_sparql_evaluator() -> SparqlEvaluator {
+    #[cfg_attr(not(feature = "geosparql"), expect(unused_mut))]
     let mut evaluator = SparqlEvaluator::new();
     #[cfg(feature = "geosparql")]
     for (name, implementation) in GEOSPARQL_EXTENSION_FUNCTIONS {
@@ -1996,6 +2010,49 @@ fn systemd_notify_ready() -> io::Result<()> {
     Ok(())
 }
 
+fn request_original_target_url<B>(request: &Request<B>) -> Result<Uri, HttpError> {
+    let mut parts = request.uri().clone().into_parts();
+    if let Some(host) = request.headers().get("X-Forwarded-Host") {
+        parts.authority = Some(
+            Authority::try_from(host.as_bytes())
+                .map_err(|e| bad_request(format!("Bad X-Forwarded-Host header: {e}")))?,
+        );
+    }
+    if let Some(proto) = request.headers().get("X-Forwarded-Proto") {
+        parts.scheme = Some(
+            Scheme::try_from(proto.as_bytes())
+                .map_err(|e| bad_request(format!("Bad X-Forwarded-Proto header: {e}")))?,
+        );
+    }
+    if let Some(forwarded) = request.headers().get("Forwarded") {
+        for pair in forwarded.as_bytes().split(|c| *c == b';') {
+            let Some((key_value_separation, _)) =
+                pair.iter().enumerate().find(|(_, c)| **c == b'=')
+            else {
+                return Err(bad_request("Bad Forwarded header"));
+            };
+            let (key, value) = pair.split_at(key_value_separation);
+            let value = value[1..].trim_ascii(); // We remove the split value
+            match key.trim_ascii() {
+                b"host" => {
+                    parts.authority = Some(
+                        Authority::try_from(value)
+                            .map_err(|e| bad_request(format!("Bad Forwarded header: {e}")))?,
+                    );
+                }
+                b"proto" => {
+                    parts.scheme = Some(
+                        Scheme::try_from(value.trim_ascii())
+                            .map_err(|e| bad_request(format!("Bad Forwarded header: {e}")))?,
+                    );
+                }
+                _ => (),
+            }
+        }
+    }
+    Uri::from_parts(parts).map_err(internal_server_error)
+}
+
 #[cfg(test)]
 #[expect(clippy::panic_in_result_fn)]
 mod tests {
@@ -2438,7 +2495,7 @@ mod tests {
             .assert()
             .success();
         output_file
-            .assert("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rdf:RDF xml:base=\"http://example.com/\" xmlns:schema=\"http://schema.org/\" xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\t<schema:Person rdf:about=\"#me\">\n\t\t<schema:name xml:lang=\"en\">Foo Bar</schema:name>\n\t</schema:Person>\n</rdf:RDF>");
+            .assert("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rdf:RDF xml:base=\"http://example.com/\" xmlns:schema=\"http://schema.org/\" xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" xmlns:its=\"http://www.w3.org/2005/11/its\">\n\t<schema:Person rdf:about=\"#me\">\n\t\t<schema:name xml:lang=\"en\">Foo Bar</schema:name>\n\t</schema:Person>\n</rdf:RDF>");
         Ok(())
     }
 
@@ -3317,5 +3374,45 @@ mod tests {
         use clap::CommandFactory;
 
         Args::command().debug_assert()
+    }
+
+    #[test]
+    fn test_request_original_target_url() {
+        assert_eq!(
+            request_original_target_url(
+                &Request::builder()
+                    .uri("http://example.com/foo")
+                    .body(())
+                    .unwrap()
+            )
+            .unwrap()
+            .to_string(),
+            "http://example.com/foo"
+        );
+        assert_eq!(
+            request_original_target_url(
+                &Request::builder()
+                    .uri("http://example.com/foo")
+                    .header("X-Forwarded-Proto", "https")
+                    .header("X-Forwarded-Host", "example.org")
+                    .body(())
+                    .unwrap()
+            )
+            .unwrap()
+            .to_string(),
+            "https://example.org/foo"
+        );
+        assert_eq!(
+            request_original_target_url(
+                &Request::builder()
+                    .uri("http://example.com/foo")
+                    .header("Forwarded", "by=foo ; proto = https ; host = example.org")
+                    .body(())
+                    .unwrap()
+            )
+            .unwrap()
+            .to_string(),
+            "https://example.org/foo"
+        );
     }
 }

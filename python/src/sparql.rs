@@ -435,7 +435,7 @@ impl PyQuerySolutions {
 /// >>> bool(store.query('ASK { ?s ?p ?o }'))
 /// True
 #[pyclass(frozen, name = "QueryBoolean", module = "pyoxigraph", eq, ord, hash)]
-#[derive(Eq, Ord, PartialOrd, PartialEq, Hash, Clone, Copy)]
+#[derive(Eq, Ord, PartialOrd, PartialEq, Hash)]
 pub struct PyQueryBoolean {
     inner: bool,
 }
@@ -516,7 +516,7 @@ impl PyQueryTriples {
     ///
     /// It currently supports the following formats:
     ///
-    /// * `JSON-LD 1.0 <https://www.w3.org/TR/json-ld/>`_ (:py:attr:`RdfFormat.JSON_LD`)
+    /// * `JSON-LD <https://www.w3.org/TR/json-ld/>`_ (:py:attr:`RdfFormat.JSON_LD`)
     /// * `canonical <https://www.w3.org/TR/n-triples/#canonical-ntriples>`_ `N-Triples <https://www.w3.org/TR/n-triples/>`_ (:py:attr:`RdfFormat.N_TRIPLES`)
     /// * `N-Quads <https://www.w3.org/TR/n-quads/>`_ (:py:attr:`RdfFormat.N_QUADS`)
     /// * `Turtle <https://www.w3.org/TR/turtle/>`_ (:py:attr:`RdfFormat.TURTLE`)
@@ -633,7 +633,14 @@ pub fn parse_query_results(
 /// * `JSON <https://www.w3.org/TR/sparql11-results-json/>`_ (:py:attr:`QueryResultsFormat.JSON`)
 /// * `CSV <https://www.w3.org/TR/sparql11-results-csv-tsv/>`_ (:py:attr:`QueryResultsFormat.CSV`)
 /// * `TSV <https://www.w3.org/TR/sparql11-results-csv-tsv/>`_ (:py:attr:`QueryResultsFormat.TSV`)
-#[pyclass(frozen, name = "QueryResultsFormat", module = "pyoxigraph", eq, hash)]
+#[pyclass(
+    frozen,
+    name = "QueryResultsFormat",
+    module = "pyoxigraph",
+    eq,
+    hash,
+    from_py_object
+)]
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 pub struct PyQueryResultsFormat {
     inner: QueryResultsFormat,

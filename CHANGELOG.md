@@ -1,3 +1,52 @@
+# [0.5.4] - 2026-01-24
+
+### Added
+- RDF/XML: support of the current 1.2 draft behind the `rdf-12` cargo feature (directional language strings and triple terms).
+- RDFC 1.0 canonicalization algorithm on the `Graph` and `Dataset` containers.
+
+### Changed
+- `oxrdf`: the default `Unstable` canonicalization algorithm has been changed for a variant of RDFC 1.0. It seems much faster in a lot of cases.
+- HTTP: always set `sd:endpoint` in the served service description (the value is guessed from the incoming request values).
+- `spareval`: make `QueryTripleIter::new` public.
+- JSON-LD: lots of internal changes in preparation of JSON-LD 1.1 support (might affect some edge cases of 1.0 parsing).
+
+
+# [0.5.3] - 2025-12-19
+
+### Added
+- SPARQL 1.2: support `VERSION` declaration. 
+
+### Changed
+- SPARQL: fixes parsing of `HAVING` when there are multiple conditions.
+- SPARQL: compute ordering values for `ORDER BY` only once (allows `ORDER BY RAND()` to work properly).
+
+
+# [0.5.2] - 2025-10-25
+
+### Changed
+- SPARQL: fixes evaluation of RDF 1.2 annotation syntax (e.g. `SELECT * WHERE { ?s ?p ?o {| ?p2 ?o |}`).
+- Bump RocksDB to 10.7.5 (requires a C++ 20 compiler).
+- Built Linux Python wheels now require Glibc 2.28.
+
+
+# [0.5.1] - 2025-10-11
+
+## Added
+- `spargebra`: `standard-unicode-escaping` feature that unescape `\u` and `\U` sequences everywhere in the query, following to the SPARQL specification.
+- `spareval`: `QueryEvaluator.prepare` method that allows to prepare a query then execute it.
+  Injecting variable bindings and customizing the query dataset is possible on the prepared query.
+  `FROM` and `FROM NAMED` clauses are taken into account by this API, opposite to the older `QueryEvaluator.execute` method.
+- `spareval`: `QueryEvaluator.prepare_delete_insert` that allows evaluating easily SPARQL UPDATE DELETE/INSERT operations.
+- CLI: `oxigraph load` now has a `--non-atomic` option to load data in a non-atomic way. Allows compaction to happen in the background during loading.
+
+### Changed
+- NTriples/Turtle: fixes parsing of language tags with numbers like `es-419`.
+- SPARQL: fixes evaluation of `SELECT * FROM NAMED <ex:> WHERE { GRAPH ?g {} }`: all named graphs of the underlying store returned and not only `ex:`.
+- SPARQL: make parsing fail on duplicated variable names in `VALUES` like `VALUES (?a ?a) {}`.
+- `spareval`: `QueryEvaluator.execute` and `QueryEvaluator.explain` are deprecated. Please use `QueryEvaluator.prepare` instead.
+- bulk loader: avoid duplicated each file. It reduces the storage footprint by half in some cases.
+- bulk loader: improve cleanup on failure and avoid some cases where files where left on disk.
+
 # [0.5.0] - 2025-09-13
 
 _This release is dedicated to the memory of [Gregg Kellogg](https://greggkellogg.net/foaf), author of multiple specifications implemented by Oxigraph and great inspiration._

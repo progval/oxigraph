@@ -37,7 +37,7 @@ env_logger.workspace = true
 flate2.workspace = true
 log.workspace = true
 oxhttp = { workspace = true, features = ["flate2"] }
-oxigraph.workspace = true
+oxigraph = { workspace = true, default-features = true }
 oxiri.workspace = true
 rand.workspace = true
 rayon.workspace = true

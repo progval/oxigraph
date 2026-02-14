@@ -1,6 +1,6 @@
 [package]
 name = "oxrdfio"
-version = "0.2.0"
+version = "0.2.2"
 authors.workspace = true
 license.workspace = true
 readme = "README.md"
@@ -14,7 +14,7 @@ rust-version.workspace = true
 [features]
 default = []
 async-tokio = ["dep:tokio", "oxrdfxml/async-tokio", "oxttl/async-tokio", "oxjsonld/async-tokio"]
-rdf-12 = ["oxrdf/rdf-12", "oxttl/rdf-12", "oxjsonld/rdf-12"]
+rdf-12 = ["oxrdf/rdf-12", "oxrdfxml/rdf-12", "oxttl/rdf-12", "oxjsonld/rdf-12"]
 
 [dependencies]
 oxjsonld.workspace = true
