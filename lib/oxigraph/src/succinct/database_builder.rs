@@ -206,10 +206,8 @@ impl DatabaseBuilder {
             log::info!("Skipping MPHF construction, already done.");
             return Ok(());
         }
-        let mphf = terms_mphf::build_terms_mphf(&self.terms_path())
-            .context("Could not build terms MPHF")?;
-        mphf.serialize(&mphf_path)
-            .with_context(|| format!("Could not write terms MPHF to {}", mphf_path.display()))
+        terms_mphf::build_terms_mphf(&self.terms_path(), &mphf_path)
+            .context("Could not build terms MPHF")
     }
 
     pub fn compress_all_quads_stores(&self) -> Result<()> {

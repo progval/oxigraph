@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use sux::bits::BitFieldVec;
 use sux::traits::BitFieldSlice;
-use sux::traits::bit_field_slice::BitFieldSliceCore;
 use tempfile::TempDir;
+use value_traits::slices::SliceByValue;
 use webgraph::utils::{ArcMmapHelper, MmapHelper};
 
 /// Sorts and deduplicates strings and spills to disk to save memory
@@ -463,7 +463,7 @@ impl<const N: usize> ExternalArraySorter<N> {
             for quad_id in 0..num_quads {
                 let mut quad = [0; N];
                 for i in 0..N {
-                    quad[i] = partition.get(quad_id * N + i);
+                    quad[i] = partition.index_value(quad_id * N + i);
                 }
                 self.push_to_partition(quad, partition_id)
                     .context("Could not push merged item")?;

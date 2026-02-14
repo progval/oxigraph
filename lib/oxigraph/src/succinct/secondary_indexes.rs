@@ -4,32 +4,27 @@ use crate::succinct::sort::SortedArraysFile;
 use anyhow::{Context, Result};
 use dsi_progress_logger::{ProgressLog, concurrent_progress_logger, progress_logger};
 use epserde::deser::mem_case::{Flags, MemCase};
-use epserde::deser::{Deserialize as EpDeserialize, DeserInner as EpDeserInner};
+use epserde::deser::{DeserInner as EpDeserInner, Deserialize as EpDeserialize};
 use epserde::ser::Serialize as EpSerialize;
 use itertools::Itertools;
 use rayon::prelude::*;
 use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use sux::bits::{AtomicBitVec, BitVec};
 use sux::dict::elias_fano::{EfSeqDict, EliasFanoBuilder};
-use sux::traits::IndexedDict;
+use sux::traits::{AtomicBitVecOps, BitVecOps, BitVecOpsMut, IndexedDict};
 use webgraph::graphs::bvgraph::{BvGraph, MemoryFlags};
 use webgraph::traits::RandomAccessGraph;
 
-pub struct Contraction<
-    T = EfSeqDict as EpDeserInner>::DeserType<
-        'static,
-    >,
->(MemCase<T>)
-where for<'a> T: IndexedDict<Input = usize, Output<'a> = usize>;
+pub struct Contraction<T = EfSeqDict>(MemCase<T>)
+where
+    for<'a, 'b> T: EpDeserInner<DeserType<'a>: IndexedDict<Input = usize, Output<'b> = usize>>;
 
 impl Contraction<EfSeqDict> {
-    pub fn mmap(
-        path: &Path,
-    ) -> Result<Contraction<<EfSeqDict as EpDeserInner>::DeserType<'static>>> {
+    pub fn mmap(path: &Path) -> Result<Contraction<EfSeqDict>> {
         Ok(Contraction(
-            EfSeqDict::mmap(&path, Flags::RANDOM_ACCESS).with_context(|| {
+            unsafe { EfSeqDict::mmap(&path, Flags::RANDOM_ACCESS) }.with_context(|| {
                 format!(
                     "Could not epdeserialize Contraction index from {}",
                     path.display()
@@ -39,9 +34,12 @@ impl Contraction<EfSeqDict> {
     }
 }
 
-impl<T: IndexedDict<Input = usize, Output = usize>> Contraction<T> {
+impl<T> Contraction<T>
+where
+    for<'a, 'b> T: EpDeserInner<DeserType<'a>: IndexedDict<Input = usize, Output<'b> = usize>>,
+{
     pub fn get(&self, term_id: usize) -> Option<usize> {
-        self.0.index_of(term_id)
+        self.0.uncase().index_of(term_id)
     }
 }
 
@@ -83,7 +81,7 @@ pub fn build_secondary_index(quads_dir: &Path, index_dir: &Path) -> Result<()> {
             Ok(())
         })?;
     pl.done();
-    let present = BitVec::from(present);
+    let present = BitVec::<Box<[usize]>>::from(present);
 
     // Build a map from term ids to their (smaller) "id as predicate", so the resulting BvGraph does
     // not need to store empty adjacency lists
@@ -106,7 +104,7 @@ pub fn build_secondary_index(quads_dir: &Path, index_dir: &Path) -> Result<()> {
     pl.done();
 
     log::info!("Building Contraction...");
-    let termid_to_predid = Contraction(MemCase::encase(efb.build_with_seq_and_dict()));
+    let termid_to_predid = Contraction(MemCase::<EfSeqDict>::encase(efb.build_with_seq_and_dict()));
 
     let mut pl = concurrent_progress_logger!(
         item_name = "quad",
@@ -151,15 +149,20 @@ pub fn build_secondary_index(quads_dir: &Path, index_dir: &Path) -> Result<()> {
     let termid_to_predid_path = index_dir.join("termid_to_predid.ef");
     let mut termid_to_predid_file = File::create(&termid_to_predid_path)
         .with_context(|| format!("Could not create {}", termid_to_predid_path.display()))?;
-    termid_to_predid
-        .0
-        .serialize(&mut termid_to_predid_file)
-        .with_context(|| {
-            format!(
-                "Could not write Contraction to {}",
-                termid_to_predid_path.display()
-            )
-        })?;
+    // SAFETY: this may leak padding bytes, but we only read data that is to be shared
+    // alongside the vfunc.
+    unsafe {
+        termid_to_predid
+            .0
+            .uncase()
+            .serialize(&mut termid_to_predid_file)
+    }
+    .with_context(|| {
+        format!(
+            "Could not write Contraction to {}",
+            termid_to_predid_path.display()
+        )
+    })?;
 
     Ok(())
 }

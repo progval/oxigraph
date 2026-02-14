@@ -7,6 +7,7 @@ use oxrdf::{GraphName, Term};
 use spareval::{InternalQuad, QueryableDataset};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use value_traits::slices::SliceByValue;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0:#}")]

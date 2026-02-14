@@ -21,8 +21,8 @@ pub(super) type DynamicBvGraph = BvGraph<
         BigEndian,
         MmapHelper<u32>,
         EliasFano<
-            SelectAdaptConst<BitVec<&'static [usize]>, &'static [usize], 12, 4>,
-            BitFieldVec<usize, &'static [usize]>,
+            SelectAdaptConst<BitVec<Box<[usize]>>, Box<[usize]>, 12, 4>,
+            BitFieldVec<usize, Box<[usize]>>,
         >,
     >,
 >;
@@ -42,7 +42,6 @@ pub fn bv(
 
     let mut pair_sorter = ParSortPairs::new(num_terms)
         .context("Could not initialize ParSortPairs")?
-        .batch_size(NonZeroUsize::new(10_000_000).unwrap()) // default uses too much RAM
         .num_partitions(num_partitions);
 
     if let Some(num_pairs) = num_pairs {
@@ -52,8 +51,9 @@ pub fn bv(
     let pairs = pairs.map(|pair| pair.unwrap()); // TODO: add support for Result in ParSortPairs
 
     let sorted_pairs = pair_sorter
-        .par_sort_pairs(pairs)
+        .sort(pairs)
         .context("Could not initialize ParSortPairs::par_sort_pairs")?;
+    let sorted_pairs: Vec<_> = sorted_pairs.into();
 
     let bvcomp_tmp_dir = tempfile::tempdir().unwrap();
 
@@ -64,15 +64,7 @@ pub fn bv(
     // https://github.com/vigna/webgraph-rs/pull/141
     BvComp::parallel_iter::<BigEndian, _>(
         &path.join("graph"),
-        sorted_pairs
-            .into_iter()
-            .enumerate()
-            .map(|(partition_id, partition)| {
-                let partition = partition.into_iter().dedup();
-                ArcListGraph::new(num_terms, partition)
-                    .iter_from(partition_id * num_terms_per_partition)
-                    .take(num_terms_per_partition)
-            }),
+        sorted_pairs.into_iter(),
         num_terms,
         CompFlags {
             // BvComp stores as many successor lists as the value of `compression_window`.
@@ -118,13 +110,13 @@ pub fn symmetric_bv(
 
     let pair_sorter = ParSortPairs::new(num_terms)
         .context("Could not initialize ParSortPairs")?
-        .batch_size(NonZeroUsize::new(10_000_000).unwrap()) // default uses too much RAM
         .expected_num_pairs(num_quads * 6) // mild overapprox (because there are duplicates)
         .num_partitions(num_partitions);
 
     let sorted_pairs = pair_sorter
-        .par_sort_pairs(pairs)
+        .sort(pairs)
         .context("Could not initialize ParSortPairs::par_sort_pairs")?;
+    let sorted_pairs: Vec<_> = sorted_pairs.into();
 
     let bvcomp_tmp_dir = tempfile::tempdir().unwrap();
 
@@ -148,40 +140,7 @@ pub fn symmetric_bv(
     // https://github.com/vigna/webgraph-rs/pull/141
     BvComp::parallel_iter::<BigEndian, _>(
         &path.join("graph"),
-        sorted_pairs
-            .into_iter()
-            .enumerate()
-            .map(|(partition_id, partition)| {
-                let partition = partition.into_iter().dedup();
-                #[cfg(debug_assertions)]
-                {
-                    let mut prev_arc = None;
-                    for arc in partition.clone() {
-                        if let Some(prev_arc) = prev_arc {
-                            assert!(
-                                arc > prev_arc,
-                                "{arc:?} after {prev_arc:?} in partition {partition_id}"
-                            );
-                        }
-                        let (src, dst) = arc;
-                        assert!(
-                            src < num_terms,
-                            "src={src} is greater then num_terms={num_terms}"
-                        );
-                        assert!(
-                            dst < num_terms,
-                            "dst={dst} is greater then num_terms={num_terms}"
-                        );
-                        assert!(src >= partition_id * num_terms_per_partition);
-                        assert!(src < (partition_id + 1) * num_terms_per_partition);
-                        // assert_ne!(src, dst);
-                        prev_arc = Some(arc);
-                    }
-                }
-                ArcListGraph::new(num_terms, partition)
-                    .iter_from(partition_id * num_terms_per_partition)
-                    .take(num_terms_per_partition)
-            }),
+        sorted_pairs.into_iter(),
         num_terms,
         CompFlags {
             // BvComp stores as many successor lists as the value of `compression_window`.
@@ -218,10 +177,12 @@ pub fn llp(graph_path: &Path, permutation_path: &Path, gammas: &[String]) -> Res
 
     // Load degree cumulative function in THP memory
     let dcf_path = graph_path.with_extension(DEG_CUMUL_EXTENSION);
-    let deg_cumul = DCF::mmap(
-        &dcf_path,
-        Flags::TRANSPARENT_HUGE_PAGES | Flags::RANDOM_ACCESS,
-    )
+    let deg_cumul = unsafe {
+        DCF::mmap(
+            &dcf_path,
+            Flags::TRANSPARENT_HUGE_PAGES | Flags::RANDOM_ACCESS,
+        )
+    }
     .with_context(|| {
         format!(
             "Could not mmap degree cumulative function from {}",
@@ -254,7 +215,7 @@ pub fn llp(graph_path: &Path, permutation_path: &Path, gammas: &[String]) -> Res
     // compute the LLP
     webgraph_algo::llp::layered_label_propagation_labels_only(
         graph,
-        &*deg_cumul,
+        deg_cumul.uncase(),
         gammas,
         Some(rayon::current_num_threads().max(1)),
         None, // chunk_size

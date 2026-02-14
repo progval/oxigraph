@@ -3,10 +3,10 @@ use crate::model::{GraphName, Quad, Term};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use dsi_progress_logger::{ProgressLog, concurrent_progress_logger, progress_logger};
 use epserde::deser::mem_case::{Flags, MemCase};
-use epserde::deser::{Deserialize as EpDeserialize, DeserializeInner as EpDeserializeInner};
+use epserde::deser::{DeserInner as EpDeserInner, Deserialize as EpDeserialize};
 use epserde::ser::Serialize as EpSerialize;
 use itertools::Itertools;
-use lender::{Lender, Lending};
+use lender::{FallibleLender, FallibleLending};
 use mmap_rs::Mmap;
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{BlankNode, Literal, NamedNode, NamedNodeRef};
@@ -19,7 +19,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use sux::dict::elias_fano::{EfSeq, EfSeqDict, EliasFanoBuilder};
 use sux::traits::IndexedSeq;
-use sux::utils::RewindableIoLender;
+use sux::utils::lenders::FallibleRewindableLender;
 
 // Increasing either these values doesn't give noticeably better compression on wikidata-20240320-truthy-BETA.
 pub const DEFAULT_ZSTD_TRAINING_SAMPLES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
@@ -157,7 +157,9 @@ pub fn deserialize_term(bytes: &[u8], dictionary: Option<&TermDictionary>) -> Re
                 .len()
                 .checked_sub(size_of::<u16>())
                 .context("Language tagged literal is too short")?;
-            let lang_length = usize::from(u16::from_be_bytes(bytes[lang_length_offset..].try_into().unwrap()));
+            let lang_length = usize::from(u16::from_be_bytes(
+                bytes[lang_length_offset..].try_into().unwrap(),
+            ));
             let lang_offset = lang_length_offset.checked_sub(lang_length).unwrap();
 
             Term::Literal(Literal::new_language_tagged_literal_unchecked(
@@ -247,7 +249,7 @@ pub fn deserialize_graph_name(bytes: &[u8]) -> Result<GraphName> {
 pub struct TermDictionary {
     name: String,
     datatypes: Mmap,
-    datatypes_offsets: MemCase<<EfSeq as EpDeserializeInner>::DeserType<'static>>,
+    datatypes_offsets: MemCase<EfSeq>,
 }
 
 impl TermDictionary {
@@ -278,13 +280,15 @@ impl TermDictionary {
                     .map()
                     .with_context(|| format!("Could not mmap {}", datatypes_path.display()))?
             },
-            datatypes_offsets: EfSeq::mmap(&datatypes_offsets_path, Flags::RANDOM_ACCESS)
-                .with_context(|| {
-                    format!(
-                        "Could not epdeserialize frames index from {}",
-                        datatypes_offsets_path.display()
-                    )
-                })?,
+            datatypes_offsets: unsafe {
+                EfSeq::mmap(&datatypes_offsets_path, Flags::RANDOM_ACCESS)
+            }
+            .with_context(|| {
+                format!(
+                    "Could not epdeserialize frames index from {}",
+                    datatypes_offsets_path.display()
+                )
+            })?,
         })
     }
 
@@ -326,8 +330,7 @@ impl TermDictionary {
                 push_namednode(xsd::STRING)?;
 
                 FrameLender::new(compressed_frames, config.terms_per_frame)?
-                    .try_for_each(|term| {
-                    let term = term?;
+                    .for_each(|term| {
                         if term.is_empty() {
                             // FIXME: that's GraphName::DefaultGraph because we currently store
                             // graph names in the terms store, but we shouldn't.
@@ -440,7 +443,9 @@ impl TermDictionary {
         let datatypes_index_path = dict_dir.path().join("datatypes.ef");
         let mut index_file = File::create(&datatypes_index_path)
             .with_context(|| format!("Could not create {}", datatypes_index_path.display()))?;
-        ef.serialize(&mut index_file).with_context(|| {
+        // SAFETY: this may leak padding bytes, but we only read data that is to be shared
+        // alongside the index.
+        unsafe { ef.serialize(&mut index_file) }.with_context(|| {
             format!(
                 "Could not write Elias-Fano index to {}",
                 datatypes_index_path.display()
@@ -460,7 +465,7 @@ impl TermDictionary {
     fn get_datatype_id(&self, datatype: NamedNodeRef<'_>) -> Result<Option<u32>> {
         // TODO: use VFunc instead of bisection
         let mut left = 0;
-        let mut right = u32::try_from(self.datatypes_offsets.len() - 1)
+        let mut right = u32::try_from(self.datatypes_offsets.uncase().len() - 1)
             .context("Number of datatypes overflowed u32")?;
         while left < right {
             let pivot_id = (left + right) / 2;
@@ -494,16 +499,17 @@ impl TermDictionary {
     fn get_datatype(&self, id: u32) -> Result<NamedNode> {
         let id = usize::try_from(id).with_context(|| format!("Invalid datatype id: {id}"))?;
         ensure!(
-            id < self.datatypes_offsets.len(),
+            id < self.datatypes_offsets.uncase().len(),
             "Invalid datatype id: {id}"
         );
 
-        let offset = self.datatypes_offsets.get(id);
-        let bytes = read_length_prefixed_string(&mut Cursor::new(&self.datatypes[offset..]), |_| {
-            Some(u64::try_from(offset).context("Offset overflowed u64"))
-        })
-        .context("Could not get datatype")?
-        .context("Unexpected end of file")?;
+        let offset = self.datatypes_offsets.uncase().get(id);
+        let bytes =
+            read_length_prefixed_string(&mut Cursor::new(&self.datatypes[offset..]), |_| {
+                Some(u64::try_from(offset).context("Offset overflowed u64"))
+            })
+            .context("Could not get datatype")?
+            .context("Unexpected end of file")?;
         Ok(NamedNode::new_unchecked(
             str::from_utf8(&bytes).context("Non-UTF8 NamedNode in store")?,
         ))
@@ -542,9 +548,8 @@ pub fn recompress_with_dictionary(dir: &Path, dictionary: &TermDictionary) -> Re
             let mut writer = BufWriter::new(recompressed_file);
 
             let mut buf = Vec::with_capacity(config.terms_per_frame.into());
-            FrameLender::new(compressed_frames, config.terms_per_frame)?.try_for_each(
+            FrameLender::new(compressed_frames, config.terms_per_frame)?.for_each(
                 |term| -> Result<_> {
-                    let term = term?;
                     if term.is_empty() {
                         // FIXME: that's GraphName::DefaultGraph because we currently store
                         // graph names in the terms store, but we shouldn't.
@@ -843,17 +848,19 @@ impl<'frame> FrameLender<'frame> {
     }
 }
 
-impl<'frame, 'lend> Lending<'lend> for FrameLender<'frame> {
-    type Lend = Result<&'lend [u8], anyhow::Error>;
+impl<'frame, 'lend> FallibleLending<'lend> for FrameLender<'frame> {
+    type Lend = &'lend [u8];
 }
 
-impl<'frame> Lender for FrameLender<'frame> {
-    fn next(&mut self) -> Option<<Self as Lending<'_>>::Lend> {
+impl<'frame> FallibleLender for FrameLender<'frame> {
+    type Error = anyhow::Error;
+
+    fn next(&mut self) -> Result<Option<<Self as FallibleLending<'_>>::Lend>, Self::Error> {
         if self.data.is_empty() {
-            return None;
+            return Ok(None);
         }
         if let Some(e) = &self.errored {
-            return Some(Err(anyhow!("Previous iteration failed: {e}")));
+            return Err(anyhow!("Previous iteration failed: {e}"));
         }
 
         if self.remaining_strings_in_frame == 0 {
@@ -897,16 +904,16 @@ impl<'frame> Lender for FrameLender<'frame> {
 
             Ok(())
         })() {
-            Ok(()) => Some(Ok(&self.previous_string[..])),
+            Ok(()) => Ok(Some(&self.previous_string[..])),
             Err(e) => {
                 self.errored = Some(format!("{e}")); // anyhow::Error does not impl Clone
-                Some(Err(e))
+                Err(e)
             }
         }
     }
 }
-impl<'frame> RewindableIoLender<[u8]> for FrameLender<'frame> {
-    type Error = anyhow::Error;
+impl<'frame> FallibleRewindableLender for FrameLender<'frame> {
+    type RewindError = anyhow::Error;
 
     fn rewind(mut self) -> Result<Self, Self::Error> {
         self.data = self.all_data;
@@ -1091,7 +1098,9 @@ pub fn index_terms(dir: &Path) -> Result<()> {
             let index_file_path = path.with_extension("frames.ef");
             let mut index_file = File::create(&index_file_path)
                 .with_context(|| format!("Could not create {}", index_file_path.display()))?;
-            ef.serialize(&mut index_file).with_context(|| {
+            // SAFETY: this may leak padding bytes, but we only read data that is to be shared
+            // alongside the vfunc.
+            unsafe { ef.serialize(&mut index_file) }.with_context(|| {
                 format!(
                     "Could not write Elias-Fano index to {}",
                     index_file_path.display()
@@ -1132,14 +1141,18 @@ impl TermStore {
                  })| {
                     let num_frames = num_terms.div_ceil(config.terms_per_frame.into());
                     let frames_index_path = path.with_extension("frames.ef");
-                    let frames_index = EfSeqDict::mmap(&frames_index_path, Flags::RANDOM_ACCESS)
+                    let frames_index = unsafe { EfSeqDict::mmap(&frames_index_path, Flags::RANDOM_ACCESS) }
                         .with_context(|| {
                             format!(
                                 "Could not epdeserialize frames index from {}",
                                 frames_index_path.display()
                             )
                         })?;
-                    ensure!(frames_index.len() == num_frames, "frames_index ({}) of partition {partition_id} does not match expected number of frames ({num_frames})", frames_index.len());
+                    ensure!(
+                        frames_index.uncase().len() == num_frames,
+                        "frames_index ({}) of partition {partition_id} does not match expected number of frames ({num_frames})",
+                        frames_index.uncase().len()
+                    );
 
                     Ok(TermsPartition {
                         path,
@@ -1163,7 +1176,7 @@ impl TermStore {
 
     fn get_frame(&self, partition_id: usize, frame_id: usize) -> Result<&[u8]> {
         let partition = &self.partitions[partition_id];
-        let frame_position = partition.frames_index.get(frame_id);
+        let frame_position = partition.frames_index.uncase().get(frame_id);
 
         Ok(&partition.compressed_frames[frame_position..])
     }
@@ -1191,7 +1204,7 @@ impl TermStore {
         );
         let frame_id = (id - first_term_in_partition) / usize::from(self.config.terms_per_frame);
         ensure!(
-            frame_id < partition.frames_index.len(),
+            frame_id < partition.frames_index.uncase().len(),
             "Inconsistent partition lengths in terms store {}",
             self.path.display()
         );
@@ -1214,5 +1227,5 @@ struct TermsPartition {
     path: PathBuf,
     first_term_id: usize,
     compressed_frames: Mmap,
-    frames_index: MemCase<<EfSeqDict as EpDeserializeInner>::DeserType<'static>>,
+    frames_index: MemCase<EfSeqDict>,
 }
