@@ -348,10 +348,25 @@ impl DatabaseBuilder {
     }
 
     pub fn index_by_second_term(&self, order: QuadOrder) -> Result<()> {
+        use webgraph_cli::GlobalArgs;
+        use webgraph_cli::build::ef::{CliArgs, main};
+
         let quads_path = self.location.join(format!("quads-{order}"));
         let index_path = self.location.join(format!("secondary-{order}"));
-        secondary_indexes::build_secondary_index(&quads_path, &index_path)
-            .context("Could not index by second term")
+
+        if !self.rebuild && index_path.join("graph").exists() {
+            log::info!("Skipping secondary index construction, already done.");
+        } else {
+            secondary_indexes::build_secondary_index(&quads_path, &index_path)
+                .context("Could not index by second term")?;
+        }
+        main(
+            GlobalArgs { log_interval: None },
+            CliArgs {
+                number_of_nodes: None,
+                src: index_path.join("graph"),
+            },
+        )
     }
 }
 
