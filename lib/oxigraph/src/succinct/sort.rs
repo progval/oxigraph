@@ -7,15 +7,15 @@ use itertools::Itertools;
 use mmap_rs::{MmapFlags, MmapOptions};
 use rayon::prelude::*;
 use rdst::{RadixKey, RadixSort};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxBuildHasher, FxHashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Cursor, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use sux::bits::BitFieldVec;
-use sux::traits::BitFieldSlice;
-use sux::traits::bit_field_slice::BitFieldSliceCore;
 use tempfile::TempDir;
+use value_traits::slices::SliceByValue;
 use webgraph::utils::{ArcMmapHelper, MmapHelper};
 
 /// Sorts and deduplicates strings and spills to disk to save memory
@@ -39,21 +39,26 @@ pub(super) struct ExternalDeduplicatingStringSorter {
     buffer_size: usize,
     buffer: FxHashSet<Box<[u8]>>,
     written_size: usize,
-    pub(super) num_unique_items_upperbound: usize, // only counting those in files
+    num_unique_items_upperbound: usize, // only counting those in files
 }
 
 impl ExternalDeduplicatingStringSorter {
-    pub fn new(max_buffer_size: usize, max_num_files: usize) -> Result<Self> {
-        Ok(Self {
+    pub fn new(max_buffer_size: usize, max_num_files: usize) -> Self {
+        Self {
             tempdirs: Vec::new(), // Create it only if needed
             sorted_files: Vec::new(),
-            buffer: FxHashSet::with_hasher(Default::default()),
+            buffer: FxHashSet::with_hasher(FxBuildHasher),
             buffer_size: 0,
             max_buffer_size,
             max_num_files,
             written_size: 0,
             num_unique_items_upperbound: 0,
-        })
+        }
+    }
+
+    /// only counting those in files
+    pub fn num_unique_items_upperbound(&self) -> usize {
+        self.num_unique_items_upperbound
     }
 
     pub fn push_boxed_bytes(&mut self, bytes: Box<[u8]>) -> Result<()> {
@@ -160,6 +165,7 @@ impl ExternalDeduplicatingStringSorter {
     fn iter_written_boxed_bytes(
         sorted_files: Vec<File>,
     ) -> Result<impl Iterator<Item = Result<Box<[u8]>>>> {
+        #[expect(clippy::match_same_arms)]
         Ok(sorted_files
             .into_iter()
             .map(|file| {
@@ -210,9 +216,9 @@ impl ExternalDeduplicatingStringSorter {
 
     /// Consome this external sorter and returns sorted items
     pub fn drain_boxed_bytes(&mut self) -> Result<impl Iterator<Item = Result<Box<[u8]>>>> {
-        let mut buffer = Default::default();
+        let mut buffer = HashSet::default();
         std::mem::swap(&mut buffer, &mut self.buffer);
-        let mut buffer: Vec<_> = buffer.into_iter().map(Box::from).collect();
+        let mut buffer: Vec<_> = buffer.into_iter().collect();
         buffer.par_sort_unstable();
         Ok(self.drain_written_boxed_bytes()?
             // TODO: merge at the same time as the others
@@ -237,7 +243,7 @@ impl ExternalDeduplicatingStringSorter {
         }
 
         self.tempdirs.extend(other.tempdirs);
-        self.sorted_files.extend(other.sorted_files.into_iter());
+        self.sorted_files.extend(other.sorted_files);
         self.written_size += other.written_size;
         self.num_unique_items_upperbound += other.num_unique_items_upperbound;
 
@@ -298,7 +304,7 @@ impl<const N: usize> ExternalArraySorter<N> {
         })
     }
 
-    #[inline(always)]
+    #[inline]
     fn get_partition(&self, item: [usize; N]) -> Result<usize> {
         ensure!(
             item[0] <= self.max_value,
@@ -330,6 +336,19 @@ impl<const N: usize> ExternalArraySorter<N> {
     }
 
     fn flush_buffer(&mut self, partition_id: usize) -> Result<()> {
+        #[derive(TransparentWrapper, Clone, Copy)]
+        #[repr(transparent)]
+        struct Quad<const N: usize>([usize; N]);
+
+        impl<const N: usize> RadixKey for Quad<N> {
+            const LEVELS: usize = N * usize::LEVELS;
+
+            #[inline]
+            fn get_level(&self, level: usize) -> u8 {
+                self.0[N - level / usize::LEVELS - 1].get_level(level % usize::LEVELS)
+            }
+        }
+
         let buffer = &mut self.buffers[partition_id];
         if buffer.is_empty() {
             return Ok(());
@@ -351,29 +370,17 @@ impl<const N: usize> ExternalArraySorter<N> {
         let mut buffer_iter = buffer.iter();
         for _ in 0..num_quads {
             let mut quad = [0; N];
-            for i in 0..N {
-                quad[i] = buffer_iter
+            for elem in &mut quad {
+                *elem = buffer_iter
                     .next()
                     .ok_or_else(|| anyhow!("buffer_iter is shorter than expected"))?;
             }
             quads.push(quad);
         }
 
-        #[derive(TransparentWrapper, Clone, Copy)]
-        #[repr(transparent)]
-        struct Quad<const N: usize>([usize; N]);
-
-        impl<const N: usize> RadixKey for Quad<N> {
-            const LEVELS: usize = N * usize::LEVELS;
-
-            #[inline]
-            fn get_level(&self, level: usize) -> u8 {
-                self.0[N - level / usize::LEVELS - 1].get_level(level % usize::LEVELS)
-            }
-        }
         Quad::<N>::wrap_slice_mut(&mut quads).radix_sort_unstable();
 
-        assert!(quads.is_sorted());
+        debug_assert!(quads.is_sorted(), "Quads were not sorted after radix sort");
         self.current_buffer_len -= buffer.len();
         buffer.clear();
 
@@ -450,7 +457,7 @@ impl<const N: usize> ExternalArraySorter<N> {
             if self_partition.len() < other_partition.len() {
                 std::mem::swap(self_partition, other_partition);
             }
-            self_partition.extend(other_partition.drain(..));
+            self_partition.append(other_partition);
         }
 
         // TODO: flush all partitions if they are already above a certain size,
@@ -462,8 +469,8 @@ impl<const N: usize> ExternalArraySorter<N> {
                 .ok_or_else(|| anyhow!("buffer size is not a multiple of {N}"))?;
             for quad_id in 0..num_quads {
                 let mut quad = [0; N];
-                for i in 0..N {
-                    quad[i] = partition.get(quad_id * N + i);
+                for (i, elem) in quad.iter_mut().enumerate() {
+                    *elem = partition.index_value(quad_id * N + i);
                 }
                 self.push_to_partition(quad, partition_id)
                     .context("Could not push merged item")?;
@@ -485,11 +492,12 @@ impl<const N: usize> ExternalArraySorter<N> {
         self.flush_buffers()?;
         self.sorted_files
             .iter()
-            .map(|partition| Self::iter_written_quads(&partition))
+            .map(|partition| Self::iter_written_quads(partition))
             .collect()
     }
 
     fn iter_written_quads(files: &[PathBuf]) -> Result<impl Iterator<Item = Result<[usize; N]>>> {
+        #[expect(clippy::match_same_arms)]
         Ok(files
             .iter()
             .map(|path| SortedArraysFile::mmap(path)?.owned_iter())
@@ -531,16 +539,16 @@ impl<const N: usize> SortedArraysFile<N> {
         let mut current_frame_size = 0;
         for item in items {
             let item = item?;
-            assert!(
+            ensure!(
                 item >= previous_item,
                 "{item:?} after {previous_item:?} (actually: {actual_previous_item:?})"
             );
-            assert!(
+            ensure!(
                 item >= actual_previous_item,
                 "{item:?} after {previous_item:?} (actually: {actual_previous_item:?})"
             );
 
-            assert!(item != [0; N], "invalid quad: {item:?}");
+            ensure!(item != [0; N], "invalid quad: {item:?}");
 
             if (current_frame_size > min_frame_size && item[0] != previous_item[0])
                 || current_frame_size >= max_frame_size
@@ -628,6 +636,7 @@ impl<const N: usize> SortedArraysFile<N> {
     }
 
     pub fn file_len(&self) -> usize {
+        #![expect(clippy::expect_used)] // can't happen, or mmap() would have failed in the constructor
         self.data
             .len()
             .checked_mul(size_of::<u64>())
@@ -659,8 +668,8 @@ impl<const N: usize> SortedArraysFile<N> {
         let mut reader = BufBitReader::<LE, _>::new(MemWordReader::<u64, _>::new(data));
 
         let mut first_quad = from_bit_position == 0;
-        let mut actual_previous_item = [0usize; N];
-        let mut previous_item = [0usize; N];
+        let mut actual_previous_item = [0_usize; N];
+        let mut previous_item = [0_usize; N];
 
         reader
             .set_bit_pos(u64::try_from(from_bit_position).context("bit position overflowed u64")?)
@@ -677,7 +686,7 @@ impl<const N: usize> SortedArraysFile<N> {
 
         Ok(std::iter::repeat(()).map_while(move |()| {
             (|| {
-                let mut item = [0usize; N];
+                let mut item = [0_usize; N];
 
                 let new_frame = reader.read_bits(1).context("Could not read frame bit")? == 1;
                 let bit_pos = if new_frame {
@@ -723,18 +732,17 @@ impl<const N: usize> SortedArraysFile<N> {
                 if new_frame && item == [0; N] {
                     // zeroed item marks the end of the file
                     return Ok(None);
-                } else {
-                    assert!(
-                        item >= previous_item,
-                        "{item:?} {actual_previous_item:?} {previous_item:?}"
-                    );
-                    assert!(
-                        item >= actual_previous_item,
-                        "{item:?} {actual_previous_item:?} {previous_item:?}"
-                    );
-                    previous_item = item;
-                    actual_previous_item = item;
                 }
+                ensure!(
+                    item >= previous_item,
+                    "{item:?} {actual_previous_item:?} {previous_item:?}"
+                );
+                ensure!(
+                    item >= actual_previous_item,
+                    "{item:?} {actual_previous_item:?} {previous_item:?}"
+                );
+                previous_item = item;
+                actual_previous_item = item;
 
                 if first_quad {
                     // the very first quad
@@ -772,6 +780,7 @@ impl<const N: usize> SortedArraysFile<N> {
             }))
     }
 
+    #[expect(clippy::iter_not_returning_iterator)]
     /// Returns every quad in the given file
     pub fn iter(&self) -> Result<impl Iterator<Item = Result<[usize; N]>> + '_> {
         self.iter_from_position(0)
@@ -785,6 +794,7 @@ impl<const N: usize> SortedArraysFile<N> {
     }
 }
 
+#[cfg(test)]
 #[test]
 fn test_read_write_sorted_array() -> Result<()> {
     let tempdir = tempfile::tempdir().context("Could nto create temp dir")?;
@@ -794,9 +804,7 @@ fn test_read_write_sorted_array() -> Result<()> {
         quads.iter().copied().map(Ok),
         no_logging!(),
     )?;
-    assert_eq!(
-        array_file.iter()?.map(Result::unwrap).collect::<Vec<_>>(),
-        quads
-    );
+    let actual: Vec<_> = array_file.iter()?.map(Result::unwrap).collect();
+    ensure!(actual == quads, "Expected {quads:?}, got {actual:?}");
     Ok(())
 }

@@ -1,3 +1,5 @@
+#![allow(clippy::print_stderr)]
+
 use super::quads_store::{QuadOrder, QuadStoreConfiguration};
 use super::{quads_store, secondary_indexes, terms_mphf, terms_store};
 use crate::io::{RdfFormat, RdfParseError, RdfParser};
@@ -45,6 +47,7 @@ impl DatabaseBuilder {
         }
     }
 
+    #[must_use]
     pub fn with_quad_orders(self, quad_orders: Vec<QuadOrder>) -> Self {
         Self {
             quad_orders,
@@ -52,6 +55,7 @@ impl DatabaseBuilder {
         }
     }
 
+    #[must_use]
     pub fn with_approx_quads_per_file(self, approx_quads_per_file: Option<usize>) -> Self {
         Self {
             approx_quads_per_file,
@@ -59,6 +63,7 @@ impl DatabaseBuilder {
         }
     }
 
+    #[must_use]
     pub fn with_approx_num_quads(self, approx_quads_per_file: Option<usize>) -> Self {
         Self {
             approx_quads_per_file,
@@ -67,16 +72,19 @@ impl DatabaseBuilder {
     }
 
     /// Whether to regenerate files that already exist
+    #[must_use]
     pub fn with_rebuild(self, rebuild: bool) -> Self {
         Self { rebuild, ..self }
     }
 
+    #[must_use]
     pub fn with_parse_quad_args(self, parse_quad_args: Option<ParseQuadsArgs>) -> Self {
         Self {
             parse_quad_args,
             ..self
         }
     }
+    #[must_use]
     pub fn with_rdf_format_from_path(
         self,
         rdf_format_from_path: fn(&Path) -> Result<RdfFormat>,
@@ -151,7 +159,7 @@ impl DatabaseBuilder {
             .as_ref()
             .context("parse_quad_args not set")?;
         if !self.location.exists() {
-            std::fs::create_dir(&self.location)
+            std::fs::create_dir_all(&self.location)
                 .with_context(|| format!("Could not create {}", self.location.display()))?;
         }
         if parse_quad_args.parallel_parser {
@@ -206,10 +214,8 @@ impl DatabaseBuilder {
             log::info!("Skipping MPHF construction, already done.");
             return Ok(());
         }
-        let mphf = terms_mphf::build_terms_mphf(&self.terms_path())
-            .context("Could not build terms MPHF")?;
-        mphf.serialize(&mphf_path)
-            .with_context(|| format!("Could not write terms MPHF to {}", mphf_path.display()))
+        terms_mphf::build_terms_mphf(&self.terms_path(), &mphf_path)
+            .context("Could not build terms MPHF")
     }
 
     pub fn compress_all_quads_stores(&self) -> Result<()> {
@@ -250,7 +256,7 @@ impl DatabaseBuilder {
         let terms_mphf = terms_mphf::TermMphf::load(&mphf_path)
             .with_context(|| format!("Could not mmap terms MPHF from {}", mphf_path.display()))?;
         if !self.location.exists() {
-            std::fs::create_dir(&self.location)
+            std::fs::create_dir_all(&self.location)
                 .with_context(|| format!("Could not create {}", self.location.display()))?;
         }
 
@@ -396,7 +402,7 @@ fn get_parallel_iterator_from_sequential_parsers(
                     eprintln!("Parsing error in {file_name}: {e}");
                     None
                 }
-                quad => Some(quad.with_context(|| format!("Could not parse {file_name}"))),
+                _ => Some(quad.with_context(|| format!("Could not parse {file_name}"))),
             })
         })
         .flatten())
@@ -448,7 +454,7 @@ fn get_parallel_iterator_from_parallel_parsers(
                     eprintln!("Parsing error in {file_name}: {e}");
                     None
                 }
-                quad => Some(quad.with_context(|| format!("Could not parse {file_name}"))),
+                _ => Some(quad.with_context(|| format!("Could not parse {file_name}"))),
             })
         })
         .flatten())
@@ -510,98 +516,97 @@ fn get_parallel_quads<R: Read + Send + 'static>(
     let mut buf = Vec::with_capacity(buf_size);
     Ok(std::iter::repeat(())
         .map_while(move |()| -> Option<Result<_>> {
-            if !buf.is_empty() {
-                assert_eq!(buf[0], b'<', "buf={:?}", String::from_utf8_lossy(&buf));
-            }
+            (|| -> Result<Option<_>> {
+                if !buf.is_empty() {
+                    ensure!(buf[0] == b'<', "buf={:?}", String::from_utf8_lossy(&buf));
+                }
 
-            let num_bytes_in_buf = buf.len();
-            if num_bytes_in_buf >= buf_size {
-                // That's a big line. Build a chunk with only that line in it.
-                if let Err(e) = reader.read_until(b'\n', &mut buf) {
-                    return Some(Err(e).map_err(Into::into));
-                }
-                let mut chunk = Vec::new();
-                std::mem::swap(&mut chunk, &mut buf);
-                println!("big line: {}", String::from_utf8_lossy(&chunk));
-                return Some(Ok(chunk));
-            }
-            assert!(!buf.contains(&b'\0'), "{:?}", String::from_utf8_lossy(&buf));
-            buf.resize(buf_size, 0);
-            match reader.read(&mut buf[num_bytes_in_buf..]) {
-                Ok(0) =>
-                // reached end of file
-                {
-                    (num_bytes_in_buf > 0).then(|| {
-                        // one last chunk
-                        buf.shrink_to(num_bytes_in_buf);
-                        let mut chunk = Vec::with_capacity(buf_size);
-                        std::mem::swap(&mut chunk, &mut buf);
-                        eprintln!("last chunk: {:?}", String::from_utf8_lossy(&chunk));
-                        Ok(chunk)
-                    })
-                }
-                Ok(num_bytes_read) => {
-                    buf.resize(num_bytes_in_buf + num_bytes_read, 0);
-                    assert!(
-                        !buf.contains(&b'\0'),
-                        "{} {} {:?} {:?}",
-                        num_bytes_in_buf,
-                        num_bytes_read,
-                        buf.iter().enumerate().find(|(_i, c)| **c == b'\0'),
-                        String::from_utf8_lossy(&buf)
-                    );
-                    // look for last line break in the buffer
-                    let Some((last_linebreak, _)) =
-                        buf.iter().enumerate().rfind(|(_i, c)| **c == b'\n')
-                    else {
-                        // line is larger than the buffer. we'll deal with it next iteration
-                        return Some(Ok(Vec::new()));
-                    };
+                let num_bytes_in_buf = buf.len();
+                if num_bytes_in_buf >= buf_size {
+                    // That's a big line. Build a chunk with only that line in it.
+                    if let Err(e) = reader.read_until(b'\n', &mut buf) {
+                        return Err(e.into());
+                    }
                     let mut chunk = Vec::new();
                     std::mem::swap(&mut chunk, &mut buf);
-                    assert!(
-                        !chunk.contains(&b'\0'),
-                        "{:?}",
-                        String::from_utf8_lossy(&chunk)
-                    );
-                    assert!(!buf.contains(&b'\0'), "{:?}", String::from_utf8_lossy(&buf));
-                    buf.extend(chunk.drain(last_linebreak + 1..)); // move the start of the next line
-                    assert!(
-                        !chunk.contains(&b'\0'),
-                        "{:?}",
-                        String::from_utf8_lossy(&chunk)
-                    );
-                    assert!(!buf.contains(&b'\0'), "{:?}", String::from_utf8_lossy(&buf));
-                    // println!("normal chunk: {}", String::from_utf8_lossy(&chunk));
-                    // println!("drained: {}", String::from_utf8_lossy(&buf));
-                    assert_eq!(chunk[0], b'<', "{}", String::from_utf8_lossy(&chunk));
-                    assert_eq!(
-                        chunk[chunk.len() - 1],
-                        b'\n',
-                        "{}",
-                        String::from_utf8_lossy(&chunk)
-                    );
-                    assert_eq!(
-                        chunk[chunk.len() - 2],
-                        b'.',
-                        "{}",
-                        String::from_utf8_lossy(&chunk)
-                    );
-                    if !buf.is_empty() {
-                        assert_eq!(
-                            buf[0],
-                            b'<',
-                            "chunk={:?} buf={:?}",
-                            String::from_utf8_lossy(&chunk),
+                    return Ok(Some(chunk));
+                }
+                ensure!(!buf.contains(&b'\0'), "{:?}", String::from_utf8_lossy(&buf));
+                buf.resize(buf_size, 0);
+                match reader.read(&mut buf[num_bytes_in_buf..]) {
+                    Ok(0) =>
+                    // reached end of file
+                    {
+                        if num_bytes_in_buf > 0 {
+                            // one last chunk
+                            buf.shrink_to(num_bytes_in_buf);
+                            let mut chunk = Vec::with_capacity(buf_size);
+                            std::mem::swap(&mut chunk, &mut buf);
+                            // Last chunk
+                            Ok(Some(chunk))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    Ok(num_bytes_read) => {
+                        buf.resize(num_bytes_in_buf + num_bytes_read, 0);
+                        ensure!(
+                            !buf.contains(&b'\0'),
+                            "{} {} {:?} {:?}",
+                            num_bytes_in_buf,
+                            num_bytes_read,
+                            buf.iter().enumerate().find(|(_i, c)| **c == b'\0'),
                             String::from_utf8_lossy(&buf)
                         );
+                        // look for last line break in the buffer
+                        let Some((last_linebreak, _)) =
+                            buf.iter().enumerate().rfind(|(_i, c)| **c == b'\n')
+                        else {
+                            // line is larger than the buffer. we'll deal with it next iteration
+                            return Ok(Some(Vec::new()));
+                        };
+                        let mut chunk = Vec::new();
+                        std::mem::swap(&mut chunk, &mut buf);
+                        ensure!(
+                            !chunk.contains(&b'\0'),
+                            "{:?}",
+                            String::from_utf8_lossy(&chunk)
+                        );
+                        ensure!(!buf.contains(&b'\0'), "{:?}", String::from_utf8_lossy(&buf));
+                        buf.extend(chunk.drain(last_linebreak + 1..)); // move the start of the next line
+                        ensure!(
+                            !chunk.contains(&b'\0'),
+                            "{:?}",
+                            String::from_utf8_lossy(&chunk)
+                        );
+                        ensure!(!buf.contains(&b'\0'), "{:?}", String::from_utf8_lossy(&buf));
+                        // println!("normal chunk: {}", String::from_utf8_lossy(&chunk));
+                        // println!("drained: {}", String::from_utf8_lossy(&buf));
+                        ensure!(chunk[0] == b'<', "{}", String::from_utf8_lossy(&chunk));
+                        ensure!(
+                            chunk[chunk.len() - 1] == b'\n',
+                            "{}",
+                            String::from_utf8_lossy(&chunk)
+                        );
+                        ensure!(
+                            chunk[chunk.len() - 2] == b'.',
+                            "{}",
+                            String::from_utf8_lossy(&chunk)
+                        );
+                        if !buf.is_empty() {
+                            ensure!(
+                                buf[0] == b'<',
+                                "chunk={:?} buf={:?}",
+                                String::from_utf8_lossy(&chunk),
+                                String::from_utf8_lossy(&buf)
+                            );
+                        }
+                        Ok(Some(chunk))
                     }
-                    Some(Ok(chunk))
+                    Err(e) => Err(e).with_context(|| format!("Could not read from {reader_name}")),
                 }
-                Err(e) => {
-                    Some(Err(e).with_context(|| format!("Could not read from {reader_name}")))
-                }
-            }
+            })()
+            .transpose()
         })
         .par_bridge()
         .flat_map_iter(move |chunk| match chunk {

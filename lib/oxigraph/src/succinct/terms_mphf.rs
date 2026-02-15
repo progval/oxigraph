@@ -4,11 +4,9 @@ use crate::succinct::terms_store::{deserialize_term, serialize_graph_name, seria
 use anyhow::{Context, Result, ensure};
 use bytemuck::TransparentWrapper;
 use dsi_progress_logger::{ProgressLog, progress_logger};
-use epserde::deser::{
-    Deserialize as EpDeserialize, DeserializeInner as EpDeserializeInner, MemCase,
-};
+use epserde::deser::{DeserInner as EpDeserInner, Deserialize as EpDeserialize, MemCase};
 use epserde::ser::Serialize as EpSerialize;
-use lender::{Lender, Lending};
+use lender::{FallibleLender, FallibleLending};
 use std::borrow::Borrow;
 use std::fs::File;
 use std::hash::Hasher;
@@ -17,7 +15,7 @@ use std::path::Path;
 use sux::bits::bit_field_vec::BitFieldVec;
 use sux::func::{VBuilder, VFunc};
 use sux::traits::bit_field_slice::BitFieldSlice;
-use sux::utils::{FromIntoIterator, RewindableIoLender};
+use sux::utils::FallibleRewindableLender;
 
 /// workaround while https://github.com/vigna/sux-rs/pull/78 is not merged
 #[derive(Debug, TransparentWrapper)]
@@ -61,6 +59,11 @@ pub trait TermHasher {
     /// Returns the number of known terms
     fn len(&self) -> usize;
 
+    /// Returns true if there are no known terms
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     fn hash_bytes(&self, s: impl AsRef<[u8]>) -> Result<usize>;
 
     fn hash_namedorblanknode(&self, term: &NamedOrBlankNode) -> Result<usize> {
@@ -75,49 +78,63 @@ pub trait TermHasher {
     }
 
     fn hash_graphname(&self, graph_name: &GraphName) -> Result<usize> {
-        self.hash_bytes(serialize_graph_name(graph_name)?)
+        self.hash_bytes(serialize_graph_name(graph_name))
     }
 }
 
-pub struct TermMphf<D: BitFieldSlice<usize> = BitFieldVec<usize>> {
-    vfunc: MemCase<VFunc<RawTerm, usize, D>>,
+pub struct TermMphf<
+    D: BitFieldSlice<usize> = BitFieldVec<usize>,
+    V: EpDeserInner = VFunc<RawTerm, usize, D>,
+> where
+    for<'a> D: EpDeserInner<DeserType<'a>: BitFieldSlice<usize>>,
+{
+    vfunc: MemCase<V>,
     marker: PhantomData<D>,
 }
 
-pub type DefaultDeserializedTermMphf =
-    TermMphf<<BitFieldVec<usize> as EpDeserializeInner>::DeserType<'static>>;
+pub type DefaultDeserializedTermMphf = TermMphf<BitFieldVec<usize>>;
 
-impl<D: BitFieldSlice<usize>> TermHasher for TermMphf<D> {
+impl<D: BitFieldSlice<usize>> TermHasher for TermMphf<D>
+where
+    for<'a> D: EpDeserInner<DeserType<'a>: BitFieldSlice<usize>>,
+{
     fn len(&self) -> usize {
-        self.vfunc.len()
+        self.vfunc.uncase().len()
     }
 
     fn hash_bytes(&self, s: impl AsRef<[u8]>) -> Result<usize> {
+        let vfunc = self.vfunc.uncase();
+
         // TODO check in the list of terms store that it is not a collision
-        let hash = self.vfunc.get(RawTerm::wrap_ref(s.as_ref()));
+        let hash = vfunc.get(RawTerm::wrap_ref(s.as_ref()));
         ensure!(
-            hash < self.vfunc.len(),
+            hash < vfunc.len(),
             "hash={hash} for vfunc of length={}",
-            self.vfunc.len()
+            vfunc.len()
         );
         Ok(hash)
     }
 }
 
-impl<D: BitFieldSlice<usize>> TermMphf<D> {
+impl<D: BitFieldSlice<usize>> TermMphf<D, epserde::deser::Owned<VFunc<RawTerm, usize, D>>>
+where
+    for<'a> D: EpDeserInner<DeserType<'a>: BitFieldSlice<usize>>,
+    VFunc<RawTerm, usize, D>: EpSerialize,
+{
     pub fn serialize(&self, path: impl AsRef<Path>) -> Result<()>
     where
         VFunc<RawTerm, usize, D>: EpSerialize,
     {
         let path = path.as_ref();
-        std::fs::create_dir(&path)
+        std::fs::create_dir_all(path)
             .with_context(|| format!("Could not create {}", path.display()))?;
 
         let vfunc_path = path.join("mphf.vfunc");
         let mut file = File::create(&vfunc_path)
             .with_context(|| format!("Could not create {}", vfunc_path.display()))?;
-        self.vfunc
-            .serialize(&mut file)
+        // SAFETY: this may leak padding bytes, but we only read data that is to be shared
+        // alongside the vfunc.
+        unsafe { self.vfunc.uncase().serialize(&mut file) }
             .with_context(|| format!("Could write VFunc to {}", vfunc_path.display()))?;
         Ok(())
     }
@@ -130,28 +147,25 @@ impl TermMphf<BitFieldVec<usize>> {
     /// If you used `mmap` and a program that should maximize CPU usage does not,
     /// this is probably why. This can be seen as page faults in the `VFunc::get_by_sig`
     /// function when profiling eg. with `cargo flamegraph`.
-    pub fn mmap(
-        path: impl AsRef<Path>,
-    ) -> Result<TermMphf<<BitFieldVec<usize> as EpDeserializeInner>::DeserType<'static>>> {
+    pub fn mmap(path: impl AsRef<Path>) -> Result<TermMphf<BitFieldVec<usize>>> {
         let path = path.as_ref();
         let vfunc_path = path.join("mphf.vfunc");
 
         let flags = epserde::deser::mem_case::Flags::RANDOM_ACCESS;
-        let vfunc = <VFunc<RawTerm, usize, BitFieldVec<usize>>>::mmap(&vfunc_path, flags)
-            .with_context(|| format!("Could mmap VFunc from {}", vfunc_path.display()))?;
+        let vfunc =
+            unsafe { <VFunc<RawTerm, usize, BitFieldVec<usize>>>::mmap(&vfunc_path, flags) }
+                .with_context(|| format!("Could mmap VFunc from {}", vfunc_path.display()))?;
         Ok(TermMphf {
             vfunc,
             marker: PhantomData,
         })
     }
 
-    pub fn load(
-        path: impl AsRef<Path>,
-    ) -> Result<TermMphf<<BitFieldVec<usize> as EpDeserializeInner>::DeserType<'static>>> {
+    pub fn load(path: impl AsRef<Path>) -> Result<TermMphf<BitFieldVec<usize>>> {
         let path = path.as_ref();
         let vfunc_path = path.join("mphf.vfunc");
 
-        let vfunc = <VFunc<RawTerm, usize, BitFieldVec<usize>>>::load_mem(&vfunc_path)
+        let vfunc = unsafe { <VFunc<RawTerm, usize, BitFieldVec<usize>>>::load_mem(&vfunc_path) }
             .with_context(|| format!("Could load VFunc from {}", vfunc_path.display()))?;
         Ok(TermMphf {
             vfunc,
@@ -160,31 +174,27 @@ impl TermMphf<BitFieldVec<usize>> {
     }
 }
 
-pub fn build_terms_mphf(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
+pub fn build_terms_mphf(dir: &Path, dest: &Path) -> Result<()> {
     let (config, terms_files) = list_terms_files(dir)?;
     let dictionary = config.get_dictionary(dir)?;
 
-    let terms_lender = RewindableIoFlattenLender::new(
+    let terms_lender = FallibleRewindableFlattenLender::new(
         terms_files
             .iter()
             .map(|terms_file| {
                 let TermsFile {
-                    first_term_id: _,
-                    num_terms: _,
-                    path,
-                    compressed_frames,
+                    compressed_frames, ..
                 } = terms_file;
 
-                sux::utils::FromResultLenderFactory::new(|| {
-                    Ok(FrameLender::new(compressed_frames, config.terms_per_frame)
-                        .with_context(|| format!("Could not decompress {}", path.display()))
-                        .map_err(DecodeError)?
+                sux::utils::FromIntoFallibleLenderFactory::new(|| {
+                    Ok(super::from_iter_ref::from_iter_ref(
+                        FrameLender::new(compressed_frames, config.terms_per_frame)
+                        .map_err(DecodeError) // on Result<Item>
                         .map(
-                            lender::hrc_mut!(for<'all> |term: Result<&'all [u8]>| -> Result<
+                            lender::hrc_mut!(for<'all> |term: &'all [u8]| -> Result<
                                     BoxedRawTerm,
                                     DecodeError,
                                 > {
-                                    let term = term.map_err(DecodeError)?;
                                     let term = if term.is_empty() {
                                         // FIXME: that's GraphName::DefaultGraph because we currently store
                                         // graph names in the terms store, but we shouldn't.
@@ -207,7 +217,9 @@ pub fn build_terms_mphf(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
                                     };
                                     Ok(BoxedRawTerm(term.into()))
                                 }),
-                        ))
+                        )
+                        .iter(),
+                    ))
                 })
             })
             .collect::<Result<_, DecodeError>>()?,
@@ -226,15 +238,18 @@ pub fn build_terms_mphf(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
         .offline(true) // Save memory by spilling to disk
         .low_mem(true) // Save memory by using slightly more CPU;
         ;
-    let vfunc = MemCase::encase(
-        builder
-            .try_build_func::<RawTerm, BoxedRawTerm>(
-                terms_lender,
-                FromIntoIterator::from(0..config.num_terms),
-                &mut pl,
-            )
-            .context("Could not build VFunc")?,
+    let Ok(counting_lender) = sux::utils::lenders::FromIntoFallibleLenderFactory::new(
+        || -> Result<_, std::convert::Infallible> {
+            Ok(super::from_iter_ref::from_iter_ref(
+                fallible_iterator::convert(
+                    (0..config.num_terms).map(Ok::<_, std::convert::Infallible>),
+                ),
+            ))
+        },
     );
+    let vfunc = builder
+        .try_build_func::<RawTerm, BoxedRawTerm>(terms_lender, counting_lender, &mut pl)
+        .context("Could not build VFunc")?;
     pl.done();
 
     ensure!(
@@ -244,10 +259,15 @@ pub fn build_terms_mphf(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
         config.num_terms
     );
 
-    Ok(TermMphf {
-        vfunc,
+    let terms_mphf = TermMphf {
+        vfunc: MemCase::<epserde::deser::Owned<VFunc<RawTerm, usize, BitFieldVec<usize>>>>::encase(
+            vfunc,
+        ),
         marker: PhantomData,
-    })
+    };
+    terms_mphf
+        .serialize(&dest)
+        .with_context(|| format!("Could not write terms MPHF to {}", dest.display()))
 }
 
 // Reads a compressed terms file using [`super::terms_store::FrameLender`] on each frame
@@ -297,7 +317,7 @@ pub fn build_terms_mphf(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
 // }
 // }
 //
-// impl<R: BufRead + Seek> RewindableIoLender<BoxedRawTerm> for ZstdLengthPrefixedStringLender<R> {
+// impl<R: BufRead + Seek> FallibleRewindableLender<BoxedRawTerm> for ZstdLengthPrefixedStringLender<R> {
 // type Error = DecodeError;
 //
 // fn rewind(mut self) -> Result<Self, Self::Error> {
@@ -314,13 +334,13 @@ pub fn build_terms_mphf(dir: &Path) -> Result<TermMphf<BitFieldVec<usize>>> {
 #[error("{0}")]
 struct DecodeError(#[from] anyhow::Error);
 
-/// Equivalent to [`Lender::flatten`] but implements [`RewindableIoLender`]
-struct RewindableIoFlattenLender<L> {
+/// Equivalent to [`Lender::flatten`] but implements [`FallibleRewindableLender`]
+struct FallibleRewindableFlattenLender<L> {
     lenders: Vec<L>,
     current_index: usize,
 }
 
-impl<L> RewindableIoFlattenLender<L> {
+impl<L> FallibleRewindableFlattenLender<L> {
     pub fn new(lenders: Vec<L>) -> Self {
         Self {
             lenders,
@@ -329,12 +349,16 @@ impl<L> RewindableIoFlattenLender<L> {
     }
 }
 
-impl<'lend, L: Lending<'lend>> Lending<'lend> for RewindableIoFlattenLender<L> {
+impl<'lend, L: FallibleLending<'lend>> FallibleLending<'lend>
+    for FallibleRewindableFlattenLender<L>
+{
     type Lend = L::Lend;
 }
 
-impl<L: Lender> Lender for RewindableIoFlattenLender<L> {
-    fn next(&mut self) -> Option<<Self as Lending<'_>>::Lend> {
+impl<L: FallibleLender> FallibleLender for FallibleRewindableFlattenLender<L> {
+    type Error = L::Error;
+
+    fn next(&mut self) -> Result<Option<<Self as FallibleLending<'_>>::Lend>, Self::Error> {
         // This is equivalent to:
         //
         //  while let Some(current_lender) = self.lenders.get_mut(self.current_index) {
@@ -349,26 +373,23 @@ impl<L: Lender> Lender for RewindableIoFlattenLender<L> {
         //
         //  but the borrow-checker forces us to write it this way because it doesn't understand we
         //  only borrow one lender at a time.
-        self.lenders[self.current_index..]
-            .iter_mut()
-            .flat_map(|current_lender| {
-                if let Some(item) = current_lender.next() {
-                    return Some(item);
-                }
+        for current_lender in &mut self.lenders[self.current_index..] {
+            if let Some(item) = current_lender.next()? {
+                return Ok(Some(item));
+            }
 
-                // exhausted the current lender, go to the next one
-                self.current_index += 1;
+            // exhausted the current lender, go to the next one
+            self.current_index += 1;
+        }
 
-                None
-            })
-            .next()
+        Ok(None)
     }
 }
 
-impl<T, L: RewindableIoLender<T>> RewindableIoLender<T> for RewindableIoFlattenLender<L> {
-    type Error = <L as RewindableIoLender<T>>::Error;
+impl<L: FallibleRewindableLender> FallibleRewindableLender for FallibleRewindableFlattenLender<L> {
+    type RewindError = <L as FallibleRewindableLender>::RewindError;
 
-    fn rewind(mut self) -> Result<Self, Self::Error> {
+    fn rewind(mut self) -> Result<Self, Self::RewindError> {
         let mut new_lenders = Vec::with_capacity(self.lenders.len());
         for lender in self
             .lenders
@@ -376,7 +397,7 @@ impl<T, L: RewindableIoLender<T>> RewindableIoLender<T> for RewindableIoFlattenL
         {
             new_lenders.push(lender.rewind()?);
         }
-        new_lenders.extend(self.lenders.drain(..));
+        new_lenders.append(&mut self.lenders);
         std::mem::swap(&mut new_lenders, &mut self.lenders);
         self.current_index = 0;
         Ok(self)

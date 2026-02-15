@@ -16,7 +16,7 @@ rust-version.workspace = true
 [features]
 default = ["rocksdb", "succinct"]
 rocksdb = ["oxrocksdb-sys"]
-succinct = ["anyhow", "bytemuck", "clap", "deko", "dsi-progress-logger", "dsi-bitstream", "deko", "epserde", "lender", "log", "itertools", "mmap-rs", "quick_cache", "rayon", "rdst", "serde", "serde/derive", "serde_json", "sux", "tempfile", "thread_local", "tiny-varint", "webgraph", "webgraph-algo", "webgraph-cli"]
+succinct = ["anyhow", "bytemuck", "clap", "deko", "dsi-progress-logger", "dsi-bitstream", "deko", "epserde", "fallible-iterator", "lender", "log", "itertools", "mmap-rs", "quick_cache", "rayon", "rdst", "serde", "serde/derive", "serde_json", "sux", "tempfile", "thread_local", "tiny-varint", "value-traits", "webgraph", "webgraph-algo", "webgraph-cli"]
 js = ["getrandom/wasm_js", "oxsdatatypes/js", "js-sys"]
 http-client = ["oxhttp"]
 http-client-native-tls = ["http-client", "oxhttp/native-tls"]
@@ -53,6 +53,7 @@ deko = { workspace = true, optional = true }
 dsi-progress-logger = { workspace = true, optional = true }
 dsi-bitstream = { workspace = true, optional = true }
 epserde = { workspace = true, optional = true }
+fallible-iterator = { workspace = true, optional = true }
 lender = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
 itertools = { workspace = true, optional = true }
@@ -66,6 +67,7 @@ sux = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 thread_local = { workspace = true, optional = true }
 tiny-varint = { workspace = true, optional = true }
+value-traits = { workspace = true, optional = true }
 webgraph = { workspace = true, optional = true }
 webgraph-algo = { workspace = true, optional = true }
 webgraph-cli = { workspace = true, optional = true }

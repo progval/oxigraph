@@ -2,15 +2,14 @@ use super::sort::ExternalDeduplicatingStringSorter;
 use crate::model::{GraphName, Quad, Term};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use dsi_progress_logger::{ProgressLog, concurrent_progress_logger, progress_logger};
+use epserde::deser::Deserialize as EpDeserialize;
 use epserde::deser::mem_case::{Flags, MemCase};
-use epserde::deser::{Deserialize as EpDeserialize, DeserializeInner as EpDeserializeInner};
 use epserde::ser::Serialize as EpSerialize;
 use itertools::Itertools;
-use lender::{Lender, Lending};
+use lender::{FallibleLender, FallibleLending};
 use mmap_rs::Mmap;
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{BlankNode, Literal, NamedNode, NamedNodeRef};
-use quick_cache::sync::Cache;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -19,7 +18,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use sux::dict::elias_fano::{EfSeq, EfSeqDict, EliasFanoBuilder};
 use sux::traits::IndexedSeq;
-use sux::utils::RewindableIoLender;
+use sux::utils::lenders::FallibleRewindableLender;
 
 // Increasing either these values doesn't give noticeably better compression on wikidata-20240320-truthy-BETA.
 pub const DEFAULT_ZSTD_TRAINING_SAMPLES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
@@ -35,7 +34,7 @@ pub(super) fn write_length_prefixed_string(
         .write_all(
             &u32::try_from(string.len())
                 .with_context(|| format!("String is longer than {} bytes", u32::MAX))?
-                .to_ne_bytes(),
+                .to_le_bytes(),
         )
         .with_context(|| format!("Could not write to {}", path.display()))?;
 
@@ -57,16 +56,14 @@ pub(super) fn read_length_prefixed_string<R: Read>(
         }
         Err(e).context("Could not read next string's length")?;
     }
-    let length = usize::try_from(u32::from_ne_bytes(length_bytes))
+    let length = usize::try_from(u32::from_le_bytes(length_bytes))
         .with_context(|| format!("String is longer than {} bytes", usize::MAX))?;
     let mut string = vec![0; length];
     file.read_exact(&mut string).with_context(|| {
         if let Some(position) = get_position(file) {
             format!(
                 "Could not read next string of length {length} from offset {}",
-                position
-                    .map(|pos| pos.to_string())
-                    .unwrap_or_else(|e| format!("<error: {e}>")),
+                position.map_or_else(|e| format!("<error: {e}>"), |pos| pos.to_string()),
             )
         } else {
             format!("Could not read next string of length {length}",)
@@ -86,26 +83,25 @@ pub fn serialize_term(term: &Term, dictionary: Option<&TermDictionary>) -> Resul
     match term {
         Term::NamedNode(nn) => Ok([TERM_TYPE_NAMED_NODE]
             .into_iter()
-            .chain(nn.as_str().as_bytes().into_iter().copied())
+            .chain(nn.as_str().as_bytes().iter().copied())
             .collect()),
         Term::BlankNode(bn) => Ok([TERM_TYPE_BLANK_NODE]
             .into_iter()
-            .chain(bn.as_str().as_bytes().into_iter().copied())
+            .chain(bn.as_str().as_bytes().iter().copied())
             .collect()),
         Term::Literal(lit) => match (lit.language(), lit.datatype()) {
             (None, xsd::STRING) => Ok([TERM_TYPE_LITERAL_SIMPLE]
                 .into_iter()
-                .chain(lit.value().as_bytes().into_iter().copied())
+                .chain(lit.value().as_bytes().iter().copied())
                 .collect()),
             (Some(lang), rdf::LANG_STRING) => Ok([TERM_TYPE_LITERAL_LANGUAGE]
                 .into_iter()
-                .chain(lit.value().as_bytes().into_iter().copied())
-                .chain(lang.as_bytes().into_iter().copied())
+                .chain(lit.value().as_bytes().iter().copied())
+                .chain(lang.as_bytes().iter().copied())
                 .chain(
-                    u16::try_from(lang.as_bytes().len())
+                    u16::try_from(lang.len())
                         .context("Language is 2^16 bytes or longer")?
-                        .to_be_bytes()
-                        .into_iter(),
+                        .to_be_bytes(),
                 )
                 .collect()),
             (None, datatype) => match dictionary
@@ -114,18 +110,17 @@ pub fn serialize_term(term: &Term, dictionary: Option<&TermDictionary>) -> Resul
             {
                 Some(datatype_id) => Ok([TERM_TYPE_LITERAL_TYPED_IN_DICT]
                     .into_iter()
-                    .chain(lit.value().as_bytes().into_iter().copied())
-                    .chain(datatype_id.to_be_bytes().into_iter())
+                    .chain(lit.value().as_bytes().iter().copied())
+                    .chain(datatype_id.to_be_bytes())
                     .collect()),
                 None => Ok([TERM_TYPE_LITERAL_TYPED]
                     .into_iter()
-                    .chain(lit.value().as_bytes().into_iter().copied())
-                    .chain(datatype.as_str().as_bytes().into_iter().copied())
+                    .chain(lit.value().as_bytes().iter().copied())
+                    .chain(datatype.as_str().as_bytes().iter().copied())
                     .chain(
-                        u32::try_from(datatype.as_str().as_bytes().len())
+                        u32::try_from(datatype.as_str().len())
                             .context("Datatype is 2^32 bytes or longer")?
-                            .to_be_bytes()
-                            .into_iter(),
+                            .to_be_bytes(),
                     )
                     .collect()),
             },
@@ -140,7 +135,7 @@ pub fn serialize_term(term: &Term, dictionary: Option<&TermDictionary>) -> Resul
 
 pub fn deserialize_term(bytes: &[u8], dictionary: Option<&TermDictionary>) -> Result<Term> {
     let &tag = bytes
-        .get(0)
+        .first()
         .context("Empty byte string is not a valid term")?;
     Ok(match tag {
         TERM_TYPE_NAMED_NODE => Term::NamedNode(NamedNode::new_unchecked(
@@ -157,8 +152,14 @@ pub fn deserialize_term(bytes: &[u8], dictionary: Option<&TermDictionary>) -> Re
                 .len()
                 .checked_sub(size_of::<u16>())
                 .context("Language tagged literal is too short")?;
-            let lang_length = usize::from(u16::from_be_bytes(bytes[lang_length_offset..].try_into().unwrap()));
-            let lang_offset = lang_length_offset.checked_sub(lang_length).unwrap();
+            let lang_length = usize::from(u16::from_be_bytes(
+                bytes[lang_length_offset..]
+                    .try_into()
+                    .context("invalid lang_length_offset")?, // can't happen
+            ));
+            let lang_offset = lang_length_offset
+                .checked_sub(lang_length)
+                .context("Language offset underflow")?;
 
             Term::Literal(Literal::new_language_tagged_literal_unchecked(
                 str::from_utf8(&bytes[1..lang_offset])
@@ -172,7 +173,11 @@ pub fn deserialize_term(bytes: &[u8], dictionary: Option<&TermDictionary>) -> Re
             let type_id_offset = bytes.len().checked_sub(type_id_size).context(
                 "Datatype-in-dict tagged literal in store is smaller than size_of<u32>()+1",
             )?;
-            let type_id = u32::from_be_bytes(bytes[type_id_offset..].try_into().unwrap());
+            let type_id = u32::from_be_bytes(
+                bytes[type_id_offset..]
+                    .try_into()
+                    .context("Invalid type ID bytes")?,
+            );
             let type_ = dictionary
                 .context("Terms store was compressed with a dictionary, but no dictionary was given to decompress")?
                 .get_datatype(type_id)
@@ -188,7 +193,11 @@ pub fn deserialize_term(bytes: &[u8], dictionary: Option<&TermDictionary>) -> Re
                 .len()
                 .checked_sub(size_of::<u32>())
                 .context("Language tag literal in store is smaller than size_of<u32>()+1")?;
-            let type_length = u32::from_be_bytes(bytes[type_length_offset..].try_into().unwrap());
+            let type_length = u32::from_be_bytes(
+                bytes[type_length_offset..]
+                    .try_into()
+                    .context("Invalid type length bytes")?,
+            );
             let type_length = usize::try_from(type_length).context("Datatype overflowed usize")?;
             let type_offset = type_length_offset
                 .checked_sub(type_length)
@@ -207,7 +216,7 @@ pub fn deserialize_term(bytes: &[u8], dictionary: Option<&TermDictionary>) -> Re
     })
 }
 
-pub fn serialize_graph_name(graph_name: &GraphName) -> Result<Vec<u8>> {
+pub fn serialize_graph_name(graph_name: &GraphName) -> Vec<u8> {
     match graph_name {
         GraphName::DefaultGraph => {
             // The empty string is very handy in datasets that have most of their quads
@@ -218,21 +227,21 @@ pub fn serialize_graph_name(graph_name: &GraphName) -> Result<Vec<u8>> {
             // And because we use gamma coding
             // (https://docs.rs/dsi-bitstream/latest/dsi_bitstream/codes/index.html),
             // 0 is encoded as a single bit whereas any other value takes at least four bits.
-            Ok(Vec::new())
+            Vec::new()
         }
-        GraphName::NamedNode(nn) => Ok([TERM_TYPE_NAMED_NODE]
+        GraphName::NamedNode(nn) => [TERM_TYPE_NAMED_NODE]
             .into_iter()
-            .chain(nn.as_str().as_bytes().into_iter().copied())
-            .collect()),
-        GraphName::BlankNode(bn) => Ok([TERM_TYPE_BLANK_NODE]
+            .chain(nn.as_str().as_bytes().iter().copied())
+            .collect(),
+        GraphName::BlankNode(bn) => [TERM_TYPE_BLANK_NODE]
             .into_iter()
-            .chain(bn.as_str().as_bytes().into_iter().copied())
-            .collect()),
+            .chain(bn.as_str().as_bytes().iter().copied())
+            .collect(),
     }
 }
 
 pub fn deserialize_graph_name(bytes: &[u8]) -> Result<GraphName> {
-    match bytes.get(0).copied() {
+    match bytes.first().copied() {
         None => Ok(GraphName::DefaultGraph),
         Some(TERM_TYPE_NAMED_NODE) => Ok(GraphName::NamedNode(NamedNode::new_unchecked(
             str::from_utf8(&bytes[1..]).context("Non-UTF8 NamedNode in store")?,
@@ -247,7 +256,7 @@ pub fn deserialize_graph_name(bytes: &[u8]) -> Result<GraphName> {
 pub struct TermDictionary {
     name: String,
     datatypes: Mmap,
-    datatypes_offsets: MemCase<<EfSeq as EpDeserializeInner>::DeserType<'static>>,
+    datatypes_offsets: MemCase<EfSeq>,
 }
 
 impl TermDictionary {
@@ -270,7 +279,7 @@ impl TermDictionary {
                 .context("TermDictionary path cannot be root")?
                 .to_str()
                 .context("TermDictionary file name is not valid UTF-8")?
-                .to_string(),
+                .to_owned(),
             datatypes: unsafe {
                 mmap_rs::MmapOptions::new(datatypes_file_len)
                     .context("Could not initialize mmap")?
@@ -278,13 +287,15 @@ impl TermDictionary {
                     .map()
                     .with_context(|| format!("Could not mmap {}", datatypes_path.display()))?
             },
-            datatypes_offsets: EfSeq::mmap(&datatypes_offsets_path, Flags::RANDOM_ACCESS)
-                .with_context(|| {
-                    format!(
-                        "Could not epdeserialize frames index from {}",
-                        datatypes_offsets_path.display()
-                    )
-                })?,
+            datatypes_offsets: unsafe {
+                EfSeq::mmap(&datatypes_offsets_path, Flags::RANDOM_ACCESS)
+            }
+            .with_context(|| {
+                format!(
+                    "Could not epdeserialize frames index from {}",
+                    datatypes_offsets_path.display()
+                )
+            })?,
         })
     }
 
@@ -309,10 +320,8 @@ impl TermDictionary {
             .into_par_iter()
             .map_with(pl.clone(), |pl, terms_file| {
                 let TermsFile {
-                    first_term_id: _,
-                   num_terms: _,
-                    path: _,
                     compressed_frames,
+                    ..
                 } = terms_file;
                 let compressed_frames = compressed_frames.as_ref();
 
@@ -320,14 +329,13 @@ impl TermDictionary {
                 let max_num_files = 10;
 
                 let mut namednode_sorter  = ExternalDeduplicatingStringSorter::new(
-                    max_buffer_size, max_num_files).context("Could not initialize sorter")?;
+                    max_buffer_size, max_num_files);
 
                 let mut push_namednode = |nn: NamedNodeRef<'_>| namednode_sorter.push_boxed_bytes(nn.as_str().as_bytes().to_vec().into());
                 push_namednode(xsd::STRING)?;
 
-                FrameLender::new(compressed_frames, config.terms_per_frame)?
-                    .try_for_each(|term| {
-                    let term = term?;
+                FrameLender::new(compressed_frames, config.terms_per_frame)
+                    .for_each(|term| {
                         if term.is_empty() {
                             // FIXME: that's GraphName::DefaultGraph because we currently store
                             // graph names in the terms store, but we shouldn't.
@@ -357,8 +365,7 @@ impl TermDictionary {
             })
             .reduce(
                 || {
-                    ExternalDeduplicatingStringSorter::new(100 * 1024 * 1024, 10)
-                        .context("Could not create reducer ExternalDeduplicatingStringSorter")
+                    Ok(ExternalDeduplicatingStringSorter::new(100 * 1024 * 1024, 10))
                 },
                 |left, right| {
                     left?
@@ -383,8 +390,8 @@ impl TermDictionary {
         let file = File::create_new(&datatypes_path)
             .with_context(|| format!("Could not create {}", datatypes_path.display()))?;
         let mut writer = BufWriter::new(file);
-        let mut num_datatypes = 0usize;
-        let mut file_len = 0usize;
+        let mut num_datatypes = 0_usize;
+        let mut file_len = 0_usize;
         for datatype in unique_sorted_datatypes
             .drain_boxed_bytes()
             .context("Could not read deduplicated datatypes")?
@@ -420,7 +427,7 @@ impl TermDictionary {
         let mut reader = BufReader::new(file);
         let mut efb = EliasFanoBuilder::new(num_datatypes + 1, file_len);
         efb.push(0);
-        let mut offset = 0usize;
+        let mut offset = 0_usize;
         for i in 0..num_datatypes {
             let datatype = read_length_prefixed_string(&mut reader, |reader| {
                 Some(reader.stream_position().map_err(Into::into))
@@ -440,7 +447,9 @@ impl TermDictionary {
         let datatypes_index_path = dict_dir.path().join("datatypes.ef");
         let mut index_file = File::create(&datatypes_index_path)
             .with_context(|| format!("Could not create {}", datatypes_index_path.display()))?;
-        ef.serialize(&mut index_file).with_context(|| {
+        // SAFETY: this may leak padding bytes, but we only read data that is to be shared
+        // alongside the index.
+        unsafe { ef.serialize(&mut index_file) }.with_context(|| {
             format!(
                 "Could not write Elias-Fano index to {}",
                 datatypes_index_path.display()
@@ -460,11 +469,11 @@ impl TermDictionary {
     fn get_datatype_id(&self, datatype: NamedNodeRef<'_>) -> Result<Option<u32>> {
         // TODO: use VFunc instead of bisection
         let mut left = 0;
-        let mut right = u32::try_from(self.datatypes_offsets.len() - 1)
+        let mut right = u32::try_from(self.datatypes_offsets.uncase().len() - 1)
             .context("Number of datatypes overflowed u32")?;
         while left < right {
             let pivot_id = (left + right) / 2;
-            assert!(
+            ensure!(
                 pivot_id > left || pivot_id < right,
                 "{left} | {pivot_id} | {right}"
             );
@@ -475,13 +484,16 @@ impl TermDictionary {
                 if left == pivot_id {
                     break;
                 }
-                assert!(left < pivot_id);
+                ensure!(left < pivot_id, "Binary search invariant: left < pivot_id");
                 left = pivot_id;
             } else {
                 if right == pivot_id {
                     break;
                 }
-                assert!(right > pivot_id);
+                ensure!(
+                    right > pivot_id,
+                    "Binary search invariant: right > pivot_id"
+                );
                 right = pivot_id;
             }
         }
@@ -494,16 +506,17 @@ impl TermDictionary {
     fn get_datatype(&self, id: u32) -> Result<NamedNode> {
         let id = usize::try_from(id).with_context(|| format!("Invalid datatype id: {id}"))?;
         ensure!(
-            id < self.datatypes_offsets.len(),
+            id < self.datatypes_offsets.uncase().len(),
             "Invalid datatype id: {id}"
         );
 
-        let offset = self.datatypes_offsets.get(id);
-        let bytes = read_length_prefixed_string(&mut Cursor::new(&self.datatypes[offset..]), |_| {
-            Some(u64::try_from(offset).context("Offset overflowed u64"))
-        })
-        .context("Could not get datatype")?
-        .context("Unexpected end of file")?;
+        let offset = self.datatypes_offsets.uncase().get(id);
+        let bytes =
+            read_length_prefixed_string(&mut Cursor::new(&self.datatypes[offset..]), |_| {
+                Some(u64::try_from(offset).context("Offset overflowed u64"))
+            })
+            .context("Could not get datatype")?
+            .context("Unexpected end of file")?;
         Ok(NamedNode::new_unchecked(
             str::from_utf8(&bytes).context("Non-UTF8 NamedNode in store")?,
         ))
@@ -527,24 +540,24 @@ pub fn recompress_with_dictionary(dir: &Path, dictionary: &TermDictionary) -> Re
         .par_iter()
         .map_with(pl.clone(), |pl, terms_file| {
             let TermsFile {
-                first_term_id: _,
-                num_terms: _,
                 path,
                 compressed_frames,
+                ..
             } = terms_file;
             let compressed_frames = compressed_frames.as_ref();
 
             let recompressed_file = tempfile::NamedTempFile::with_prefix_in(
-                path.file_name().expect("File has no name"),
-                path.parent().expect("File has no parent directory"),
+                path.file_name()
+                    .with_context(|| format!("{} has no file name", path.display()))?,
+                path.parent()
+                    .with_context(|| format!("{} has no parent directory", path.display()))?,
             )
             .context("Could not create temporary file")?;
             let mut writer = BufWriter::new(recompressed_file);
 
             let mut buf = Vec::with_capacity(config.terms_per_frame.into());
-            FrameLender::new(compressed_frames, config.terms_per_frame)?.try_for_each(
+            FrameLender::new(compressed_frames, config.terms_per_frame).for_each(
                 |term| -> Result<_> {
-                    let term = term?;
                     if term.is_empty() {
                         // FIXME: that's GraphName::DefaultGraph because we currently store
                         // graph names in the terms store, but we shouldn't.
@@ -612,16 +625,18 @@ pub fn recompress_with_dictionary(dir: &Path, dictionary: &TermDictionary) -> Re
 fn deduplicate_terms(
     quads: impl ParallelIterator<Item = Result<Quad>>,
 ) -> Result<ExternalDeduplicatingStringSorter> {
-    fn push_term(sorter: &mut ExternalDeduplicatingStringSorter, term: Term) -> Result<()> {
-        sorter.push_boxed_bytes(serialize_term(&term, None)?.into_boxed_slice())
+    fn push_term(sorter: &mut ExternalDeduplicatingStringSorter, term: &Term) -> Result<()> {
+        sorter.push_boxed_bytes(serialize_term(term, None)?.into_boxed_slice())
     }
 
     let unique_sorted_terms = quads
         .fold(
             || {
                 // 100MiB in-memory buffer per thread
-                ExternalDeduplicatingStringSorter::new(100 * 1024 * 1024, 16)
-                    .context("Could not create sorter ExternalDeduplicatingStringSorter")
+                Ok(ExternalDeduplicatingStringSorter::new(
+                    100 * 1024 * 1024,
+                    16,
+                ))
             },
             |thread_sorter, quad| -> Result<_> {
                 let mut thread_sorter: ExternalDeduplicatingStringSorter = thread_sorter?;
@@ -631,14 +646,14 @@ fn deduplicate_terms(
                     object,
                     graph_name,
                 } = quad?;
-                push_term(&mut thread_sorter, subject.into()).context("Could not push subject")?;
-                push_term(&mut thread_sorter, predicate.into())
+                push_term(&mut thread_sorter, &subject.into()).context("Could not push subject")?;
+                push_term(&mut thread_sorter, &predicate.into())
                     .context("Could not push predicate")?;
-                push_term(&mut thread_sorter, object).context("Could not push term")?;
+                push_term(&mut thread_sorter, &object).context("Could not push term")?;
 
                 // TODO: deduplicate and store graph names separately
                 thread_sorter
-                    .push_boxed_bytes(serialize_graph_name(&graph_name)?.into_boxed_slice())
+                    .push_boxed_bytes(serialize_graph_name(&graph_name).into_boxed_slice())
                     .context("Could not push graph name")?;
 
                 Ok(thread_sorter)
@@ -646,8 +661,10 @@ fn deduplicate_terms(
         )
         .reduce(
             || {
-                ExternalDeduplicatingStringSorter::new(100 * 1024 * 1024, 10)
-                    .context("Could not create reducer ExternalDeduplicatingStringSorter")
+                Ok(ExternalDeduplicatingStringSorter::new(
+                    100 * 1024 * 1024,
+                    10,
+                ))
             },
             |left, right| {
                 left?
@@ -703,12 +720,12 @@ pub fn write_unique_terms(
     pl.done();
     drop(pl);
 
-    std::fs::create_dir(dir).with_context(|| format!("Could not create {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("Could not create {}", dir.display()))?;
     let mut pl = progress_logger!(
         item_name = "term",
         display_memory = true,
         local_speed = true,
-        expected_updates = Some(sorter.num_unique_items_upperbound),
+        expected_updates = Some(sorter.num_unique_items_upperbound()),
     );
     pl.start("Writing terms...");
     let term_chunk_iterator = sorter
@@ -771,7 +788,7 @@ pub fn write_frame(
         let num_discard_bytes: u32 = previous_string
             .len()
             .checked_sub(longest_common_prefix)
-            .expect("Incorrect longest_common_prefix")
+            .with_context(|| format!("longest_common_prefix ({longest_common_prefix}) is longer than previous_string ({})", previous_string.len()))?
             .try_into()
             .context("String is 2^32 bytes or longer")?;
 
@@ -786,7 +803,7 @@ pub fn write_frame(
         let num_new_bytes: u32 = string
             .len()
             .checked_sub(longest_common_prefix)
-            .expect("Incorrect longest_common_prefix")
+            .with_context(|| format!("longest_common_prefix ({longest_common_prefix}) is longer than current string ({})", previous_string.len()))?
             .try_into()
             .context("String is 2^32 bytes or longer")?;
         let varint_bytes = tiny_varint::encode(num_new_bytes, &mut buf)
@@ -812,7 +829,7 @@ pub fn get_from_frame(
     terms_per_frame: NonZeroUsize,
     position: usize,
 ) -> Result<Box<[u8]>> {
-    Ok(FrameLender::new(frame, terms_per_frame)?
+    Ok(FrameLender::new(frame, terms_per_frame)
         .skip(position)
         .next()
         .with_context(|| format!("Frame has fewer than {} strings", position + 1))?
@@ -831,29 +848,31 @@ pub struct FrameLender<'frame> {
 }
 
 impl<'frame> FrameLender<'frame> {
-    pub fn new(frame: &'frame [u8], max_strings_per_frame: NonZeroUsize) -> Result<Self> {
-        Ok(FrameLender {
+    pub fn new(frame: &'frame [u8], max_strings_per_frame: NonZeroUsize) -> Self {
+        FrameLender {
             all_data: frame,
             data: frame,
             previous_string: Vec::new(),
             errored: None,
             max_strings_per_frame,
             remaining_strings_in_frame: max_strings_per_frame.into(),
-        })
+        }
     }
 }
 
-impl<'frame, 'lend> Lending<'lend> for FrameLender<'frame> {
-    type Lend = Result<&'lend [u8], anyhow::Error>;
+impl<'frame, 'lend> FallibleLending<'lend> for FrameLender<'frame> {
+    type Lend = &'lend [u8];
 }
 
-impl<'frame> Lender for FrameLender<'frame> {
-    fn next(&mut self) -> Option<<Self as Lending<'_>>::Lend> {
+impl<'frame> FallibleLender for FrameLender<'frame> {
+    type Error = anyhow::Error;
+
+    fn next(&mut self) -> Result<Option<<Self as FallibleLending<'_>>::Lend>, Self::Error> {
         if self.data.is_empty() {
-            return None;
+            return Ok(None);
         }
         if let Some(e) = &self.errored {
-            return Some(Err(anyhow!("Previous iteration failed: {e}")));
+            return Err(anyhow!("Previous iteration failed: {e}"));
         }
 
         if self.remaining_strings_in_frame == 0 {
@@ -897,16 +916,16 @@ impl<'frame> Lender for FrameLender<'frame> {
 
             Ok(())
         })() {
-            Ok(()) => Some(Ok(&self.previous_string[..])),
+            Ok(()) => Ok(Some(&*self.previous_string)),
             Err(e) => {
                 self.errored = Some(format!("{e}")); // anyhow::Error does not impl Clone
-                Some(Err(e))
+                Err(e)
             }
         }
     }
 }
-impl<'frame> RewindableIoLender<[u8]> for FrameLender<'frame> {
-    type Error = anyhow::Error;
+impl<'frame> FallibleRewindableLender for FrameLender<'frame> {
+    type RewindError = anyhow::Error;
 
     fn rewind(mut self) -> Result<Self, Self::Error> {
         self.data = self.all_data;
@@ -921,7 +940,7 @@ pub fn get_frame_size(frame: &[u8], max_num_strings: usize) -> Result<usize> {
     let mut data = frame;
 
     for _ in 0..max_num_strings {
-        if data.len() == 0 {
+        if data.is_empty() {
             // end of file
             break;
         }
@@ -944,10 +963,13 @@ pub fn get_frame_size(frame: &[u8], max_num_strings: usize) -> Result<usize> {
         data = &data[num_new_bytes..];
     }
 
-    Ok(frame
-        .len()
-        .checked_sub(data.len())
-        .expect("data is longer than frame, but it should be a subslice of it"))
+    frame.len().checked_sub(data.len()).with_context(|| {
+        format!(
+            "data ({} bytes) is longer than frame ({} bytes), but it should be a subslice of it",
+            data.len(),
+            frame.len()
+        )
+    })
 }
 
 pub(super) struct TermsFile<D> {
@@ -973,7 +995,7 @@ pub(super) fn list_terms_files(
         .into_iter()
         .filter(|entry| entry.path().extension() == Some("strings".as_ref()))
         .collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.path());
+    entries.sort_by_key(std::fs::DirEntry::path);
 
     let terms_per_file = usize::from(config.terms_per_frame) * config.frames_per_file;
     let num_files = config.num_terms.div_ceil(terms_per_file);
@@ -1050,10 +1072,10 @@ pub fn index_terms(dir: &Path) -> Result<()> {
         .into_par_iter()
         .try_for_each_with(pl.clone(), |pl, terms_file| {
             let TermsFile {
-                first_term_id: _,
                 num_terms,
                 path,
                 compressed_frames,
+                ..
             } = terms_file;
             let num_frames = num_terms.div_ceil(config.terms_per_frame.into());
             let compressed_frames = compressed_frames.as_ref();
@@ -1091,7 +1113,9 @@ pub fn index_terms(dir: &Path) -> Result<()> {
             let index_file_path = path.with_extension("frames.ef");
             let mut index_file = File::create(&index_file_path)
                 .with_context(|| format!("Could not create {}", index_file_path.display()))?;
-            ef.serialize(&mut index_file).with_context(|| {
+            // SAFETY: this may leak padding bytes, but we only read data that is to be shared
+            // alongside the vfunc.
+            unsafe { ef.serialize(&mut index_file) }.with_context(|| {
                 format!(
                     "Could not write Elias-Fano index to {}",
                     index_file_path.display()
@@ -1132,28 +1156,32 @@ impl TermStore {
                  })| {
                     let num_frames = num_terms.div_ceil(config.terms_per_frame.into());
                     let frames_index_path = path.with_extension("frames.ef");
-                    let frames_index = EfSeqDict::mmap(&frames_index_path, Flags::RANDOM_ACCESS)
+                    let frames_index = unsafe { EfSeqDict::mmap(&frames_index_path, Flags::RANDOM_ACCESS) }
                         .with_context(|| {
                             format!(
                                 "Could not epdeserialize frames index from {}",
                                 frames_index_path.display()
                             )
                         })?;
-                    ensure!(frames_index.len() == num_frames, "frames_index ({}) of partition {partition_id} does not match expected number of frames ({num_frames})", frames_index.len());
+                    ensure!(
+                        frames_index.uncase().len() == num_frames,
+                        "frames_index ({}) of partition {partition_id} does not match expected number of frames ({num_frames})",
+                        frames_index.uncase().len()
+                    );
 
                     Ok(TermsPartition {
-                        path,
+                        _path: path,
                         first_term_id,
-                        frames_index,
                         compressed_frames,
+                        frames_index,
                     })
                 },
             )
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            config,
             path,
             partitions,
-            config,
         })
     }
 
@@ -1161,11 +1189,15 @@ impl TermStore {
         self.config.num_terms
     }
 
-    fn get_frame(&self, partition_id: usize, frame_id: usize) -> Result<&[u8]> {
-        let partition = &self.partitions[partition_id];
-        let frame_position = partition.frames_index.get(frame_id);
+    pub fn is_empty(&self) -> bool {
+        self.config.num_terms == 0
+    }
 
-        Ok(&partition.compressed_frames[frame_position..])
+    fn get_frame(&self, partition_id: usize, frame_id: usize) -> &[u8] {
+        let partition = &self.partitions[partition_id];
+        let frame_position = partition.frames_index.uncase().get(frame_id);
+
+        &partition.compressed_frames[frame_position..]
     }
 
     pub fn get(&self, id: usize) -> Result<Option<Box<[u8]>>> {
@@ -1191,7 +1223,7 @@ impl TermStore {
         );
         let frame_id = (id - first_term_in_partition) / usize::from(self.config.terms_per_frame);
         ensure!(
-            frame_id < partition.frames_index.len(),
+            frame_id < partition.frames_index.uncase().len(),
             "Inconsistent partition lengths in terms store {}",
             self.path.display()
         );
@@ -1201,7 +1233,7 @@ impl TermStore {
 
         Ok(Some(
             get_from_frame(
-                self.get_frame(partition_id, frame_id)?,
+                self.get_frame(partition_id, frame_id),
                 self.config.terms_per_frame,
                 offset_in_frame,
             )
@@ -1211,8 +1243,8 @@ impl TermStore {
 }
 
 struct TermsPartition {
-    path: PathBuf,
+    _path: PathBuf,
     first_term_id: usize,
     compressed_frames: Mmap,
-    frames_index: MemCase<<EfSeqDict as EpDeserializeInner>::DeserType<'static>>,
+    frames_index: MemCase<EfSeqDict>,
 }

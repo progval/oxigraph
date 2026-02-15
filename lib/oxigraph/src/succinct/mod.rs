@@ -1,6 +1,9 @@
-#![allow(clippy::shadow_same)]
+#![allow(clippy::undocumented_unsafe_blocks)]
+#![allow(clippy::todo)]
+#![allow(unsafe_code)]
 
 pub mod database_builder;
+mod from_iter_ref;
 pub mod quads_store;
 pub mod queryable_dataset;
 pub mod secondary_indexes;
