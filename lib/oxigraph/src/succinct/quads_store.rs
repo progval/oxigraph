@@ -398,6 +398,7 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
             );
             efb.push(0); // first term is always in the first frame if present
 
+            let mut num_indexed_terms = 1;
             SortedArraysFile::<4>::mmap(&path)
             .with_context(|| format!("Could not mmap array file {}", path.display()))?
             .iter_with_positions(0)
@@ -432,10 +433,12 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
 
                     // fill the blanks for terms with no quad
                     for _ in (previous_relative_first_term + 1)..relative_first_term {
+                        num_indexed_terms += 1;
                         efb.push(previous_bit_pos);
                     }
 
                     ensure!(bit_pos < file_len_bits, "bit_pos={bit_pos} is past the end of {} ({file_len_bits})", path.display());
+                    num_indexed_terms += 1;
                     efb.push(bit_pos);
 
                     previous_relative_first_term = relative_first_term;
@@ -447,6 +450,15 @@ pub fn index_quads_by_first_term(dir: &Path) -> Result<()> {
                 Ok(())
             })
             .with_context(|| format!("Could not read frame offsets from {}", path.display()))?;
+
+            ensure!(num_indexed_terms <= num_terms_in_partition, "Expected {num_terms_in_partition} terms in partition {partition_id}, indexed {num_indexed_terms}");
+            for _ in (previous_relative_first_term + 1)..num_terms_in_partition {
+                // fill the remaining terms with no occurence
+                num_indexed_terms += 1;
+                efb.push(previous_bit_pos);
+            }
+
+            ensure!(num_indexed_terms == num_terms_in_partition, "Expected {num_terms_in_partition} terms in partition {partition_id}, indexed {num_indexed_terms}"); // EliasFanoBuilder panics if this is false
             let ef = efb.build_with_seq();
             ensure!(ef.len() == num_terms_in_partition, "Expected {num_terms_in_partition} terms in partition {partition_id}, wrote {} in Elias-Fano index", ef.len());
 
