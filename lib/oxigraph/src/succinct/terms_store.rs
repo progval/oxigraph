@@ -72,6 +72,10 @@ pub(super) fn read_length_prefixed_string<R: Read>(
     Ok(Some(string.into()))
 }
 
+// Terms are sorted lexicographically using these values, so changing them also changes
+// term ids. These specific values have show to give the best compression on Wikidata.
+//
+// TODO: dynamically pick them based on the dataset.
 const TERM_TYPE_NAMED_NODE: u8 = 6;
 const TERM_TYPE_BLANK_NODE: u8 = 1;
 const TERM_TYPE_LITERAL_SIMPLE: u8 = 2;
