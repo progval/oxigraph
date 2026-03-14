@@ -228,7 +228,7 @@ pub fn serialize_graph_name(graph_name: &GraphName) -> Vec<u8> {
             // which means that the DefaultGraph gets hashed to id 0.
             // And because sorted quad files have to write the graph at the beginning
             // of each frame, the shorter the graph id is, the better.
-            // And because we use gamma coding
+            // And because we use delta coding
             // (https://docs.rs/dsi-bitstream/latest/dsi_bitstream/codes/index.html),
             // 0 is encoded as a single bit whereas any other value takes at least four bits.
             Vec::new()

@@ -574,8 +574,8 @@ impl<const N: usize> SortedArraysFile<N> {
                         - i64::try_from(previous_cell).context("previous term overflows i64")?;
                     let zigzag = diff.to_nat();
                     writer
-                        .write_gamma(zigzag)
-                        .context("Could not write gamma")?;
+                        .write_delta(zigzag)
+                        .context("Could not write delta")?;
                 } else {
                     let diff = u64::try_from(cell)
                         .context("current term overflows u64")?
@@ -585,7 +585,7 @@ impl<const N: usize> SortedArraysFile<N> {
                         .context(
                             "write_sorted_array_file got non-sorted quads after the initial check",
                         )?;
-                    writer.write_gamma(diff).context("Could not write gamma")?;
+                    writer.write_delta(diff).context("Could not write delta")?;
 
                     if diff > 0 {
                         // this term is a strict increase, so terms after it in the quad are
@@ -609,8 +609,8 @@ impl<const N: usize> SortedArraysFile<N> {
             .context("Could not write last frame bit")?;
         for _ in 0..N {
             writer
-                .write_gamma(0)
-                .context("Could not write final gammas")?;
+                .write_delta(0)
+                .context("Could not write final deltas")?;
         }
 
         writer
@@ -702,7 +702,7 @@ impl<const N: usize> SortedArraysFile<N> {
                 let mut must_zigzag = false;
                 for (&previous_cell, cell) in previous_item.iter().zip(item.iter_mut()) {
                     if must_zigzag {
-                        let zigzag = reader.read_gamma().context("Could not read gamma")?;
+                        let zigzag = reader.read_delta().context("Could not read delta")?;
                         let diff = zigzag.to_int();
 
                         *cell = u64::try_from(previous_cell)
@@ -712,7 +712,7 @@ impl<const N: usize> SortedArraysFile<N> {
                             .try_into()
                             .context("value overflows usize")?;
                     } else {
-                        let diff = reader.read_gamma().context("Could not read gamma")?;
+                        let diff = reader.read_delta().context("Could not read delta")?;
                         *cell = u64::try_from(previous_cell)
                             .context("previous value overflows u64")?
                             .checked_add(diff)

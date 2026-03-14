@@ -68,23 +68,23 @@ This list is sorted and written in a custom binary format using [`dsi-bitstream`
 * Split quads into frames using whatever heuristic (by default: split every 100 quads if they have different first terms, or every 10000 quads if they have the same first term)
 * For each frame of quads:
     * bit 0 if this is the first frame of the file, bit 1 otherwise
-    * the first quad of the frame, with each of its term written using [gamma-coding](https://docs.rs/dsi-bitstream/latest/dsi_bitstream/codes/)
+    * the first quad of the frame, with each of its term written using [delta-coding](https://docs.rs/dsi-bitstream/latest/dsi_bitstream/codes/)
     * For each other quad of the frame:
         * bit 0 (indicating this is not a new frame)
         * `let mut zigzag = false`
         * for the i-th term of the quad:
-            * if `!zigzag`: the gamma-coded increase between the previous quad's i-th term and this quad's i-th term
+            * if `!zigzag`: the delta-coded increase between the previous quad's i-th term and this quad's i-th term
                 * (that increase is guaranteed to be >= 0 due to quads being lexicographically sorted)
                 * if the increase > 0, set `zigzag = true` (ie. the `i+1`th term of this quad is not guaranteed to be >= to the `i+1`th term of the previous quad )
-            * if `zigzag`: the gamma-coded [zigzag-encoded](https://docs.rs/dsi-bitstream/latest/dsi_bitstream/codes/trait.ToInt.html) difference between the previous quad's i-th term and this quad's i-th term
-* end with bit 1, then `0` gamma-encoded four times (ie. as if we had the quad `(0, 0, 0, 0)`)
+            * if `zigzag`: the delta-coded [zigzag-encoded](https://docs.rs/dsi-bitstream/latest/dsi_bitstream/codes/trait.ToInt.html) difference between the previous quad's i-th term and this quad's i-th term
+* end with bit 1, then `0` delta-encoded four times (ie. as if we had the quad `(0, 0, 0, 0)`)
 
 This allows a compact, mmappable, seekable, and fast to decompress, representation of the quads.
 
 This stores `wikidata-20240320-truthy-BETA` quads in
 
-* 37GiB for spog quads
-* 29GiB for opsg quads
+* 28GiB for spog quads
+* 22GiB for opsg quads
 
 ## First-term index
 
@@ -95,7 +95,7 @@ Getting the rest of the list is done by iterating from that frame (discarding th
 
 This indexes `wikidata-20240320-truthy-BETA` quads in
 
-* 620MiB for spog quads
+* 658MiB for spog quads
 * 1.9GiB for opsg quads
 
 ## First-two-terms index
@@ -131,10 +131,10 @@ TODO: in case of false positive that gives a tiny offset, we may end up reading 
 
 This indexes `wikidata-20240320-truthy-BETA` quads in
 
-* 74MiB for the Elias-Fano of frame offsets of spog quads
-* 280MiB for the vfunc of spog quads
-* 74MiB for the Elias-Fano of frame offsets of opsg quads
-* 1.6GiB for the vfunc of opsg quads
+* 88MiB for the Elias-Fano of frame offsets of spog quads
+* 281MiB for the vfunc of spog quads
+* 72MiB for the Elias-Fano of frame offsets of opsg quads
+* 2.4GiB for the vfunc of opsg quads
 
 ## Secondary index
 
