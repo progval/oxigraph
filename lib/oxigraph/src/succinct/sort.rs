@@ -512,14 +512,76 @@ impl<const N: usize> ExternalArraySorter<N> {
     }
 }
 
-pub struct SortedArraysFile<const N: usize> {
+type BBWriter = BufBitWriter<LE, WordAdapter<usize, BufWriter<File>>>;
+type BBReader<D> = BufBitReader<LE, MemWordReader<u64, D>>;
+
+pub trait Compressor: Clone + 'static {
+    fn write_newframe_bit(&mut self, writer: &mut BBWriter, is_new_frame: bool) -> Result<usize> {
+        Ok(writer.write_bits(is_new_frame.into(), 1)?)
+    }
+    fn write_i64(&mut self, writer: &mut BBWriter, column: usize, value: i64) -> Result<usize>;
+    fn write_u64(&mut self, writer: &mut BBWriter, column: usize, value: u64) -> Result<usize>;
+
+    fn read_newframe_bit(&self, reader: &mut BBReader<impl AsRef<[u64]>>) -> Result<bool> {
+        Ok(match reader.read_bits(1)? {
+            0 => false,
+            1 => true,
+            _ => unreachable!("read_bits(1) returned more than one bit"),
+        })
+    }
+    fn read_i64(&self, reader: &mut BBReader<impl AsRef<[u64]>>, column: usize) -> Result<i64>;
+    fn read_u64(&self, reader: &mut BBReader<impl AsRef<[u64]>>, column: usize) -> Result<u64>;
+}
+
+/// An implementation of [`Compressor`] that only uses the [delta
+/// code](https://docs.rs/dsi-bitstream/latest/dsi_bitstream/codes/)
+#[derive(Clone)]
+pub struct DeltaCompressor;
+
+impl Compressor for DeltaCompressor {
+    fn write_i64(&mut self, writer: &mut BBWriter, _column: usize, value: i64) -> Result<usize> {
+        let zigzag = value.to_nat();
+        Ok(writer.write_delta(zigzag)?)
+    }
+    fn write_u64(&mut self, writer: &mut BBWriter, _column: usize, value: u64) -> Result<usize> {
+        Ok(writer.write_delta(value)?)
+    }
+
+    fn read_i64(&self, reader: &mut BBReader<impl AsRef<[u64]>>, _column: usize) -> Result<i64> {
+        let zigzag = reader.read_delta()?;
+        Ok(zigzag.to_int())
+    }
+    fn read_u64(&self, reader: &mut BBReader<impl AsRef<[u64]>>, _column: usize) -> Result<u64> {
+        Ok(reader.read_delta()?)
+    }
+}
+
+pub struct SortedArraysFile<const N: usize, C: Compressor = DeltaCompressor> {
     data: Arc<MmapHelper<u64>>,
+    compressor: C,
 }
 
 impl<const N: usize> SortedArraysFile<N> {
     pub fn create(
         path: impl AsRef<Path>,
         items: impl Iterator<Item = Result<[usize; N]>>,
+        pl: &mut impl ProgressLog,
+    ) -> Result<Self> {
+        let compressor = DeltaCompressor;
+        Self::create_with_compressor(path, items, compressor, pl)
+    }
+
+    pub fn mmap(path: impl AsRef<Path>) -> Result<Self> {
+        let compressor = DeltaCompressor;
+        Self::mmap_with_compressor(path, compressor)
+    }
+}
+
+impl<const N: usize, C: Compressor> SortedArraysFile<N, C> {
+    pub fn create_with_compressor(
+        path: impl AsRef<Path>,
+        items: impl Iterator<Item = Result<[usize; N]>>,
+        mut compressor: C,
         pl: &mut impl ProgressLog,
     ) -> Result<Self> {
         let path = path.as_ref();
@@ -556,25 +618,25 @@ impl<const N: usize> SortedArraysFile<N> {
                 // new frame
                 previous_item = [0; N];
                 current_frame_size = 0;
-                writer
-                    .write_bits(1, 1)
+                compressor
+                    .write_newframe_bit(&mut writer, true)
                     .context("Could not write frame bit")?;
             } else {
-                writer
-                    .write_bits(0, 1)
+                compressor
+                    .write_newframe_bit(&mut writer, false)
                     .context("Could not write non-frame bit")?;
             }
 
             // quads are sorted lexicographically, so the first term of a quad is guaranteed to be
             // >= the first term of the previous quad
             let mut must_zigzag = false;
-            for (&previous_cell, &cell) in previous_item.iter().zip(item.iter()) {
+            for (col, (&previous_cell, &cell)) in previous_item.iter().zip(item.iter()).enumerate()
+            {
                 if must_zigzag {
                     let diff = i64::try_from(cell).context("current term overflows i64")?
                         - i64::try_from(previous_cell).context("previous term overflows i64")?;
-                    let zigzag = diff.to_nat();
-                    writer
-                        .write_delta(zigzag)
+                    compressor
+                        .write_i64(&mut writer, col, diff)
                         .context("Could not write delta")?;
                 } else {
                     let diff = u64::try_from(cell)
@@ -585,7 +647,9 @@ impl<const N: usize> SortedArraysFile<N> {
                         .context(
                             "write_sorted_array_file got non-sorted quads after the initial check",
                         )?;
-                    writer.write_delta(diff).context("Could not write delta")?;
+                    compressor
+                        .write_u64(&mut writer, col, diff)
+                        .context("Could not write delta")?;
 
                     if diff > 0 {
                         // this term is a strict increase, so terms after it in the quad are
@@ -604,12 +668,12 @@ impl<const N: usize> SortedArraysFile<N> {
         }
 
         // mark end of file
-        writer
-            .write_bits(1, 1)
+        compressor
+            .write_newframe_bit(&mut writer, true)
             .context("Could not write last frame bit")?;
-        for _ in 0..N {
-            writer
-                .write_delta(0)
+        for col in 0..N {
+            compressor
+                .write_u64(&mut writer, col, 0)
                 .context("Could not write final deltas")?;
         }
 
@@ -622,17 +686,17 @@ impl<const N: usize> SortedArraysFile<N> {
             .flush()
             .with_context(|| format!("Could not flush {}", path.display()))?;
 
-        Self::mmap(path)
+        Self::mmap_with_compressor(path, compressor)
     }
 
-    pub fn mmap(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn mmap_with_compressor(path: impl AsRef<Path>, compressor: C) -> Result<Self> {
         let path = path.as_ref();
         let data = Arc::new(
             MmapHelper::mmap(path, MmapFlags::SEQUENTIAL)
                 .with_context(|| format!("Could not mmap array file {}", path.display()))?,
         );
 
-        Ok(Self { data })
+        Ok(Self { data, compressor })
     }
 
     pub fn file_len(&self) -> usize {
@@ -650,19 +714,24 @@ impl<const N: usize> SortedArraysFile<N> {
         &self,
         from_bit_position: usize,
     ) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + '_> {
-        Self::_iter_with_positions(&*self.data, from_bit_position)
+        Self::_iter_with_positions(&*self.data, self.compressor.clone(), from_bit_position)
     }
 
     /// Same as [`Self::iter_with_positions`] but increments an internal [`Arc`] to return `'static`
     pub fn owned_iter_with_positions(
         &self,
         from_bit_position: usize,
-    ) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + 'static + use<N>> {
-        Self::_iter_with_positions(ArcMmapHelper(Arc::clone(&self.data)), from_bit_position)
+    ) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + 'static + use<N, C>> {
+        Self::_iter_with_positions(
+            ArcMmapHelper(Arc::clone(&self.data)),
+            self.compressor.clone(),
+            from_bit_position,
+        )
     }
 
     fn _iter_with_positions<'a>(
         data: impl AsRef<[u64]> + 'a,
+        compressor: C,
         from_bit_position: usize,
     ) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + 'a> {
         let mut reader = BufBitReader::<LE, _>::new(MemWordReader::<u64, _>::new(data));
@@ -688,7 +757,9 @@ impl<const N: usize> SortedArraysFile<N> {
             (|| {
                 let mut item = [0_usize; N];
 
-                let new_frame = reader.read_bits(1).context("Could not read frame bit")? == 1;
+                let new_frame = compressor
+                    .read_newframe_bit(&mut reader)
+                    .context("Could not read frame bit")?;
                 let bit_pos = if new_frame {
                     previous_item = [0; N];
                     // -1 because we want to start at the bit we just read
@@ -700,10 +771,13 @@ impl<const N: usize> SortedArraysFile<N> {
                 // quads are sorted lexicographically, so the first term of a quad is guaranteed to be
                 // >= the first term of the previous quad
                 let mut must_zigzag = false;
-                for (&previous_cell, cell) in previous_item.iter().zip(item.iter_mut()) {
+                for (col, (&previous_cell, cell)) in
+                    previous_item.iter().zip(item.iter_mut()).enumerate()
+                {
                     if must_zigzag {
-                        let zigzag = reader.read_delta().context("Could not read delta")?;
-                        let diff = zigzag.to_int();
+                        let diff = compressor
+                            .read_i64(&mut reader, col)
+                            .context("Could not read delta")?;
 
                         *cell = u64::try_from(previous_cell)
                             .context("previous value overflows u64")?
@@ -712,7 +786,9 @@ impl<const N: usize> SortedArraysFile<N> {
                             .try_into()
                             .context("value overflows usize")?;
                     } else {
-                        let diff = reader.read_delta().context("Could not read delta")?;
+                        let diff = compressor
+                            .read_u64(&mut reader, col)
+                            .context("Could not read delta")?;
                         *cell = u64::try_from(previous_cell)
                             .context("previous value overflows u64")?
                             .checked_add(diff)
@@ -771,7 +847,7 @@ impl<const N: usize> SortedArraysFile<N> {
     pub fn owned_iter_from_position(
         &self,
         from_bit_position: usize,
-    ) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'static + use<N>> {
+    ) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'static + use<N, C>> {
         Ok(self
             .owned_iter_with_positions(from_bit_position)?
             .map(|item| {
@@ -789,7 +865,7 @@ impl<const N: usize> SortedArraysFile<N> {
     /// Same as [`Self::iter`] but increments an internal [`Arc`] to return `'static`
     pub fn owned_iter(
         &self,
-    ) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'static + use<N>> {
+    ) -> Result<impl Iterator<Item = Result<[usize; N]>> + 'static + use<N, C>> {
         self.owned_iter_from_position(0)
     }
 }
