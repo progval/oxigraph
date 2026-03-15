@@ -512,25 +512,25 @@ impl<const N: usize> ExternalArraySorter<N> {
     }
 }
 
-type BBWriter = BufBitWriter<LE, WordAdapter<usize, BufWriter<File>>>;
-type BBReader<D> = BufBitReader<LE, MemWordReader<u64, D>>;
+pub(super) type BBWriter = BufBitWriter<LE, WordAdapter<usize, BufWriter<File>>>;
+pub(super) type BBReader<D> = BufBitReader<LE, MemWordReader<u64, D>>;
 
-pub trait Compressor: Clone + 'static {
+pub trait Compressor: Clone + Send + Sync + 'static {
     fn write_newframe_bit(&mut self, writer: &mut BBWriter, is_new_frame: bool) -> Result<usize> {
         Ok(writer.write_bits(is_new_frame.into(), 1)?)
     }
     fn write_i64(&mut self, writer: &mut BBWriter, column: usize, value: i64) -> Result<usize>;
     fn write_u64(&mut self, writer: &mut BBWriter, column: usize, value: u64) -> Result<usize>;
 
-    fn read_newframe_bit(&self, reader: &mut BBReader<impl AsRef<[u64]>>) -> Result<bool> {
+    fn read_newframe_bit(&mut self, reader: &mut BBReader<impl AsRef<[u64]>>) -> Result<bool> {
         Ok(match reader.read_bits(1)? {
             0 => false,
             1 => true,
             _ => unreachable!("read_bits(1) returned more than one bit"),
         })
     }
-    fn read_i64(&self, reader: &mut BBReader<impl AsRef<[u64]>>, column: usize) -> Result<i64>;
-    fn read_u64(&self, reader: &mut BBReader<impl AsRef<[u64]>>, column: usize) -> Result<u64>;
+    fn read_i64(&mut self, reader: &mut BBReader<impl AsRef<[u64]>>, column: usize) -> Result<i64>;
+    fn read_u64(&mut self, reader: &mut BBReader<impl AsRef<[u64]>>, column: usize) -> Result<u64>;
 }
 
 /// An implementation of [`Compressor`] that only uses the [delta
@@ -547,11 +547,19 @@ impl Compressor for DeltaCompressor {
         Ok(writer.write_delta(value)?)
     }
 
-    fn read_i64(&self, reader: &mut BBReader<impl AsRef<[u64]>>, _column: usize) -> Result<i64> {
+    fn read_i64(
+        &mut self,
+        reader: &mut BBReader<impl AsRef<[u64]>>,
+        _column: usize,
+    ) -> Result<i64> {
         let zigzag = reader.read_delta()?;
         Ok(zigzag.to_int())
     }
-    fn read_u64(&self, reader: &mut BBReader<impl AsRef<[u64]>>, _column: usize) -> Result<u64> {
+    fn read_u64(
+        &mut self,
+        reader: &mut BBReader<impl AsRef<[u64]>>,
+        _column: usize,
+    ) -> Result<u64> {
         Ok(reader.read_delta()?)
     }
 }
@@ -731,7 +739,7 @@ impl<const N: usize, C: Compressor> SortedArraysFile<N, C> {
 
     fn _iter_with_positions<'a>(
         data: impl AsRef<[u64]> + 'a,
-        compressor: C,
+        mut compressor: C,
         from_bit_position: usize,
     ) -> Result<impl Iterator<Item = Result<(Option<u64>, [usize; N])>> + 'a> {
         let mut reader = BufBitReader::<LE, _>::new(MemWordReader::<u64, _>::new(data));

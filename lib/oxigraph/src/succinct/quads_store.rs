@@ -261,16 +261,27 @@ pub fn par_iter_quads(
     dir: &Path,
     order: QuadOrder,
 ) -> Result<impl ParallelIterator<Item = Result<[usize; 4]>>> {
+    let compressor = &super::sort::DeltaCompressor;
+    par_iter_quads_with_compressor(dir, order, compressor)
+}
+
+pub(super) fn par_iter_quads_with_compressor(
+    dir: &Path,
+    order: QuadOrder,
+    compressor: &impl super::sort::Compressor,
+) -> Result<impl ParallelIterator<Item = Result<[usize; 4]>>> {
     let (_config, partitions) = get_quad_partitions(dir)?;
     Ok(partitions
         .into_par_iter()
         .map(|path| {
             let de_order_quad = order.mapper();
-            Ok(SortedArraysFile::mmap(&path)
-                .with_context(|| format!("Could not mmap array file {}", path.display()))?
-                .owned_iter()
-                .with_context(|| format!("Could not read array file {}", path.display()))?
-                .map(move |quad| Ok(de_order_quad(quad?))))
+            Ok(
+                SortedArraysFile::mmap_with_compressor(&path, compressor.clone())
+                    .with_context(|| format!("Could not mmap array file {}", path.display()))?
+                    .owned_iter()
+                    .with_context(|| format!("Could not read array file {}", path.display()))?
+                    .map(move |quad| Ok(de_order_quad(quad?))),
+            )
         })
         .collect::<Result<Vec<_>>>()?
         .into_par_iter()
@@ -626,6 +637,10 @@ impl QuadStore {
             path,
             partitions,
         })
+    }
+
+    pub fn num_quads(&self) -> usize {
+        self.config.num_quads
     }
 
     fn get_partition(&self, term: usize) -> Result<&QuadPartition> {

@@ -170,6 +170,12 @@ pub enum Commands {
         #[arg(long)]
         order: succinct::quads_store::QuadOrder,
     },
+    /// Prints the size used by each kind of value in a quad store
+    AnalyzeCodes {
+        /// Which quad store to analyze
+        #[arg(long)]
+        order: succinct::quads_store::QuadOrder,
+    },
 }
 
 pub fn main() -> Result<()> {
@@ -272,6 +278,9 @@ pub fn main() -> Result<()> {
         }
         Commands::IndexBySecondTerm { order } => {
             db_builder.index_by_second_term(order)?;
+        }
+        Commands::AnalyzeCodes { order } => {
+            db_builder.analyze_codes(order)?;
         }
     }
 

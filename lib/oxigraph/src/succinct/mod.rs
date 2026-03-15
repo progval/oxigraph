@@ -2,6 +2,7 @@
 #![allow(clippy::todo)]
 #![allow(unsafe_code)]
 
+pub mod analyze;
 pub mod database_builder;
 mod from_iter_ref;
 pub mod quads_store;

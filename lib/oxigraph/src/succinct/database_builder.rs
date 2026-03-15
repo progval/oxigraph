@@ -368,6 +368,12 @@ impl DatabaseBuilder {
             },
         )
     }
+
+    pub fn analyze_codes(&self, order: QuadOrder) -> Result<()> {
+        let quads_path = self.location.join(format!("quads-{order}"));
+        super::analyze::analyze_quad_store_codes(&quads_path)
+            .context("Could not analyze quad store codes")
+    }
 }
 
 fn get_parallel_iterator_from_sequential_parsers(
