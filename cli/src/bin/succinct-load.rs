@@ -100,12 +100,12 @@ pub enum Commands {
         approx_quads_per_file: Option<usize>,
     },
     /// Step 1.5: (Optional) Trains a dictionary on the terms and use it to recompress them
-    RecompressTerms {},
+    RecompressTerms,
     /// Step 2a: read the terms/ directory and makes each term accessible in O(1) given its position,
     /// allowing a O(1) map from ids to terms
-    IndexTerms {},
+    IndexTerms,
     /// Step 2b: build a O(1) map from terms to ids
-    BuildTermsMphf {},
+    BuildTermsMphf,
     /// Step 3: read all quads again, and write them in a succinct format
     ///
     /// May error with ENOMEM if sysctl setting `vm.max_map_count` is too low.
@@ -197,13 +197,13 @@ pub fn main() -> Result<()> {
                 .with_approx_num_quads(approx_quads_per_file)
                 .extract_terms()?;
         }
-        Commands::RecompressTerms {} => {
+        Commands::RecompressTerms => {
             db_builder.recompress_terms()?;
         }
-        Commands::IndexTerms {} => {
+        Commands::IndexTerms => {
             db_builder.index_terms()?;
         }
-        Commands::BuildTermsMphf {} => db_builder.build_terms_mphf()?,
+        Commands::BuildTermsMphf => db_builder.build_terms_mphf()?,
         Commands::CompressQuads {
             parse_args,
             approx_quads_per_file,
