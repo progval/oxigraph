@@ -364,7 +364,7 @@ impl DatabaseBuilder {
             GlobalArgs { log_interval: None },
             CliArgs {
                 number_of_nodes: None,
-                src: index_path.join("graph"),
+                basename: index_path.join("graph"),
             },
         )
     }

@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use sux::bits::{AtomicBitVec, BitVec};
 use sux::dict::elias_fano::{EfSeqDict, EliasFanoBuilder};
-use sux::traits::{AtomicBitVecOps, BitVecOps, BitVecOpsMut, IndexedDict};
+use sux::traits::{AtomicBitVecOps, BitVecOps, IndexedDict};
 use webgraph::graphs::bvgraph::{BvGraph, MemoryFlags};
 use webgraph::traits::RandomAccessGraph;
 

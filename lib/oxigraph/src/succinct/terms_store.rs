@@ -871,6 +871,8 @@ impl<'frame, 'lend> FallibleLending<'lend> for FrameLender<'frame> {
 impl<'frame> FallibleLender for FrameLender<'frame> {
     type Error = anyhow::Error;
 
+    lender::check_covariance_fallible!();
+
     fn next(&mut self) -> Result<Option<<Self as FallibleLending<'_>>::Lend>, Self::Error> {
         if self.data.is_empty() {
             return Ok(None);

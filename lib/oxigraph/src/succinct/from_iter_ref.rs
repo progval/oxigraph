@@ -52,6 +52,8 @@ impl<'lend, I: FallibleIterator> FallibleLending<'lend> for FromIterRef<I> {
 impl<I: FallibleIterator> FallibleLender for FromIterRef<I> {
     type Error = I::Error;
 
+    lender::check_covariance_fallible!();
+
     #[inline]
     fn next(&mut self) -> Result<Option<FallibleLend<'_, Self>>, Self::Error> {
         self.current = self.iter.next()?;

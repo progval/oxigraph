@@ -191,7 +191,7 @@ pub fn build_terms_mphf(dir: &Path, dest: &Path) -> Result<()> {
                         FrameLender::new(compressed_frames, config.terms_per_frame)
                         .map_err(DecodeError) // on Result<Item>
                         .map(
-                            lender::hrc_mut!(for<'all> |term: &'all [u8]| -> Result<
+                            lender::covar_mut!(for<'all> |term: &'all [u8]| -> Result<
                                     BoxedRawTerm,
                                     DecodeError,
                                 > {
@@ -357,6 +357,11 @@ impl<'lend, L: FallibleLending<'lend>> FallibleLending<'lend>
 
 impl<L: FallibleLender> FallibleLender for FallibleRewindableFlattenLender<L> {
     type Error = L::Error;
+
+    // SAFETY: L implements FallibleLender so it is covariant, and
+    // FallibleRewindableFlattenLender<L> is covariant in L, so FallibleRewindableFlattenLender is
+    // covariant.
+    lender::unsafe_assume_covariance_fallible!();
 
     fn next(&mut self) -> Result<Option<<Self as FallibleLending<'_>>::Lend>, Self::Error> {
         // This is equivalent to:

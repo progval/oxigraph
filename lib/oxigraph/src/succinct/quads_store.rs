@@ -85,7 +85,7 @@ pub fn compress_parsed_quads<D>(
 ) -> Result<()>
 where
     D: BitFieldSlice<usize> + Sync + Send,
-    for<'a> D: EpDeserInner<DeserType<'a>: BitFieldSlice<usize>>,
+    for<'a> D: EpDeserInner<DeserType<'a>: BitFieldSlice<usize> + Sync>,
 {
     let compressed_quads = quads.map(|quad| {
         let quad = quad.context("Could not read quad")?;

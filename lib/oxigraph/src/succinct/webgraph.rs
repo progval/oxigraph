@@ -50,32 +50,22 @@ pub fn bv(
         .context("Could not initialize ParSortPairs::par_sort_pairs")?;
     let sorted_pairs: Vec<_> = sorted_pairs.into();
 
-    let bvcomp_tmp_dir = tempfile::tempdir().context("Could not create temporary directory")?;
-
     std::fs::create_dir_all(path)
         .with_context(|| format!("Could not create {}", path.display()))?;
 
     // TODO: Switch to LittleEndian once webgraph publishes a release that includes this fix:
     // https://github.com/vigna/webgraph-rs/pull/141
-    let thread_pool = rayon::ThreadPoolBuilder::default()
-        .build()
-        .context("Could not build thread pool")?;
-    BvComp::parallel_iter::<BigEndian, _>(
-        &path.join("graph"),
-        sorted_pairs.into_iter(),
-        num_terms,
-        CompFlags {
+    BvComp::with_basename(&path.join("graph"))
+        .with_comp_flags(CompFlags {
             // BvComp stores as many successor lists as the value of `compression_window`.
             // As we have some very long successor lists (eg.
             // http://www.wikidata.org/prop/direct/P31) this can use tens of gigabytes
             // of RAM as compression_window defaults to 7
             compression_window: 1,
             ..Default::default()
-        },
-        &thread_pool,
-        bvcomp_tmp_dir.path(),
-    )
-    .context("Could not run BvComp")?;
+        })
+        .par_comp_lenders::<BigEndian, _>(sorted_pairs, num_terms)
+        .context("Could not run BvComp")?;
 
     Ok(())
 }
@@ -130,8 +120,6 @@ pub fn symmetric_bv(
         .context("Could not initialize ParSortPairs::par_sort_pairs")?;
     let sorted_pairs: Vec<_> = sorted_pairs.into();
 
-    let bvcomp_tmp_dir = tempfile::tempdir().context("Could not create temporary directory")?;
-
     // let mut g = webgraph::graphs::vec_graph::VecGraph::new();
     // for i in 0..num_terms {
     // g.add_node(i);
@@ -150,25 +138,17 @@ pub fn symmetric_bv(
 
     // TODO: Switch to LittleEndian once webgraph publishes a release that includes this fix:
     // https://github.com/vigna/webgraph-rs/pull/141
-    let thread_pool = rayon::ThreadPoolBuilder::default()
-        .build()
-        .context("Could not build thread pool")?;
-    BvComp::parallel_iter::<BigEndian, _>(
-        &path.join("graph"),
-        sorted_pairs.into_iter(),
-        num_terms,
-        CompFlags {
+    BvComp::with_basename(&path.join("graph"))
+        .with_comp_flags(CompFlags {
             // BvComp stores as many successor lists as the value of `compression_window`.
             // As we have some very long successor lists (eg.
             // http://www.wikidata.org/prop/direct/P31) this can use tens of gigabytes
             // of RAM as compression_window defaults to 7
             compression_window: 1,
             ..Default::default()
-        },
-        &thread_pool,
-        bvcomp_tmp_dir.path(),
-    )
-    .context("Could not run BvComp")?;
+        })
+        .par_comp_lenders::<BigEndian, _>(sorted_pairs, num_terms)
+        .context("Could not run BvComp")?;
 
     Ok(())
 }
@@ -237,7 +217,6 @@ pub fn llp(graph_path: &Path, permutation_path: &Path, gammas: &[String]) -> Res
         graph,
         deg_cumul.uncase(),
         gammas,
-        Some(rayon::current_num_threads().max(1)),
         None, // chunk_size
         granularity,
         0, // seed
