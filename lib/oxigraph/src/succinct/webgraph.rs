@@ -2,10 +2,13 @@ use anyhow::{Context, Result, bail, ensure};
 use dsi_bitstream::prelude::BigEndian;
 use epserde::deser::Deserialize;
 use epserde::prelude::Flags;
+use itertools::Itertools;
+use lender::Lender;
 use rayon::prelude::*;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use sux::prelude::*;
+use webgraph::graphs::arc_list_graph::ArcListGraph;
 use webgraph::graphs::bvgraph::{BvComp, CompFlags};
 use webgraph::prelude::*;
 use webgraph::utils::par_sort_pairs::ParSortPairs;
@@ -118,7 +121,6 @@ pub fn symmetric_bv(
     let sorted_pairs = pair_sorter
         .try_sort(pairs)
         .context("Could not initialize ParSortPairs::par_sort_pairs")?;
-    let sorted_pairs: Vec<_> = sorted_pairs.into();
 
     // let mut g = webgraph::graphs::vec_graph::VecGraph::new();
     // for i in 0..num_terms {
@@ -132,6 +134,20 @@ pub fn symmetric_bv(
     // }
     // use epserde::ser::Serialize;
     // unsafe { g.serialize(&mut std::io::BufWriter::new( std::fs::File::create("/tmp/negative_node_id_offset.vecgraph.epserde")?))? };
+
+    // dedup pairs
+    // TODO: remove after update to webgraph 0.7, whose ParSortPairs should natively dedup
+    let arc_list_graphs = Vec::from(sorted_pairs.iters).into_iter().enumerate().map(
+        |(partition_id, sorted_pairs_partition)| {
+            ArcListGraph::new(num_terms, sorted_pairs_partition.into_iter().dedup())
+                .iter_from(sorted_pairs.boundaries[partition_id])
+                .take(
+                    sorted_pairs.boundaries[partition_id + 1]
+                        .checked_sub(sorted_pairs.boundaries[partition_id])
+                        .expect("sorted_pairs.boundaries is not sorted"),
+                )
+        },
+    );
 
     std::fs::create_dir_all(path)
         .with_context(|| format!("Could not create {}", path.display()))?;
@@ -147,7 +163,7 @@ pub fn symmetric_bv(
             compression_window: 1,
             ..Default::default()
         })
-        .par_comp_lenders::<BigEndian, _>(sorted_pairs, num_terms)
+        .par_comp_lenders::<BigEndian, _>(arc_list_graphs, num_terms)
         .context("Could not run BvComp")?;
 
     Ok(())
