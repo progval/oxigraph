@@ -91,12 +91,12 @@ pub fn symmetric_bv(
     let pairs = quads
         .flat_map_iter(|quad| match quad.context("Could not read quad") {
             Ok([s, p, o, _g]) => vec![
-                Ok((s, p)),
+                // Ok((s, p)),
                 Ok((s, o)),
-                Ok((p, s)),
-                Ok((p, o)),
+                // Ok((p, s)),
+                // Ok((p, o)),
                 Ok((o, s)),
-                Ok((o, p)),
+                // Ok((o, p)),
             ],
             Err(e) => vec![Err(e)],
         })

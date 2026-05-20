@@ -141,7 +141,7 @@ pub enum Commands {
     //  * webgraph build dcf /srv/oxigraph-data/wikidata.succinct/symmetric_bvgraph/graph
     /// Step 7 run LLP to cluster similar nodes together
     Llp {
-        #[arg(long, default_values_t = vec!["-0".to_string(), "-1".to_string(), "-2".to_string(), "-3".to_string(), "-4".to_string(), "-5".to_string(), "-6".to_string(), "-7".to_string(), "-8".to_string(), "-9".to_string(), "-10".to_string()])]
+        #[arg(long, default_values_t = vec!["-0".to_string(), "-1".to_string(), "-2".to_string(), "-3".to_string(), "-4".to_string()])]
         gammas: Vec<String>,
     },
     /// Step ??: Build an index from the first term of each quad to its position in a compressed
