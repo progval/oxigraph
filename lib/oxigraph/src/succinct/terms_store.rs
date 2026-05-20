@@ -20,10 +20,6 @@ use sux::dict::elias_fano::{EfSeq, EfSeqDict, EliasFanoBuilder};
 use sux::traits::IndexedSeq;
 use sux::utils::lenders::FallibleRewindableLender;
 
-// Increasing either these values doesn't give noticeably better compression on wikidata-20240320-truthy-BETA.
-pub const DEFAULT_ZSTD_TRAINING_SAMPLES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
-pub const DEFAULT_ZSTD_DICTIONARY_SIZE: NonZeroUsize = NonZeroUsize::new(1_000_000).unwrap();
-
 pub(super) fn write_length_prefixed_string(
     writer: &mut impl Write,
     string: &[u8],
