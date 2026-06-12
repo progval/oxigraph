@@ -39,7 +39,7 @@ and be written to disk while building instead of needing to fit in memory.
 
 Each term is then associated to an id, which is its position in the compressed files.
 
-We map each frame's id to its position in the zstd-compressed files using an Elias-Fano sequence.
+We map each frame's id to its position in the prefix-omission-compressed files using an Elias-Fano sequence.
 This allows getting a term's frame given its id, by dividing the id by `terms_per_frame`.
 
 We map each term to its position using a VFunc static function/MPH.
