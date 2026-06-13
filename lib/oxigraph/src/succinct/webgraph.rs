@@ -58,7 +58,7 @@ pub fn bv(
 
     // TODO: Switch to LittleEndian once webgraph publishes a release that includes this fix:
     // https://github.com/vigna/webgraph-rs/pull/141
-    BvComp::with_basename(&path.join("graph"))
+    BvComp::with_basename(path.join("graph"))
         .with_comp_flags(CompFlags {
             // BvComp stores as many successor lists as the value of `compression_window`.
             // As we have some very long successor lists (eg.
@@ -90,7 +90,9 @@ pub fn symmetric_bv(
 
     let pairs = quads
         .flat_map_iter(|quad| match quad.context("Could not read quad") {
-            Ok([s, p, o, _g]) => vec![
+            Ok([s, _p, o, _g]) => vec![
+                // TODO: add more quads (currently I can't because they bloat the graph so it
+                // doesn't fit in 32GB of RAM)
                 // Ok((s, p)),
                 Ok((s, o)),
                 // Ok((p, s)),
@@ -142,6 +144,7 @@ pub fn symmetric_bv(
             ArcListGraph::new(num_terms, sorted_pairs_partition.into_iter().dedup())
                 .iter_from(sorted_pairs.boundaries[partition_id])
                 .take(
+                    #[expect(clippy::expect_used)] // we just sorted the pairs, can't fail
                     sorted_pairs.boundaries[partition_id + 1]
                         .checked_sub(sorted_pairs.boundaries[partition_id])
                         .expect("sorted_pairs.boundaries is not sorted"),
@@ -154,7 +157,7 @@ pub fn symmetric_bv(
 
     // TODO: Switch to LittleEndian once webgraph publishes a release that includes this fix:
     // https://github.com/vigna/webgraph-rs/pull/141
-    BvComp::with_basename(&path.join("graph"))
+    BvComp::with_basename(path.join("graph"))
         .with_comp_flags(CompFlags {
             // BvComp stores as many successor lists as the value of `compression_window`.
             // As we have some very long successor lists (eg.
