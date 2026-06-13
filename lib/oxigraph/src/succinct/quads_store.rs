@@ -1,6 +1,7 @@
 use super::sort::{ExternalArraySorter, SortedArraysFile};
 use super::terms_mphf::{TermHasher, TermMphf};
 use crate::model::Quad;
+use crate::succinct::permutation::Permutation;
 use crate::succinct::queryable_dataset::SuccinctDatasetError;
 use anyhow::{Context, Result, anyhow, ensure};
 use dsi_progress_logger::{ProgressLog, concurrent_progress_logger};
@@ -82,6 +83,7 @@ pub fn compress_parsed_quads<D>(
     mphf: &TermMphf<D>,
     approx_num_quads: Option<usize>,
     order: QuadOrder,
+    permutation: Option<&Permutation>,
 ) -> Result<()>
 where
     D: BitFieldSlice<usize> + Sync + Send,
@@ -122,6 +124,7 @@ where
         mphf.len(),
         approx_num_quads,
         order,
+        permutation,
     )
 }
 
@@ -131,6 +134,7 @@ pub fn compress_quads(
     num_terms: usize,
     approx_num_quads: Option<usize>,
     order: QuadOrder,
+    permutation: Option<&Permutation>,
 ) -> Result<()> {
     let mut config = QuadStoreConfiguration {
         num_partitions: (4 * usize::from(
@@ -180,7 +184,14 @@ pub fn compress_quads(
             let sorter = sorter
                 .as_mut()
                 .map_err(|e| anyhow!("Could not create sorter ExternalArraySorter: {e:#?}"))?;
-            let quad = order_quad(quad?);
+            let mut quad = order_quad(quad?);
+            if let Some(permutation) = permutation {
+                for item in &mut quad {
+                    *item = permutation
+                        .get(*item)
+                        .context("Permutation shorter than number of terms")?;
+                }
+            }
             sorter.push(quad).context("Could not push quad to sorter")?;
             pl.light_update();
             num_quads.fetch_add(1, Ordering::Relaxed);

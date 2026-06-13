@@ -117,6 +117,8 @@ pub enum Commands {
         approx_quads_per_file: Option<usize>,
         #[arg(long)]
         order: succinct::quads_store::QuadOrder,
+        #[arg(long)]
+        permutation: Option<PathBuf>,
     },
     /// Step 4: Read compressed quads in one order, and write them to an other order
     ///
@@ -129,6 +131,8 @@ pub enum Commands {
         from_order: succinct::quads_store::QuadOrder,
         #[arg(long)]
         to_order: succinct::quads_store::QuadOrder,
+        #[arg(long)]
+        permutation: Option<PathBuf>,
     },
     /// Step 5: read all quads (from a quad store) and compress them as a symmetrized BGraph
     SymmetricBv {
@@ -214,17 +218,25 @@ pub fn main() -> Result<()> {
             parse_args,
             approx_quads_per_file,
             order,
+            permutation,
         } => {
+            let permutation = permutation
+                .map(succinct::permutation::Permutation::mmap)
+                .transpose()?;
             db_builder
                 .with_parse_quad_args(Some(parse_args.try_into()?))
                 .with_approx_quads_per_file(approx_quads_per_file)
-                .compress_quad_store(order)?;
+                .compress_quad_store(order, permutation.as_ref())?;
         }
         Commands::RecompressQuads {
             from_order,
             to_order,
+            permutation,
         } => {
-            db_builder.recompress_quad_store(from_order, to_order)?;
+            let permutation = permutation
+                .map(succinct::permutation::Permutation::mmap)
+                .transpose()?;
+            db_builder.recompress_quad_store(from_order, to_order, permutation.as_ref())?;
         }
         Commands::SymmetricBv { order } => {
             let config_path = db_builder.terms_path().join("config.json");

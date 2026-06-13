@@ -1,5 +1,6 @@
 #![allow(clippy::print_stderr)]
 
+use super::permutation::Permutation;
 use super::quads_store::{QuadOrder, QuadStoreConfiguration};
 use super::{quads_store, secondary_indexes, terms_mphf, terms_store};
 use crate::io::{RdfFormat, RdfParseError, RdfParser};
@@ -219,6 +220,7 @@ impl DatabaseBuilder {
     }
 
     pub fn compress_all_quads_stores(&self) -> Result<()> {
+        let permutation = None;
         let mut already_compressed_order = None;
         for &order in &self.quad_orders {
             if let Some(already_compressed_order) = already_compressed_order {
@@ -227,11 +229,11 @@ impl DatabaseBuilder {
                 log::info!(
                     "Creating {order} quads store (from {already_compressed_order} quads)..."
                 );
-                self.recompress_quad_store(already_compressed_order, order)
+                self.recompress_quad_store(already_compressed_order, order, permutation)
                     .with_context(|| format!("Could not compress {order} quads"))?;
             } else {
                 log::info!("Creating {order} quad store...");
-                self.compress_quad_store(order)
+                self.compress_quad_store(order, permutation)
                     .with_context(|| format!("Could not compress {order} quads"))?;
                 already_compressed_order = Some(order);
             }
@@ -240,7 +242,11 @@ impl DatabaseBuilder {
         Ok(())
     }
 
-    pub fn compress_quad_store(&self, order: QuadOrder) -> Result<()> {
+    pub fn compress_quad_store(
+        &self,
+        order: QuadOrder,
+        permutation: Option<&Permutation>,
+    ) -> Result<()> {
         let parse_quad_args = self
             .parse_quad_args
             .as_ref()
@@ -271,6 +277,7 @@ impl DatabaseBuilder {
                 &terms_mphf,
                 self.compute_approx_num_quads(),
                 order,
+                permutation,
             )
             .context("Could not compress quads")
         } else {
@@ -284,12 +291,18 @@ impl DatabaseBuilder {
                 &terms_mphf,
                 self.compute_approx_num_quads(),
                 order,
+                permutation,
             )
             .context("Could not compress quads")
         }
     }
 
-    pub fn recompress_quad_store(&self, from_order: QuadOrder, to_order: QuadOrder) -> Result<()> {
+    pub fn recompress_quad_store(
+        &self,
+        from_order: QuadOrder,
+        to_order: QuadOrder,
+        permutation: Option<&Permutation>,
+    ) -> Result<()> {
         let quads_from_path = self.location.join(format!("quads-{from_order}"));
         let quads_to_path = self.location.join(format!("quads-{to_order}"));
 
@@ -313,6 +326,7 @@ impl DatabaseBuilder {
             config.num_terms,
             Some(config.num_quads),
             to_order,
+            permutation,
         )
         .context("Could not compress quads")
     }
