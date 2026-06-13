@@ -638,7 +638,6 @@ impl<const N: usize, C: Compressor> SortedArraysFile<N, C> {
             // quads are sorted lexicographically, so the first term of a quad is guaranteed to be
             // >= the first term of the previous quad
             let mut must_zigzag = false;
-            let first_cell = item[0];
             for (col, (&previous_cell, &cell)) in previous_item.iter().zip(item.iter()).enumerate()
             {
                 if must_zigzag {
@@ -648,32 +647,23 @@ impl<const N: usize, C: Compressor> SortedArraysFile<N, C> {
                         .write_i64(&mut writer, col, diff)
                         .context("Could not write delta")?;
                 } else {
-                    if col == 2 {
-                        // zigzag anyway, but from the first cell of the row
-                        let diff = i64::try_from(cell).context("current term overflows i64")?
-                            - i64::try_from(first_cell).context("previous term overflows i64")?;
-                        compressor
-                            .write_i64(&mut writer, col, diff)
-                            .context("Could not write delta")?;
-                    } else {
-                        let diff = u64::try_from(cell)
-                            .context("current term overflows u64")?
-                            .checked_sub(
-                                u64::try_from(previous_cell).context("previous term overflows u64")?,
-                            )
-                            .context(
-                                "write_sorted_array_file got non-sorted quads after the initial check",
-                            )?;
-                        compressor
-                            .write_u64(&mut writer, col, diff)
-                            .context("Could not write delta")?;
+                    let diff = u64::try_from(cell)
+                        .context("current term overflows u64")?
+                        .checked_sub(
+                            u64::try_from(previous_cell).context("previous term overflows u64")?,
+                        )
+                        .context(
+                            "write_sorted_array_file got non-sorted quads after the initial check",
+                        )?;
+                    compressor
+                        .write_u64(&mut writer, col, diff)
+                        .context("Could not write delta")?;
 
-                        if diff > 0 {
-                            // this term is a strict increase, so terms after it in the quad are
-                            // not guaranteed to be >= the corresponding term in the previous quad,
-                            // so we must zigzag-encode them all for the rest of this term.
-                            must_zigzag = true;
-                        }
+                    if diff > 0 {
+                        // this term is a strict increase, so terms after it in the quad are
+                        // not guaranteed to be >= the corresponding term in the previous quad,
+                        // so we must zigzag-encode them all for the rest of this term.
+                        must_zigzag = true;
                     }
                 }
             }
@@ -789,7 +779,6 @@ impl<const N: usize, C: Compressor> SortedArraysFile<N, C> {
                 // quads are sorted lexicographically, so the first term of a quad is guaranteed to be
                 // >= the first term of the previous quad
                 let mut must_zigzag = false;
-                let mut first_cell = None;
                 for (col, (&previous_cell, cell)) in
                     previous_item.iter().zip(item.iter_mut()).enumerate()
                 {
@@ -805,38 +794,22 @@ impl<const N: usize, C: Compressor> SortedArraysFile<N, C> {
                             .try_into()
                             .context("value overflows usize")?;
                     } else {
-                        if col == 2 {
-                            let diff = compressor
-                                .read_i64(&mut reader, col)
-                                .context("Could not read delta")?;
+                        let diff = compressor
+                            .read_u64(&mut reader, col)
+                            .context("Could not read delta")?;
+                        *cell = u64::try_from(previous_cell)
+                            .context("previous value overflows u64")?
+                            .checked_add(diff)
+                            .context("new value (old + absolute delta) overflows u64")?
+                            .try_into()
+                            .context("value overflows usize")?;
 
-                            *cell = u64::try_from(first_cell.expect("first_cell uninitialized"))
-                                .context("previous value overflows u64")?
-                                .checked_add_signed(diff)
-                                .context("new value (old + relative delta) overflows u64")?
-                                .try_into()
-                                .context("value overflows usize")?;
-                        } else {
-                            let diff = compressor
-                                .read_u64(&mut reader, col)
-                                .context("Could not read delta")?;
-                            *cell = u64::try_from(previous_cell)
-                                .context("previous value overflows u64")?
-                                .checked_add(diff)
-                                .context("new value (old + absolute delta) overflows u64")?
-                                .try_into()
-                                .context("value overflows usize")?;
-
-                            if diff > 0 {
-                                // this term is a strict increase, so terms after it in the quad are
-                                // not guaranteed to be >= the corresponding term in the previous quad,
-                                // so we must zigzag-encode them all for the rest of this term.
-                                must_zigzag = true;
-                            }
+                        if diff > 0 {
+                            // this term is a strict increase, so terms after it in the quad are
+                            // not guaranteed to be >= the corresponding term in the previous quad,
+                            // so we must zigzag-encode them all for the rest of this term.
+                            must_zigzag = true;
                         }
-                    }
-                    if col == 0 {
-                        first_cell = Some(*cell);
                     }
                 }
 
